@@ -5,6 +5,18 @@ import GoogleDrive from "../../shared/utils/googleDrive.util.js";
 
 const gd = new GoogleDrive();
 
+// Helpers
+function buildProcessingTime(handlerStartTime, diagnostics = {}) {
+    const now = Date.now();
+    return {
+        timeElapsed:    now - handlerStartTime,
+        lastProcessed:  now,
+        totalElapsedMs: diagnostics.totalElapsedMs,
+        ...diagnostics
+    };
+}
+
+// Handlers
 export async function handleLyricsRequest(c) {
     const startTime = Date.now();
     const query = c.req.query();
@@ -18,8 +30,7 @@ export async function handleLyricsRequest(c) {
     if ((!songTitle || !songArtist) && !songISRC && !songPlatformId) {
         return c.json(
             {
-                error:
-                    "Missing required parameters: (title and artist) or isrc or platformId",
+                error: "Missing required parameters: (title and artist) or isrc or platformId",
             },
             400
         );
@@ -29,7 +40,6 @@ export async function handleLyricsRequest(c) {
     const songDuration = query.duration;
     const source = query.source;
     const forceReload = query.forceReload === "true";
-
 
     const result = await handleSongLyrics(
         songTitle,
@@ -41,7 +51,8 @@ export async function handleLyricsRequest(c) {
         gd,
         source ? source.split(",") : undefined,
         forceReload,
-        c.env
+        c.env,
+        c
     );
 
     let data;
@@ -67,12 +78,11 @@ export async function handleLyricsRequest(c) {
         data = { error: result.data };
     }
 
-    data.processingTime = {
-        timeElapsed: Date.now() - startTime,
-        lastProcessed: Date.now(),
-    };
+    data.processingTime = buildProcessingTime(startTime, result.diagnostics);
 
-    const headers = result.success ? { "Cache-Control": "public, max-age=3600, immutable" } : { "Cache-Control": "no-store" };
+    const headers = result.success
+        ? { "Cache-Control": "public, max-age=3600, immutable" }
+        : { "Cache-Control": "no-store" };
 
     return c.json(data, result.status || (result.success ? 200 : 400), headers);
 }
@@ -89,8 +99,7 @@ export async function handleRawLyricsRequest(c) {
     if ((!songTitle || !songArtist) && !songISRC && !songPlatformId) {
         return c.json(
             {
-                error:
-                    "Missing required parameters: (title and artist) or isrc or platformId",
+                error: "Missing required parameters: (title and artist) or isrc or platformId",
             },
             400
         );
@@ -111,17 +120,17 @@ export async function handleRawLyricsRequest(c) {
         gd,
         source ? source.split(",") : undefined,
         forceReload,
-        c.env
+        c.env,
+        c
     );
+
+    const processingTime = buildProcessingTime(startTime, result.diagnostics);
 
     if (!result.success) {
         return c.json(
             {
                 error: result.data,
-                processingTime: {
-                    timeElapsed: Date.now() - startTime,
-                    lastProcessed: Date.now(),
-                },
+                processingTime,
             },
             result.status || 400,
             { "Cache-Control": "no-store" }
@@ -133,10 +142,7 @@ export async function handleRawLyricsRequest(c) {
             {
                 error: "Raw data is not available for this result",
                 source: result.source,
-                processingTime: {
-                    timeElapsed: Date.now() - startTime,
-                    lastProcessed: Date.now(),
-                },
+                processingTime,
             },
             404,
             { "Cache-Control": "no-store" }

@@ -4,15 +4,21 @@ import { MusixmatchService } from "./musixmatch.service.js";
 import { mergeAppleMetadataIntoWordSync } from "../utils/merge.util.js";
 import { logger } from '../utils/logger.util.js';
 import { FileUtils } from "../utils/file.util.js";
+import { runWithFetchSignal } from '../utils/fetch.util.js';
 
-function withTimeout(promise, ms, sourceStr) {
-    return Promise.race([
-        promise,
-        new Promise((_, reject) => setTimeout(() => reject(new Error(`Timeout fetching from ${sourceStr}`)), ms))
-    ]).catch(err => {
+async function withTimeout(promise, ms, sourceStr) {
+    let timeoutId;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise((_, reject) => { timeoutId = setTimeout(() => reject(new Error(`Timeout fetching from ${sourceStr}`)), ms); })
+        ]);
+    } catch (err) {
         logger.error(`QapleService: ${err.message}`);
         return null;
-    });
+    } finally {
+        clearTimeout(timeoutId);
+    }
 }
 
 async function saveResultIfNeeded(sourceStr, result, gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, env) {
@@ -34,52 +40,72 @@ async function saveResultIfNeeded(sourceStr, result, gd, songTitle, songArtist, 
 
 export class QapleService {
     static async fetchLyrics(songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, gd, forceReload, env, sources) {
-        logger.debug('QapleService: Attempting to fetch word-sync from QQ...');
-        const qqResult = await withTimeout(
-            QQService.fetchLyrics(songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, gd, false, env, false),
-            10000,
-            'QQ'
-        );
-        await saveResultIfNeeded('qq', qqResult, gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, env);
+        
+        // Define the QQ Fetch task
+        const fetchQQ = async () => {
+            logger.debug('QapleService: Attempting to fetch word-sync from QQ...');
+            const result = await withTimeout(
+                QQService.fetchLyrics(songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, gd, forceReload, env, false),
+                10000,
+                'QQ'
+            );
+            await saveResultIfNeeded('qq', result, gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, env);
+            return result;
+        };
 
-        if (!qqResult || !qqResult.success || !qqResult.data || !qqResult.data.lyrics) {
-            logger.debug('QapleService: QQ word-sync fetch failed, aborting Qaple merge.');
-            return null;
-        }
+        const fetchLineSync = async () => {
+            logger.debug('QapleService: Attempting to fetch line-sync from Apple Music...');
+            const appleResult = await withTimeout(
+                AppleMusicService.fetchLyrics(songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, gd, forceReload, sources || [], false),
+                10000,
+                'Apple Music'
+            );
+            await saveResultIfNeeded('apple', appleResult, gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, env);
 
-        let lineSyncResult = null;
-        let lineSyncSource = '';
+            if (appleResult && appleResult.success && appleResult.data && appleResult.data.lyrics) {
+                return { data: appleResult.data, source: 'Apple' };
+            }
 
-        logger.debug('QapleService: Attempting to fetch line-sync from Apple Music...');
-        const appleResult = await withTimeout(
-            AppleMusicService.fetchLyrics(songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, gd, false, sources || [], false),
-            10000,
-            'Apple Music'
-        );
-        await saveResultIfNeeded('apple', appleResult, gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, env);
-
-        if (appleResult && appleResult.success && appleResult.data && appleResult.data.lyrics) {
-            lineSyncResult = appleResult.data;
-            lineSyncSource = 'Apple';
-        } else {
             logger.debug('QapleService: Apple Music fetch failed, falling back to Musixmatch line-sync...');
             const mxmResult = await withTimeout(
-                MusixmatchService.fetchLyrics(songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, gd, false, env, false, true),
+                MusixmatchService.fetchLyrics(songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, gd, forceReload, env, false, true),
                 10000,
                 'Musixmatch'
             );
             await saveResultIfNeeded('musixmatch', mxmResult, gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, env);
+            
             if (mxmResult && mxmResult.success && mxmResult.data && mxmResult.data.lyrics) {
-                lineSyncResult = mxmResult.data;
-                lineSyncSource = 'Musixmatch';
+                return { data: mxmResult.data, source: 'Musixmatch' };
             }
+
+            return null;
+        };
+
+        // Start both fetch processes concurrently
+        const qqPromise = fetchQQ();
+        const lineSyncController = new AbortController();
+        const lineSyncPromise = runWithFetchSignal(lineSyncController.signal, fetchLineSync);
+
+        // Wait QQ first. If QQ fails, we can immediately return to the user
+        const qqResult = await qqPromise;
+
+        if (!qqResult || !qqResult.success || !qqResult.data || !qqResult.data.lyrics) {
+            lineSyncController.abort();
+            logger.debug('QapleService: QQ word-sync fetch failed, aborting Qaple merge.');
+            return null;
         }
 
-        if (!lineSyncResult) {
+        // QQ succeeds, await the line-sync result
+        const lineSyncResultData = await lineSyncPromise;
+
+        if (!lineSyncResultData) {
             logger.debug('QapleService: No line-sync component available, aborting Qaple merge.');
             return null;
         }
 
+        const { data: lineSyncResult, source: lineSyncSource } = lineSyncResultData;
+
+        // Merge the components
         const mergedData = mergeAppleMetadataIntoWordSync(lineSyncResult, qqResult.data);
 
         if (!mergedData) {

@@ -4,13 +4,12 @@ import { SimilarityUtils } from "../utils/similarity.util.js";
 import { spotifyAccountManager } from "../config.js";
 import { convertSpotifyToJSON } from "../parsers/spotify.parser.js";
 import { logger } from '../utils/logger.util.js';
+import { fetchWithProxy } from '../utils/fetch.util.js';
 
-const CACHE = {
-    clientId: null,
-    accessToken: null,
-    spotifyToken: null,
-    tokenExpiry: null
-};
+const webTokenCaches = new WeakMap();
+const webTokenPromises = new WeakMap();
+const spotifyTokenCaches = new WeakMap();
+const spotifyTokenPromises = new WeakMap();
 
 const SECRET_CIPHER_DICT_URL = "https://raw.githubusercontent.com/Thereallo1026/spotify-secrets/main/secrets/secretDict.json";
 
@@ -27,6 +26,13 @@ const SECRET_CACHE = {
 };
 
 const MAX_RETRIES = 3;
+
+const USER_AGENTS = Object.freeze([
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
+]);
 
 export class SpotifyService {
 
@@ -251,8 +257,8 @@ export class SpotifyService {
      * @param {object} track - The Spotify track object.
      * @returns {Promise<object>} The normalized song object.
      */
-    static async normalizeSpotifySong(track) {
-        const songwriters = await this.fetchSpotifySongwriters(track.id);
+    static async normalizeSpotifySong(track, hydrate = true) {
+        const songwriters = hydrate ? await this.fetchSpotifySongwriters(track.id) : [];
         const albumArtUrl = track.album.images.length > 0 ? track.album.images[0].url : null;
         const isrc = track.external_ids?.isrc || null;
 
@@ -273,9 +279,9 @@ export class SpotifyService {
 
     // --- Core Request & Authentication Logic ---
 
-    static async makeSpotifyRequest(url, options = {}, retries = 0) {
+    static async makeSpotifyRequest(url, options = {}, retries = 0, account = null) {
         try {
-            const currentAccount = spotifyAccountManager.getCurrentAccount();
+            const currentAccount = account || spotifyAccountManager.getCurrentAccount();
             if (!currentAccount) throw new Error("No Spotify account available.");
 
             const headers = {
@@ -285,29 +291,33 @@ export class SpotifyService {
 
             if (url.includes(SPOTIFY.LYRICS_URL) || url.includes("track-credits-view")) {
                 if (!headers.Authorization) {
-                    const { accessToken } = await this.getSpotifyWebToken();
+                    const { accessToken } = await this.getSpotifyWebToken(currentAccount);
                     headers.Authorization = `Bearer ${accessToken}`;
                 }
                 if (!headers.Cookie) headers.Cookie = currentAccount.COOKIE;
                 headers["app-platform"] = "WebPlayer";
             } else if (url.includes(SPOTIFY.AUTH_URL) || url.includes(SPOTIFY.BASE_URL)) {
                 if (!headers.Authorization) {
-                    const token = await this.getSpotifyAuth();
+                    const token = await this.getSpotifyAuth(currentAccount);
                     headers.Authorization = `Bearer ${token}`;
                 }
             }
 
-            const response = await fetch(url, { ...options, headers });
+            const response = await fetchWithProxy(url, { ...options, headers });
 
             if (!response.ok) {
                 if ((response.status === 401 || response.status === 429) && retries < MAX_RETRIES) {
                     logger.warn(`Spotify API call failed with status ${response.status}. Retrying with next account...`);
-                    spotifyAccountManager.switchToNextAccount();
-                    Object.assign(CACHE, { clientId: null, accessToken: null, spotifyToken: null, tokenExpiry: null });
-                    return this.makeSpotifyRequest(url, options, retries + 1);
+                    const nextAccount = spotifyAccountManager.getNextAccount(currentAccount);
+                    if (nextAccount) return this.makeSpotifyRequest(url, options, retries + 1, nextAccount);
                 }
-                const errorText = await response.json();
-                throw new Error(`Spotify API returned status ${response.status}: ${errorText.error.message || ""}`);
+                const responseText = await response.text();
+                let errorMessage = responseText;
+                try {
+                    const errorJson = JSON.parse(responseText);
+                    errorMessage = errorJson.error?.message || errorJson.error_description || errorJson.error || responseText;
+                } catch {}
+                throw new Error(`Spotify API returned status ${response.status}: ${errorMessage}`);
             }
             return response;
         } catch (error) {
@@ -316,18 +326,19 @@ export class SpotifyService {
         }
     }
 
-    static async getSpotifyWebToken() {
-        if (CACHE.accessToken && CACHE.tokenExpiry && Date.now() < CACHE.tokenExpiry) {
-            return {
-                clientId: CACHE.clientId,
-                accessToken: CACHE.accessToken,
-                expiry: CACHE.tokenExpiry
-            };
-        }
-
-        const currentAccount = spotifyAccountManager.getCurrentAccount();
+    static async getSpotifyWebToken(account = null) {
+        const currentAccount = account || spotifyAccountManager.getCurrentAccount();
         if (!currentAccount) throw new Error("No Spotify account available for web token authentication.");
 
+        const cached = webTokenCaches.get(currentAccount);
+        if (cached?.expiry > Date.now()) return cached;
+        if (webTokenPromises.has(currentAccount)) return webTokenPromises.get(currentAccount);
+        const promise = this._fetchSpotifyWebToken(currentAccount).finally(() => webTokenPromises.delete(currentAccount));
+        webTokenPromises.set(currentAccount, promise);
+        return promise;
+    }
+
+    static async _fetchSpotifyWebToken(currentAccount) {
         try {
             const { totp, totpVer } = await this.generateSpotifyTOTP();
             const headers = {
@@ -338,17 +349,22 @@ export class SpotifyService {
             };
 
             const transportParams = new URLSearchParams({ reason: 'transport', productType: 'web-player', totp, totpServer: totp, totpVer: totpVer.toString() });
-            let response = await fetch(`https://open.spotify.com/api/token?${transportParams}`, { headers });
+            let response = await fetchWithProxy(`https://open.spotify.com/api/token?${transportParams}`, { headers });
 
             if (!response.ok) {
                 logger.warn(`Token request with reason=transport failed (${response.status}). Retrying with reason=init.`);
                 const initParams = new URLSearchParams({ reason: 'init', productType: 'web-player', totp, totpServer: totp, totpVer: totpVer.toString() });
-                response = await fetch(`https://open.spotify.com/api/token?${initParams}`, { headers });
+                response = await fetchWithProxy(`https://open.spotify.com/api/token?${initParams}`, { headers });
             }
 
             if (!response.ok) {
-                const errorText = await response.json();
-                throw new Error(`Failed to get Spotify web token after retries. Status: ${response.status}, Body: ${errorText.error.message || ""}`);
+                const errorBody = await response.text();
+                let errorMsg = errorBody;
+                try {
+                    const errorJson = JSON.parse(errorBody);
+                    errorMsg = errorJson.error?.message || errorJson.error_description || errorJson.error || errorBody;
+                } catch {}
+                throw new Error(`Failed to get Spotify web token after retries. Status: ${response.status}, Body: ${errorMsg}`);
             }
 
             const data = await response.json();
@@ -357,15 +373,13 @@ export class SpotifyService {
                 throw new Error("Failed to get Spotify web tokens: Invalid response structure.");
             }
 
-            CACHE.clientId = data.clientId;
-            CACHE.accessToken = data.accessToken;
-            CACHE.tokenExpiry = new Date(data.accessTokenExpirationTimestampMs);
-
-            return {
+            const cached = {
                 clientId: data.clientId,
                 accessToken: data.accessToken,
-                expiry: CACHE.tokenExpiry
+                expiry: Number(data.accessTokenExpirationTimestampMs)
             };
+            webTokenCaches.set(currentAccount, cached);
+            return cached;
         } catch (error) {
             logger.error("Error fetching Spotify web tokens:", error);
             throw error;
@@ -373,17 +387,22 @@ export class SpotifyService {
     }
 
 
-    static async getSpotifyAuth() {
-        if (CACHE.spotifyToken && Date.now() < CACHE.tokenExpiry) {
-            return CACHE.spotifyToken;
-        }
-
-        const currentAccount = spotifyAccountManager.getCurrentAccount();
+    static async getSpotifyAuth(account = null) {
+        const currentAccount = account || spotifyAccountManager.getCurrentAccount();
         if (!currentAccount) {
             logger.error("No Spotify account available for client credentials authentication.");
             return null;
         }
 
+        const cached = spotifyTokenCaches.get(currentAccount);
+        if (cached?.expiry > Date.now()) return cached.token;
+        if (spotifyTokenPromises.has(currentAccount)) return spotifyTokenPromises.get(currentAccount);
+        const promise = this._fetchSpotifyAuth(currentAccount).finally(() => spotifyTokenPromises.delete(currentAccount));
+        spotifyTokenPromises.set(currentAccount, promise);
+        return promise;
+    }
+
+    static async _fetchSpotifyAuth(currentAccount) {
         try {
             const encoded = btoa(`${currentAccount.CLIENT_ID}:${currentAccount.CLIENT_SECRET}`);
             const response = await this.makeSpotifyRequest(SPOTIFY.AUTH_URL, {
@@ -393,13 +412,15 @@ export class SpotifyService {
                     'Content-Type': 'application/x-www-form-urlencoded'
                 },
                 body: 'grant_type=client_credentials'
-            }, 0);
+            }, 0, currentAccount);
 
             const data = await response.json();
             if (data.access_token) {
-                CACHE.spotifyToken = data.access_token;
-                CACHE.tokenExpiry = Date.now() + (data.expires_in * 1000);
-                return CACHE.spotifyToken;
+                spotifyTokenCaches.set(currentAccount, {
+                    token: data.access_token,
+                    expiry: Date.now() + (data.expires_in * 1000),
+                });
+                return data.access_token;
             } else {
                 throw new Error("Failed to get Spotify token: access_token not in response.");
             }
@@ -426,7 +447,7 @@ export class SpotifyService {
         const joined = transformed.join('');
         const derivedSecretBytes = new TextEncoder().encode(joined);
 
-        const serverTimeResponse = await fetch("https://open.spotify.com/", { method: 'HEAD' });
+        const serverTimeResponse = await fetchWithProxy("https://open.spotify.com/", { method: 'HEAD' });
         if (!serverTimeResponse.ok || !serverTimeResponse.headers.has('date')) {
             throw new Error(`Failed to fetch Spotify server time: ${serverTimeResponse.status}`);
         }
@@ -464,7 +485,7 @@ export class SpotifyService {
     static async updateSecrets() {
         logger.debug("Attempting to update Spotify TOTP secrets...");
         try {
-            const response = await fetch(SECRET_CIPHER_DICT_URL);
+            const response = await fetchWithProxy(SECRET_CIPHER_DICT_URL);
             if (!response.ok) throw new Error(`Failed to fetch secrets, status: ${response.status}`);
 
             const newSecrets = await response.json();
@@ -496,12 +517,6 @@ export class SpotifyService {
     }
 
     static getRandomUserAgent() {
-        const userAgents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
-        ];
-        return userAgents[Math.floor(Math.random() * userAgents.length)];
+        return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
     }
 }

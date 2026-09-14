@@ -1,144 +1,107 @@
 import NodeCache from 'node-cache';
 
-/**
- * Emulates Cloudflare KV storage using node-cache.
- */
-export class KvEmulator {
-    constructor(namespace) {
-        this.namespace = namespace;
-        this.cache = new NodeCache({
-            stdTTL: 0,
-            checkperiod: 60,
-            useClones: false,
-            deleteOnExpire: true
-        });
+const MAX_KEYS = Number(process.env.MAX_CACHE_KEYS) || 2000;
+const MAX_CACHE_BYTES = Number(process.env.MAX_CACHE_BYTES) || 96 * 1024 * 1024; // 96 MB hard cap (fits 4 GB hosts)
+const MAX_BODY_BYTES = 1572864; // 1.5 MB for syllable sync lyrics support
+
+function getByteLength(str) {
+    if (typeof Buffer !== 'undefined' && Buffer.byteLength) {
+        return Buffer.byteLength(str, 'utf8');
     }
-
-    /**
-     * Gets a value from the KV store.
-     * @param {string} key 
-     * @param {Object} options - Supports { type: 'json' }
-     */
-    async get(key, options = {}) {
-        const item = this.cache.get(key);
-        if (item === undefined) return null;
-
-        const type = typeof options === 'string' ? options : options.type;
-        if (type === 'json' && typeof item === 'string') {
-            try {
-                return JSON.parse(item);
-            } catch {
-                return item;
-            }
-        }
-        return item;
-    }
-
-    /**
-     * Puts a value into the KV store.
-     * @param {string} key 
-     * @param {any} value 
-     * @param {Object} options - Supports { expirationTtl, metadata }
-     */
-    async put(key, value, options = {}) {
-        const ttl = options.expirationTtl || 0;
-        this.cache.set(key, value, ttl);
-        // Metadata not natively supported in node-cache but we can store it separately if needed
-    }
-
-    async delete(key) {
-        this.cache.del(key);
-    }
-
-    async list(options = {}) {
-        const { prefix, limit = 1000 } = options;
-        const keys = this.cache.keys();
-        const filteredKeys = [];
-        let count = 0;
-
-        for (const key of keys) {
-            if (prefix && !key.startsWith(prefix)) continue;
-            filteredKeys.push({ name: key });
-            count++;
-            if (count >= limit) break;
-        }
-
-        return { 
-            keys: filteredKeys,
-            list_complete: true,
-            cursor: null
-        };
-    }
+    return str.length;
 }
 
-/**
- * Emulates the Web Cache API using node-cache.
- */
 export class Cache {
-    constructor(namespace) {
-        this.cache = new NodeCache({
-            stdTTL: 3600,
-            checkperiod: 120,
-            useClones: false
-        });
+    constructor(maxKeys = MAX_KEYS) {
+        this.maxKeys = maxKeys;
+        this.totalBytes = 0;
+        this.cache = new NodeCache({ stdTTL: 3600, checkperiod: 60, useClones: false });
+        this._queue = new Map();
+        this.cache.on('del', (k) => this._dequeue(k));
+        this.cache.on('expired', (k) => this._dequeue(k));
+    }
+
+    _dequeue(key) {
+        const entry = this._queue.get(key);
+        if (entry) {
+            this.totalBytes = Math.max(0, this.totalBytes - entry.bytes);
+            this._queue.delete(key);
+        }
+    }
+
+    _evictOldest() {
+        const oldest = this._queue.keys().next().value;
+        if (oldest) this.cache.del(oldest);
+    }
+
+    _key(request) {
+        if (typeof request === 'string') return `GET:${request}`;
+        return `${request.method}:${request.url}`;
     }
 
     async match(request) {
-        const url = typeof request === 'string' ? request : request.url;
-        const cached = this.cache.get(url);
-        
+        const key = this._key(request);
+        const cached = this.cache.get(key);
         if (!cached) return undefined;
-
         try {
-            const { body, status, statusText, headers } = cached;
-            return new Response(body, { 
-                status: status || 200, 
-                statusText: statusText || 'OK',
-                headers: new Headers(headers || {})
-            });
-        } catch (e) {
-            console.error(`[Cache] Error creating response from cache for ${url}:`, e);
+            return new Response(cached.body, { status: cached.status, headers: new Headers(cached.headers) });
+        } catch {
             return undefined;
         }
     }
 
     async put(request, response) {
-        const url = typeof request === 'string' ? request : request.url;
+        const key = this._key(request);
         if (response.status !== 200) return;
-
+        if (typeof request !== 'string' && (request.headers.has('authorization') || request.headers.has('cookie'))) return;
         try {
-            const resClone = response.clone();
-            const body = await resClone.text();
-            const headers = Object.fromEntries(resClone.headers.entries());
+            const clone = response.clone();
+            const body = await clone.text();
+            const bodyBytes = getByteLength(body);
+            if (bodyBytes > MAX_BODY_BYTES) return;
+            if (clone.headers.has('set-cookie')) return;
 
-            const cacheControl = resClone.headers.get('Cache-Control');
+            const cc = clone.headers.get('Cache-Control');
             let ttl = 3600;
-            if (cacheControl) {
-                const maxAgeMatch = cacheControl.match(/max-age=(\d+)/);
-                if (maxAgeMatch) ttl = parseInt(maxAgeMatch[1], 10);
+            if (cc) {
+                const m = cc.match(/max-age=(\d+)/);
+                if (m) ttl = parseInt(m[1], 10);
             }
 
-            this.cache.set(url, {
-                body,
-                status: resClone.status,
-                statusText: resClone.statusText,
-                headers
-            }, ttl);
+            // Evict previous entry with the same key before accounting bytes
+            this._dequeue(key);
+
+            const headers = [...clone.headers.entries()].filter(([name]) => name.toLowerCase() !== 'set-cookie');
+            if (this.cache.set(key, { body, status: clone.status, headers }, ttl)) {
+                const entry = { bytes: bodyBytes };
+                this._queue.set(key, entry);
+                this.totalBytes += bodyBytes;
+            }
+
+            // Enforce caps: key count AND total response bytes (prevents RAM blowup on 4 GB hosts)
+            while (this._queue.size > this.maxKeys) {
+                this._evictOldest();
+            }
+            while (this.totalBytes > MAX_CACHE_BYTES && this._queue.size > 0) {
+                this._evictOldest();
+            }
         } catch (e) {
-            console.error(`[Cache] Error storing response for ${url}:`, e);
+            console.error(`[Cache] put error for ${key}:`, e);
         }
     }
 
     async delete(request) {
-        const url = typeof request === 'string' ? request : request.url;
-        this.cache.del(url);
+        this.cache.del(this._key(request));
         return true;
+    }
+
+    clear() {
+        this.cache.flushAll();
+        this._queue.clear();
+        this.totalBytes = 0;
     }
 }
 
-/**
- * Emulates the Global caches object.
- */
 export class CacheStorage {
     constructor() {
         this.cacheMap = new Map();
@@ -146,13 +109,19 @@ export class CacheStorage {
 
     async open(cacheName) {
         if (!this.cacheMap.has(cacheName)) {
-            this.cacheMap.set(cacheName, new Cache(cacheName));
+            this.cacheMap.set(cacheName, new Cache());
         }
         return this.cacheMap.get(cacheName);
     }
 
     async delete(cacheName) {
         return this.cacheMap.delete(cacheName);
+    }
+
+    async clearAll() {
+        for (const cache of this.cacheMap.values()) {
+            cache.clear();
+        }
     }
 
     async keys() {

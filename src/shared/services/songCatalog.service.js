@@ -80,9 +80,10 @@ export class SongCatalogService {
             const searchData = await AppleMusicService.searchSong(query, storefront);
             const songsData = searchData.results?.songs?.data || [];
 
-            return Promise.all(
-                songsData.map(song => AppleMusicService.normalizeAppleMusicSong(song, storefront))
+            const normalized = await Promise.allSettled(
+                songsData.slice(0, 10).map(song => AppleMusicService.normalizeAppleMusicSong(song, storefront, false))
             );
+            return normalized.filter(result => result.status === 'fulfilled').map(result => result.value);
         } catch (error) {
             logger.error("Error searching Apple Music:", error);
             return [];
@@ -97,9 +98,10 @@ export class SongCatalogService {
         try {
             // Note: Spotify's search is more effective with an artist, but we use the query for the title.
             const spotifyTracks = await SpotifyService.searchSpotifySong(query, "");
-            return Promise.all(
-                spotifyTracks.map(track => SpotifyService.normalizeSpotifySong(track))
+            const normalized = await Promise.allSettled(
+                spotifyTracks.slice(0, 10).map(track => SpotifyService.normalizeSpotifySong(track, false))
             );
+            return normalized.filter(result => result.status === 'fulfilled').map(result => result.value);
         } catch (error) {
             logger.error("Error searching Spotify:", error);
             return [];
@@ -115,9 +117,13 @@ export class SongCatalogService {
             const searchData = await MusixmatchService.searchTrack(query, null, env);
             const tracksData = searchData.message?.body?.track_list || [];
 
-            return Promise.all(
-                tracksData.map(trackResult => MusixmatchService.normalizeMusixmatchSong(trackResult.track, null, env))
+            const normalized = await Promise.allSettled(
+                tracksData.slice(0, 10).map(trackResult => {
+                    const track = trackResult?.track || trackResult;
+                    return MusixmatchService.normalizeMusixmatchSong(track, null, env, false);
+                })
             );
+            return normalized.filter(result => result.status === 'fulfilled').map(result => result.value);
         } catch (error) {
             logger.error("Error searching Musixmatch:", error);
             return [];

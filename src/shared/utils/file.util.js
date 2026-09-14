@@ -1,12 +1,66 @@
-// utils/fileUtils.js
-import { GDRIVE } from "../config.js";
+import { GDRIVE, CACHE_CONFIG } from "../config.js";
 import { SimilarityUtils } from "./similarity.util.js";
+
+const cacheWriteLocks = new Map();
+const recentSavesCache = new Map();
+const RECENT_SAVE_TTL_MS = 60 * 1000;
+const MAX_RECENT_SAVES = 2000;
+
+function getContentHash(data) {
+    const str = typeof data === 'string' ? data : JSON.stringify(data);
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        hash = (hash << 5) - hash + str.charCodeAt(i);
+        hash |= 0;
+    }
+    return hash;
+}
 
 /**
  * A utility class for handling file operations, specifically for generating filenames
  * and finding existing files on Google Drive based on song metadata.
  */
 export class FileUtils {
+    static _escapeDriveQueryLiteral(value) {
+        return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    }
+
+    static _extractKeywords(text) {
+        if (!text) return [];
+        const STOP_WORDS = new Set([
+            'the', 'and', 'for', 'with', 'feat', 'ft', 'featuring', 'from', 'this', 'that',
+            'you', 'your', 'are', 'was', 'were', 'original', 'version', 'audio', 'video'
+        ]);
+        const cleaned = String(text)
+            .replace(/[<>[\](){}_\\/|:;!?,.*~`"@#$%^&+=]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (!cleaned) return [];
+
+        const words = cleaned.split(' ').map(w => w.trim()).filter(Boolean);
+        const keywords = [];
+
+        for (const w of words) {
+            const lower = w.toLowerCase();
+            if (STOP_WORDS.has(lower)) continue;
+            // Support CJK (Han, Hiragana, Katakana, Hangul) or alphanumeric length >= 2
+            const isCjk = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/.test(w);
+            if (isCjk || w.length >= 2) {
+                keywords.push(w);
+            }
+            if (keywords.length >= 2) break;
+        }
+
+        // If no keywords met length >= 2 or CJK, fallback to first non-empty word or whole cleaned string
+        if (keywords.length === 0 && words.length > 0) {
+            keywords.push(words[0]);
+        } else if (keywords.length === 0 && cleaned.length > 0) {
+            keywords.push(cleaned.slice(0, 10));
+        }
+
+        return keywords;
+    }
+
     /**
      * Parses a structured song filename into its constituent parts.
      * @param {string} filename - The filename to parse (e.g., "Artist - Title [Album] (185.75).ext").
@@ -59,6 +113,36 @@ export class FileUtils {
     }
 
     /**
+     * Saves a GDrive-sourced file into the local DB cache, skipping the write
+     * when an equivalent row already exists (prevents write amplification on
+     * low-end hosts). Fire-and-forget from callers.
+     */
+    static async _backfillDbRow(parsed, file, mimeType, folderID, content) {
+        const { db } = await import('./db.util.js');
+        const folderId = Array.isArray(folderID) ? folderID[0] : folderID;
+
+        if (parsed.isrc || parsed.platformId) {
+            const existing = await db.findExact([folderId], mimeType, parsed.isrc, parsed.platformId);
+            if (existing && existing.content) return;
+        }
+
+        await db.saveRow({
+            id: crypto.randomUUID(),
+            gdrive_id: file.id,
+            file_name: file.name,
+            folder_id: folderId,
+            mime_type: mimeType,
+            content,
+            title: parsed.title,
+            artist: parsed.artist,
+            album: parsed.album,
+            duration: parsed.duration,
+            isrc: parsed.isrc,
+            platform_id: parsed.platformId
+        });
+    }
+
+    /**
      * Generates a unique, filesystem-safe filename from song metadata.
      * @param {string} songTitle - The title of the song.
      * @param {string} songArtist - The artist of the song.
@@ -99,37 +183,77 @@ export class FileUtils {
      * @returns {Promise<object|null>} The matching file object or null if not found.
      */
     static async findExactMatchByIds(gd, songISRC, songPlatformId, folderID, mimeType) {
-        if (!gd) throw new Error("Google Drive instance is not provided.");
-        if (!folderID) throw new Error("Folder ID is not provided.");
+        const folderIDs = (Array.isArray(folderID) ? folderID : [folderID]).filter(Boolean);
+        if (folderIDs.length === 0) return null;
         if (!mimeType) throw new Error("MIME type is not provided.");
         if (!songISRC && !songPlatformId) return null;
 
-        try {
-            let queryParts = [`mimeType = '${mimeType}'`, `'${folderID}' in parents`];
-            let searchTerm = songISRC || songPlatformId;
-
-            queryParts.push(`name contains '${searchTerm}'`);
-
-            const query = queryParts.join(' and ');
-            const { files } = await gd.searchFiles(query);
-
-            if (!files || files.length === 0) return null;
-
-            for (const file of files) {
-                const parsed = FileUtils._parseFileName(file.name);
-                if (songISRC && parsed.isrc === songISRC) {
-                    return file;
+        // Try local DB first
+        if (CACHE_CONFIG.DB_ENABLED) {
+            try {
+                const { db } = await import('./db.util.js');
+                const row = await db.findExact(folderIDs, mimeType, songISRC, songPlatformId);
+                if (row) {
+                    return {
+                        id: `db:${row.id}`,
+                        name: row.file_name,
+                        mimeType: row.mime_type,
+                        isDb: true
+                    };
                 }
-                if (songPlatformId && parsed.platformId === songPlatformId) {
-                    return file;
-                }
+            } catch (err) {
+                console.error("Error checking exact match in local DB:", err);
             }
-
-            return null;
-        } catch (error) {
-            console.error("Error searching for exact match by ID:", error);
-            return null;
         }
+
+        // Fallback to GDrive
+        if (CACHE_CONFIG.GDRIVE_ENABLED) {
+            if (!gd) throw new Error("Google Drive instance is not provided.");
+            try {
+                const folderIDs = Array.isArray(folderID) ? folderID : [folderID];
+                const parentsQuery = `(${folderIDs.map(id => `'${this._escapeDriveQueryLiteral(id)}' in parents`).join(' or ')})`;
+                let queryParts = [`mimeType = '${this._escapeDriveQueryLiteral(mimeType)}'`, parentsQuery];
+                let searchTerm = songISRC || songPlatformId;
+
+                queryParts.push(`name contains '${this._escapeDriveQueryLiteral(searchTerm)}'`);
+
+                const query = queryParts.join(' and ');
+                const { files } = await gd.searchFiles(query);
+
+                if (!files || files.length === 0) return null;
+
+                for (const file of files) {
+                    const parsed = FileUtils._parseFileName(file.name);
+                    let matched = false;
+                    if (songISRC && parsed.isrc === songISRC) {
+                        matched = true;
+                    }
+                    if (songPlatformId && parsed.platformId === songPlatformId) {
+                        matched = true;
+                    }
+                    
+                    if (matched) {
+                        // Populate local DB cache asynchronously in background if DB is enabled
+                        if (CACHE_CONFIG.DB_ENABLED) {
+                            (async () => {
+                                try {
+                                    const parsed = FileUtils._parseFileName(file.name);
+                                    const content = await gd.fetchFile(file.id);
+                                    FileUtils._backfillDbRow(parsed, file, mimeType, folderID, content);
+                                } catch (cacheErr) {
+                                    console.error("Failed to populate DB cache from GDrive:", cacheErr);
+                                }
+                            })();
+                        }
+                        return file;
+                    }
+                }
+            } catch (error) {
+                console.error("Error searching for exact match by ID on GDrive:", error);
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -146,61 +270,132 @@ export class FileUtils {
      * @returns {Promise<object|null>} The best matching file object or null if not found.
      */
     static async findExistingFile(gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, folderID, mimeType) {
-        if (!gd) throw new Error("Google Drive instance is not provided.");
-        if (!folderID) throw new Error("Folder ID is not provided.");
+        const folderIDs = (Array.isArray(folderID) ? folderID : [folderID]).filter(Boolean);
+        if (folderIDs.length === 0) return null;
         if (!mimeType) throw new Error("MIME type is not provided.");
         if (!songTitle || !songArtist) return null;
 
-        try {
-            const createKeywords = (text) => String(text || '').split(' ').filter(w => w.length > 3).slice(0, 2);
-            const keywords = [
-                ...createKeywords(songTitle),
-                ...createKeywords(songArtist),
-                ...createKeywords(songAlbum)
-            ].map(k => k.replace(/'/g, "\\'"));
+        const keywords = [
+            ...this._extractKeywords(songTitle),
+            ...this._extractKeywords(songArtist),
+            ...this._extractKeywords(songAlbum)
+        ].map(k => this._escapeDriveQueryLiteral(k));
 
-            if (keywords.length === 0) return null;
-
-            const query = `${keywords.map(k => `name contains '${k}'`).join(' and ')} and mimeType = '${mimeType}' and '${folderID}' in parents`;
-            const { files } = await gd.searchFiles(query);
-
-            if (!files || files.length === 0) return null;
-
-            const adaptedCandidates = files.map(file => {
-                const parsed = FileUtils._parseFileName(file.name);
-                return {
-                    attributes: {
-                        name: parsed.title,
-                        artistName: parsed.artist,
-                        albumName: parsed.album,
-                        durationInMillis: parsed.duration ? parsed.duration * 1000 : undefined,
-                        isrc: parsed.isrc,
-                        platformId: parsed.platformId,
-                    },
-                    originalFile: file,
-                };
-            });
-
-            const bestMatch = SimilarityUtils.findBestSongMatch(
-                adaptedCandidates,
-                songTitle,
-                songArtist,
-                songAlbum,
-                songDuration,
-                songISRC,
-                songPlatformId
-            );
-
-            if (bestMatch?.scoreInfo?.score > 0) {
-                console.debug("Top file match found with score:", bestMatch.scoreInfo.score);
-                return bestMatch.candidate.originalFile;
+        if (keywords.length === 0) {
+            if (songISRC || songPlatformId) {
+                return this.findExactMatchByIds(gd, songISRC, songPlatformId, folderIDs, mimeType);
             }
-
-            return null;
-        } catch (error) {
-            console.error("Error searching for existing file:", error);
             return null;
         }
+
+        // 1. Try local DB first
+        if (CACHE_CONFIG.DB_ENABLED) {
+            try {
+                const { db } = await import('./db.util.js');
+                const rows = await db.findExisting(folderIDs, mimeType, keywords);
+                
+                if (rows && rows.length > 0) {
+                    const adaptedCandidates = rows.map(row => {
+                        return {
+                            attributes: {
+                                name: row.title,
+                                artistName: row.artist,
+                                albumName: row.album,
+                                durationInMillis: row.duration ? row.duration * 1000 : undefined,
+                                isrc: row.isrc,
+                                platformId: row.platform_id,
+                            },
+                            originalFile: {
+                                id: `db:${row.id}`,
+                                name: row.file_name,
+                                mimeType: row.mime_type,
+                                isDb: true
+                            },
+                        };
+                    });
+
+                    const bestMatch = SimilarityUtils.findBestSongMatch(
+                        adaptedCandidates,
+                        songTitle,
+                        songArtist,
+                        songAlbum,
+                        songDuration,
+                        songISRC,
+                        songPlatformId
+                    );
+
+                    if (bestMatch?.scoreInfo?.score > 0) {
+                        console.debug("Top file match found in local DB with score:", bestMatch.scoreInfo.score);
+                        return bestMatch.candidate.originalFile;
+                    }
+                }
+            } catch (err) {
+                console.error("Error searching in local DB cache:", err);
+            }
+        }
+
+        // 2. Fallback to GDrive
+        if (CACHE_CONFIG.GDRIVE_ENABLED) {
+            if (!gd) throw new Error("Google Drive instance is not provided.");
+            try {
+                if (keywords.length === 0) return null;
+
+                const folderIDs = Array.isArray(folderID) ? folderID : [folderID];
+                const parentsQuery = `(${folderIDs.map(id => `'${this._escapeDriveQueryLiteral(id)}' in parents`).join(' or ')})`;
+                const query = `${keywords.map(k => `name contains '${this._escapeDriveQueryLiteral(k)}'`).join(' and ')} and mimeType = '${this._escapeDriveQueryLiteral(mimeType)}' and ${parentsQuery}`;
+                const { files } = await gd.searchFiles(query);
+
+                if (!files || files.length === 0) return null;
+
+                const adaptedCandidates = files.map(file => {
+                    const parsed = FileUtils._parseFileName(file.name);
+                    return {
+                        attributes: {
+                            name: parsed.title,
+                            artistName: parsed.artist,
+                            albumName: parsed.album,
+                            durationInMillis: parsed.duration ? parsed.duration * 1000 : undefined,
+                            isrc: parsed.isrc,
+                            platformId: parsed.platformId,
+                        },
+                        originalFile: file,
+                    };
+                });
+
+                const bestMatch = SimilarityUtils.findBestSongMatch(
+                    adaptedCandidates,
+                    songTitle,
+                    songArtist,
+                    songAlbum,
+                    songDuration,
+                    songISRC,
+                    songPlatformId
+                );
+
+                if (bestMatch?.scoreInfo?.score > 0) {
+                    console.debug("Top file match found on GDrive with score:", bestMatch.scoreInfo.score);
+                    const file = bestMatch.candidate.originalFile;
+                    
+                    // Populate local DB cache asynchronously in background if DB is enabled
+                    if (CACHE_CONFIG.DB_ENABLED) {
+                        (async () => {
+                            try {
+                                const parsed = FileUtils._parseFileName(file.name);
+                                const content = await gd.fetchFile(file.id);
+                                FileUtils._backfillDbRow(parsed, file, mimeType, folderID, content);
+                            } catch (cacheErr) {
+                                console.error("Failed to populate DB cache from GDrive:", cacheErr);
+                            }
+                        })();
+                    }
+                    return file;
+                }
+            } catch (error) {
+                console.error("Error searching for existing file on GDrive:", error);
+            }
+        }
+
+        return null;
     }
 
     // --- Specific File Type Finders ---
@@ -220,68 +415,106 @@ export class FileUtils {
      * @param {string|null} songPlatformId - The platform-specific ID of the song.
      * @param {object} env - The Hono context environment object.
      */
-    static async saveBestLyrics(source, fileName, rawData, convertedData, gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, env) {
-        let fileId;
-        try {
-            if (source === 'apple') {
-                const existingFile = await FileUtils.findExistingTTML(gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId);
-                if (existingFile) {
-                    fileId = await gd.updateFile(existingFile.id, rawData);
-                } else {
-                    fileId = await gd.uploadFile(
-                        `${fileName}.ttml`,
-                        'application/xml',
-                        rawData,
-                        GDRIVE.CACHED_TTML
-                    );
-                }
+    static async saveBestLyrics(...args) {
+        const source = String(args[0]).toLowerCase();
+        const fileName = args[1];
+        const rawData = args[2];
+        const key = `${source}:${fileName}`;
 
-            } else if (source === 'musixmatch') {
-                const existingFile = await FileUtils.findExistingFile(
-                    gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, GDRIVE.CACHED_MUSIXMATCH, 'application/json'
-                );
-                if (existingFile) {
-                    fileId = await gd.updateFile(existingFile.id, JSON.stringify(rawData));
-                } else {
-                    fileId = await gd.uploadFile(
-                        `${fileName}.json`,
-                        'application/json',
-                        JSON.stringify(rawData),
-                        GDRIVE.CACHED_MUSIXMATCH
-                    );
+        // Deduplicate rapid identical saves within 60s
+        const contentHash = getContentHash(rawData);
+        const recent = recentSavesCache.get(key);
+        if (recent && recent.contentHash === contentHash && Date.now() - recent.timestamp < RECENT_SAVE_TTL_MS) {
+            return recent.result;
+        }
+
+        const previous = cacheWriteLocks.get(key) || Promise.resolve();
+        const current = previous.catch(() => {}).then(async () => {
+            const res = await this._saveBestLyricsUnlocked(...args);
+            if (recentSavesCache.size >= MAX_RECENT_SAVES) {
+                const now = Date.now();
+                for (const [k, val] of recentSavesCache) {
+                    if (now - val.timestamp >= RECENT_SAVE_TTL_MS) {
+                        recentSavesCache.delete(k);
+                    }
                 }
-            } else if (source === 'spotify') {
-                const existingFile = await FileUtils.findExistingFile(
-                    gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, GDRIVE.CACHED_SPOTIFY, 'application/json'
-                );
-                if (existingFile) {
-                    fileId = await gd.updateFile(existingFile.id, JSON.stringify(rawData));
-                } else {
-                    fileId = await gd.uploadFile(
-                        `${fileName}.json`,
-                        'application/json',
-                        JSON.stringify(rawData),
-                        GDRIVE.CACHED_SPOTIFY
-                    );
-                }
-            } else if (source === 'qq') {
-                const existingFile = await FileUtils.findExistingFile(
-                    gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, GDRIVE.CACHED_QQ, 'application/xml'
-                );
-                if (existingFile) {
-                    fileId = await gd.updateFile(existingFile.id, rawData);
-                } else {
-                    fileId = await gd.uploadFile(
-                        `${fileName}.qrc`,
-                        'application/xml',
-                        rawData,
-                        GDRIVE.CACHED_QQ
-                    );
+                if (recentSavesCache.size >= MAX_RECENT_SAVES) {
+                    const oldest = recentSavesCache.keys().next().value;
+                    if (oldest) recentSavesCache.delete(oldest);
                 }
             }
+            recentSavesCache.set(key, { timestamp: Date.now(), contentHash, result: res });
+            return res;
+        });
+        cacheWriteLocks.set(key, current);
+        try {
+            return await current;
+        } finally {
+            if (cacheWriteLocks.get(key) === current) cacheWriteLocks.delete(key);
+        }
+    }
+
+    static async _saveBestLyricsUnlocked(source, fileName, rawData, convertedData, gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, env) {
+        let fileId;
+        const normalizedSource = source.toLowerCase().replace('-word', '');
+        try {
+            let folderId, mimeType, extension, payload;
+
+            if (normalizedSource === 'apple') {
+                folderId = GDRIVE.CACHED_TTML;
+                mimeType = 'application/xml';
+                extension = 'ttml';
+                payload = rawData;
+            } else if (normalizedSource === 'musixmatch') {
+                folderId = GDRIVE.CACHED_MUSIXMATCH;
+                mimeType = 'application/json';
+                extension = 'json';
+                payload = typeof rawData === 'string' ? rawData : JSON.stringify(rawData);
+            } else if (normalizedSource === 'spotify') {
+                folderId = GDRIVE.CACHED_SPOTIFY;
+                mimeType = 'application/json';
+                extension = 'json';
+                payload = typeof rawData === 'string' ? rawData : JSON.stringify(rawData);
+            } else if (normalizedSource === 'qq') {
+                folderId = GDRIVE.CACHED_QQ;
+                mimeType = 'application/xml';
+                extension = 'qrc';
+                payload = rawData;
+            } else if (normalizedSource === 'deezer') {
+                folderId = GDRIVE.CACHED_DEEZER;
+                mimeType = 'application/json';
+                extension = 'json';
+                payload = typeof rawData === 'string' ? rawData : JSON.stringify(rawData);
+            } else {
+                throw new Error(`Unsupported lyrics cache source: ${source}`);
+            }
+
+            // 1. First check by exact ISRC / Platform ID
+            let existingFile = null;
+            if (songISRC || songPlatformId) {
+                existingFile = await this.findExactMatchByIds(gd, songISRC, songPlatformId, folderId, mimeType);
+            }
+
+            // 2. Fallback to fuzzy metadata search
+            if (!existingFile) {
+                existingFile = await this.findExistingFile(gd, songTitle, songArtist, songAlbum, songDuration, songISRC, songPlatformId, folderId, mimeType);
+            }
+
+            if (existingFile) {
+                fileId = await gd.updateFile(existingFile.id, payload);
+            } else {
+                fileId = await gd.uploadFileWithFallback(
+                    `${fileName}.${extension}`,
+                    mimeType,
+                    payload,
+                    folderId
+                );
+            }
             console.log(`[ASYNC] Successfully saved best lyrics for song ${songTitle} by ${songArtist} from ${source} to Google Drive.`);
+            return fileId;
         } catch (error) {
             console.error(`[ASYNC] Failed to save lyrics from ${source}:`, error);
+            throw error;
         }
     }
 
@@ -333,7 +566,13 @@ export class FileUtils {
      * @returns {boolean} True if syllable sync information is present.
      */
     static hasSyllableSync(json) {
-        return !!json && (json.type === "Word" || json.type === "syllable");
+        if (!json) return false;
+        const type = String(json.type || '').toUpperCase();
+        if (type === "WORD" || type === "SYLLABLE") return true;
+        if (Array.isArray(json.lyrics) && json.lyrics.some(l => Array.isArray(l.syllabus) && l.syllabus.length > 0)) {
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -342,7 +581,13 @@ export class FileUtils {
      * @returns {boolean} True if line sync information is present.
      */
     static hasLineSync(json) {
-        return !!json && (json.type === "Line");
+        if (!json) return false;
+        const type = String(json.type || '').toUpperCase();
+        if (type === "LINE") return true;
+        if (Array.isArray(json.lyrics) && json.lyrics.length > 0 && !this.hasSyllableSync(json)) {
+            return true;
+        }
+        return false;
     }
 }
 

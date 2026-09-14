@@ -21,7 +21,7 @@ export function convertSpotifyToJSON(spotifyPayload) {
     if (originalType === "Line") {
         result.lyrics = (spotifyLyrics.lines || []).map((line, index) => ({
             time: Math.round(Number(line.startTimeMs)),
-            duration: Math.round(Number(line.endTimeMs) || ((spotifyLyrics.lines[index + 1]?.startTimeMs - line.startTimeMs) || 0)),
+            duration: durationFromEnd(line.startTimeMs, line.endTimeMs, Number(spotifyLyrics.lines[index + 1]?.startTimeMs) - Number(line.startTimeMs)),
             text: line.words,
             syllabus: [],
             element: {
@@ -49,7 +49,7 @@ export function convertSpotifyToJSON(spotifyPayload) {
                     currentLine.text += syllableText;
                     currentLine.syllabus.push({
                         time: Math.round(Number(syl.startTimeMs)),
-                        duration: Math.round(Number(syl.endTimeMs) || 500),
+                        duration: durationFromEnd(syl.startTimeMs, syl.endTimeMs, 500),
                         text: syllableText,
                     });
                 });
@@ -65,7 +65,7 @@ export function convertSpotifyToJSON(spotifyPayload) {
             } else {
                 result.lyrics.push({
                     time: Math.round(Number(line.startTimeMs)),
-                    duration: Math.round(Number(line.endTimeMs) || ((spotifyLyrics.lines[index + 1]?.startTimeMs - line.startTimeMs) || 0)),
+                    duration: durationFromEnd(line.startTimeMs, line.endTimeMs, Number(spotifyLyrics.lines[index + 1]?.startTimeMs) - Number(line.startTimeMs)),
                     text: line.words,
                     syllabus: [],
                     element: currentLine.element
@@ -76,8 +76,16 @@ export function convertSpotifyToJSON(spotifyPayload) {
     return result;
 }
 
+function durationFromEnd(startTimeMs, endTimeMs, fallback) {
+    const start = Number(startTimeMs);
+    const end = Number(endTimeMs);
+    const hasEnd = endTimeMs !== null && endTimeMs !== '' && Number.isFinite(end);
+    const duration = Number.isFinite(start) && hasEnd ? end - start : fallback;
+    return Math.max(0, Math.round(Number.isFinite(duration) ? duration : 0));
+}
+
 export function detectSongPart(line) {
-    const text = line.words.toLowerCase();
+    const text = (line?.words || "").toLowerCase();
     if (text.includes("[verse]") || text.includes("verse")) return "Verse";
     if (text.includes("[chorus]") || text.includes("chorus")) return "Chorus";
     if (text.includes("[bridge]") || text.includes("bridge")) return "Bridge";

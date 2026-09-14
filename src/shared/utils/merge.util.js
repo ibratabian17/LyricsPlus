@@ -11,6 +11,10 @@ const SYL_CROSS_WORD_PENALTY  = 9999; // syllables never straddle Apple word bou
 const SEQ_PENALTY_RATE        = 1e-7; // earlier seqIdx wins on tied cost
 const INTRA_WINDOW_NUDGE      = 0.05; // token closer to lineStart wins on tied cost
 
+const SYNTH_BAIL_THRESHOLD    = 0.50; // abort merge if >50 % of tokens are synthetic
+const OFFSET_MIN_MS           = 1000; // ignore sub-second systematic offsets
+const OFFSET_MAX_MAD_MS       = 3000; // reject offset estimate if QQ spread is too wide
+
 //  Mode detection 
 
 // Returns 'syllable' if QQ entries look like sub-word fragments, 'word' otherwise.
@@ -133,6 +137,37 @@ function tokenizeAppleLine(text) {
     return tokens;
 }
 
+//  Timing offset detection 
+
+// Compares Apple line texts against QQ line texts to detect a systematic time
+// offset (e.g. Apple cues lines early for display; QQ timestamps vocal onsets).
+// Returns the median delta in ms, or 0 if the offset is negligible / inconsistent.
+function estimateLineOffset(appleLines, wordLines) {
+    const deltas = [];
+    for (const al of appleLines) {
+        if (!al.time || !al.text) continue;
+        const aNorm = normalizeForMatch(al.text);
+        let bestSim = 0.5, bestDelta = null;
+        for (const ql of wordLines) {
+            if (ql.time == null) continue;
+            const sim = textSimilarity(aNorm, normalizeForMatch(ql.text ?? ''));
+            if (sim > bestSim) { bestSim = sim; bestDelta = ql.time - al.time; }
+        }
+        if (bestDelta !== null) deltas.push(bestDelta);
+    }
+    if (!deltas.length) return 0;
+    deltas.sort((a, b) => a - b);
+    const median = deltas[Math.floor(deltas.length / 2)];
+    const mad    = deltas.reduce((s, d) => s + Math.abs(d - median), 0) / deltas.length;
+    if (mad > OFFSET_MAX_MAD_MS) {
+        console.debug(`estimateLineOffset: spread too wide (MAD ${mad.toFixed(0)} ms) – skipping offset`);
+        return 0;
+    }
+    if (Math.abs(median) < OFFSET_MIN_MS) return 0;
+    console.debug(`estimateLineOffset: ${median > 0 ? '+' : ''}${median} ms (MAD ${mad.toFixed(0)} ms)`);
+    return median;
+}
+
 //  QQ pool 
 
 function flattenQQIntoWordPool(wordLines) {
@@ -173,7 +208,7 @@ function flattenQQIntoWordPool(wordLines) {
     return pool;
 }
 
-function collectCandidates(appleLines, qqPool) {
+function collectCandidates(appleLines, qqPool, lineOffset = 0) {
     const map = new Map();
     for (let i = 0; i < appleLines.length; i++) map.set(i, []);
 
@@ -184,8 +219,12 @@ function collectCandidates(appleLines, qqPool) {
             // bogus [-tolerance, +tolerance] window around 0 and collect every
             // early QQ token.
             if ((al.time == null || al.time === 0) && !al.duration) continue;
-            const lo = al.time - CANDIDATE_TOLERANCE_MS;
-            const hi = al.time + (al.duration || 0) + CANDIDATE_TOLERANCE_MS;
+            // Shift Apple's window by the detected systematic offset so that QQ
+            // tokens (which may be timed to vocal onset rather than display cue)
+            // still land inside the candidate window.
+            const centre = al.time + lineOffset;
+            const lo = centre - CANDIDATE_TOLERANCE_MS;
+            const hi = centre + (al.duration || 0) + CANDIDATE_TOLERANCE_MS;
             if (tok.time >= lo && tok.time <= hi) map.get(a).push(tok);
         }
     }
@@ -635,7 +674,8 @@ export function mergeAppleMetadataIntoWordSync(appleData, wordSyncData) {
     console.debug(`mergeAppleMetadataIntoWordSync: QQ mode = "${mode}"`);
 
     const qqPool           = flattenQQIntoWordPool(wordLines);
-    const candidatesByLine = collectCandidates(appleLines, qqPool);
+    const lineOffset       = estimateLineOffset(appleLines, wordLines);
+    const candidatesByLine = collectCandidates(appleLines, qqPool, lineOffset);
 
     const mergedLyrics = [];
     let totalWords = 0, totalSynth = 0;
@@ -701,6 +741,20 @@ export function mergeAppleMetadataIntoWordSync(appleData, wordSyncData) {
         mergedLyrics.push(line);
     }
 
+    console.debug(`QQ/Apple merge (${mode}): ${mergedLyrics.length} lines, ${totalSynth}/${totalWords} tokens synthesized`);
+
+    // Bail out if too many tokens had to be synthesized – this usually means the
+    // two sources are too far out of alignment to produce a useful result.  The
+    // caller should fall back to the raw QQ or Apple data instead.
+    const synthRatio = totalWords > 0 ? totalSynth / totalWords : 0;
+    if (synthRatio > SYNTH_BAIL_THRESHOLD) {
+        console.debug(
+            `QQ/Apple merge aborted: ${(synthRatio * 100).toFixed(1)} % synthetic ` +
+            `(${totalSynth}/${totalWords}) exceeds ${SYNTH_BAIL_THRESHOLD * 100} % threshold`
+        );
+        return null;
+    }
+
     const mergedMetadata = {
         source:         `QQ/Apple (${mode})`,
         songWriters:    appleMeta.songWriters?.length ? appleMeta.songWriters : (wordMeta.songWriters || []),
@@ -714,8 +768,6 @@ export function mergeAppleMetadataIntoWordSync(appleData, wordSyncData) {
     if (wordMeta.title)  mergedMetadata.title  = wordMeta.title;
     if (wordMeta.artist) mergedMetadata.artist = wordMeta.artist;
     if (wordMeta.album)  mergedMetadata.album  = wordMeta.album;
-
-    console.debug(`QQ/Apple merge (${mode}): ${mergedLyrics.length} lines, ${totalSynth}/${totalWords} tokens synthesized`);
 
     return { ...wordSyncData, type: 'Word', metadata: mergedMetadata, lyrics: mergedLyrics };
 }

@@ -1,11 +1,11 @@
 import crypto from "crypto";
 import { v4 as uuidv4 } from 'uuid';
-import { DbHandler } from "../utils/db.util.js";
 import { SimilarityUtils } from "../utils/similarity.util.js";
 import { FileUtils } from "../utils/file.util.js";
 import { convertMusixmatchToJSON } from "../parsers/musixmatch.parser.js";
 import { musixmatchAccountManager } from "../config.js";
 import { logger } from '../utils/logger.util.js';
+import { fetchWithProxy } from '../utils/fetch.util.js';
 
 const WEB_BASE_URL = 'https://apic-desktop.musixmatch.com/ws/1.1';
 const ANDROID_BASE_URL = 'https://apic.musixmatch.com/ws/1.1/';
@@ -21,6 +21,9 @@ const TOKEN_EXPIRY_SECONDS = 600;
 
 // Android client state management
 const androidClientStates = new Map();
+
+const webTokenCaches = new WeakMap();
+const webTokenPromises = new WeakMap();
 
 export class MusixmatchService {
 
@@ -48,10 +51,9 @@ export class MusixmatchService {
         } catch (error) {
             logger.warn(`Fetch failed with ${currentAccount.AUTH_TYPE} API:`, error.message);
 
-            const switched = musixmatchAccountManager.switchToNextAccount();
-            if (switched) {
+            const nextAccount = musixmatchAccountManager.getNextAccount(currentAccount);
+            if (nextAccount) {
                 logger.log('Trying next account...');
-                const nextAccount = musixmatchAccountManager.getCurrentAccount();
                 try {
                     return await this._fetchLyricsWithAccount(nextAccount, originalSongTitle, originalSongArtist, originalSongAlbum, originalSongDuration, songISRC, songPlatformId, gd, forceReload, env, requireWordSync);
                 } catch (retryError) {
@@ -129,7 +131,7 @@ export class MusixmatchService {
         if (account.AUTH_TYPE === 'android') {
             return await this._androidSearchTrack(query, account, env);
         } else {
-            const userToken = await this.getUserToken(env);
+            const userToken = await this.getUserToken(env, account);
             const url = new URL(`${WEB_BASE_URL}/track.search`);
             url.searchParams.set('page_size', '5');
             url.searchParams.set('f_has_lyrics', 'true');
@@ -139,13 +141,17 @@ export class MusixmatchService {
         }
     }
 
-    static async normalizeMusixmatchSong(track, account, env) {
+    static async normalizeMusixmatchSong(track, account, env, hydrate = true) {
         if (!account) account = musixmatchAccountManager.getCurrentAccount();
         let fullTrackDetails = track;
         let songwriters = [];
         let isrc = null;
 
         try {
+            if (!hydrate) {
+                isrc = track.track_isrc || null;
+                songwriters = (track.writer_list || []).map(writer => writer.writer_name);
+            } else {
             const advancedResult = await this.advancedTrackSearch({ q_track: track.track_name, q_artist: track.artist_name, q_album: track.album_name }, account, env);
             const advancedTrack = advancedResult?.message?.body?.track;
             if (advancedTrack) {
@@ -153,6 +159,7 @@ export class MusixmatchService {
                 isrc = advancedTrack.track_isrc || null;
                 const writerList = advancedTrack.writer_list || advancedTrack.credits?.writer_list || [];
                 songwriters = writerList.map(writer => writer.writer_name);
+            }
             }
         } catch (error) {
             logger.warn(`Failed to fetch advanced details for ${track.track_name}:`, error);
@@ -181,7 +188,7 @@ export class MusixmatchService {
         if (account.AUTH_TYPE === 'android') {
             return this.getSubtitle(trackId, account, env);
         } else {
-            const userToken = await this.getUserToken(env);
+            const userToken = await this.getUserToken(env, account);
             const url = new URL(`${WEB_BASE_URL}/track.lyrics.get`);
             url.searchParams.set('track_id', trackId);
             return this._makeWebRequest(url, userToken, account);
@@ -193,7 +200,7 @@ export class MusixmatchService {
         if (account.AUTH_TYPE === 'android') {
             return await this._androidGetSubtitle(trackId, account, env);
         } else {
-            const userToken = await this.getUserToken(env);
+            const userToken = await this.getUserToken(env, account);
             const url = new URL(`${WEB_BASE_URL}/track.subtitle.get`);
             url.searchParams.set('subtitle_format', 'lrc');
             url.searchParams.set('track_id', trackId);
@@ -206,7 +213,7 @@ export class MusixmatchService {
         if (account.AUTH_TYPE === 'android') {
             return await this._androidGetRichsync(trackId, account, env);
         } else {
-            const userToken = await this.getUserToken(env);
+            const userToken = await this.getUserToken(env, account);
             const url = new URL(`${WEB_BASE_URL}/track.richsync.get`);
             url.searchParams.set('track_id', trackId);
             return this._makeWebRequest(url, userToken, account);
@@ -222,7 +229,7 @@ export class MusixmatchService {
                 track_id: trackId
             });
         } else {
-            const userToken = await this.getUserToken(env);
+            const userToken = await this.getUserToken(env, account);
             const url = new URL(`${WEB_BASE_URL}/crowd.track.translations.get`);
             url.searchParams.set('translation_fields_set', 'minimal');
             url.searchParams.set('selected_language', language);
@@ -242,7 +249,7 @@ export class MusixmatchService {
             const mergedParams = { ...defaultParams, ...params };
             return await this._androidApiRequest(`${ANDROID_BASE_URL}matcher.track.get`, account, env, mergedParams);
         } else {
-            const userToken = await this.getUserToken(env);
+            const userToken = await this.getUserToken(env, account);
             const url = new URL(`${WEB_BASE_URL}/matcher.track.get`);
             const defaultParams = {
                 'subtitle_format': 'dfxp',
@@ -320,7 +327,7 @@ export class MusixmatchService {
             options.body = typeof body === 'string' ? body : JSON.stringify(body);
         }
 
-        const response = await fetch(urlObj.toString(), options);
+        const response = await fetchWithProxy(urlObj.toString(), options);
 
         const data = await response.json();
 
@@ -335,12 +342,7 @@ export class MusixmatchService {
         if (state) {
             state.currentToken = null;
             state.isLoggedIn = false;
-        }
-        try {
-            const kvHandler = new DbHandler(env.LYRICSPLUS);
-            await kvHandler.delete(ANDROID_TOKEN_KEY);
-        } catch (error) {
-            logger.warn('Could not delete Android token:', error.message);
+            state.expiresAt = 0;
         }
     }
 
@@ -367,39 +369,16 @@ export class MusixmatchService {
 
         const expirationTime = Date.now() + (TOKEN_EXPIRY_SECONDS * 1000);
 
-        try {
-            const kvHandler = new DbHandler(env.LYRICSPLUS);
-            await kvHandler.set(ANDROID_TOKEN_KEY, {
-                token: newToken,
-                expiryTime: expirationTime
-            }, TOKEN_EXPIRY_SECONDS);
-        } catch (err) {
-            logger.warn('Failed to cache token:', err.message);
-        }
-
-        return { loginNeeded: true, token: newToken };
+        return { loginNeeded: true, token: newToken, expiresAt: expirationTime };
     }
 
     static async _getAndroidToken(env, state) {
-        if (state.currentToken) {
-            state.isLoggedIn = true;
-            return { loginNeeded: false, token: state.currentToken };
+        if (state.currentToken && state.isLoggedIn && state.expiresAt > Date.now() + 30000) {
+            return { loginNeeded: false, token: state.currentToken, expiresAt: state.expiresAt };
         }
 
-        try {
-            const kvHandler = new DbHandler(env.LYRICSPLUS);
-            const cachedTokenData = await kvHandler.get(ANDROID_TOKEN_KEY);
-            const currentTime = Date.now();
-
-            if (cachedTokenData?.token && cachedTokenData?.expiryTime > currentTime) {
-                state.currentToken = cachedTokenData.token;
-                logger.log('Using cached Android token.');
-                state.isLoggedIn = true;
-                return { loginNeeded: false, token: state.currentToken };
-            }
-        } catch (error) {
-            logger.warn(`Could not read Android token: ${error.message}`);
-        }
+        state.currentToken = null;
+        state.isLoggedIn = false;
 
         logger.log('Fetching a new Android token...');
         return await this._fetchAndroidToken(env);
@@ -442,31 +421,39 @@ export class MusixmatchService {
                 email: account.EMAIL,
                 password: account.PASSWORD,
                 currentToken: null,
-                isLoggedIn: false
+                isLoggedIn: false,
+                expiresAt: 0,
+                initializationPromise: null,
             };
             androidClientStates.set(key, state);
         }
 
-        logger.log('Initializing Musixmatch Android client...');
-        try {
-            const { loginNeeded, token } = await this._getAndroidToken(env, state);
-            state.currentToken = token;
+        if (state.initializationPromise) return state.initializationPromise;
 
-            if (loginNeeded) {
-                await this._androidLogin(account, env, state);
-            }
+        state.initializationPromise = (async () => {
+            logger.log('Initializing Musixmatch Android client...');
+            try {
+                const { loginNeeded, token, expiresAt } = await this._getAndroidToken(env, state);
+                state.currentToken = token;
+                state.expiresAt = expiresAt;
 
-            logger.log('Android initialization successful. Logged in.');
-            return state;
-        } catch (error) {
-            logger.error(`Android initialization failed: ${error.message}`);
-            if (error.message.includes('401') && retryCount < 3) {
-                logger.log(`Received 401, attempting to refresh token and re-login (Attempt ${retryCount + 1})`);
-                await this._clearAndroidToken(env, key);
-                return await this._initializeAndroidClient(account, env, retryCount + 1);
+                if (loginNeeded) await this._androidLogin(account, env, state);
+
+                logger.log('Android initialization successful. Logged in.');
+                return state;
+            } catch (error) {
+                logger.error(`Android initialization failed: ${error.message}`);
+                if (error.message.includes('401') && retryCount < 1 && state.currentToken) {
+                    logger.log(`Received 401 with existing token, refreshing (Attempt ${retryCount + 1})`);
+                    await this._clearAndroidToken(env, key);
+                    state.initializationPromise = null;
+                    return await this._initializeAndroidClient(account, env, retryCount + 1);
+                }
+                throw error;
             }
-            throw error;
-        }
+        })().finally(() => { state.initializationPromise = null; });
+
+        return state.initializationPromise;
     }
 
     static async _androidApiRequest(url, account, env, params = {}, body = null, method = 'GET') {
@@ -529,21 +516,25 @@ export class MusixmatchService {
 
     // --- Web API Implementation ---
 
-    static async getUserToken(env) {
+    static async getUserToken(env, account = null) {
         try {
-            const kvHandler = new DbHandler(env.LYRICSPLUS);
-            const storedToken = await kvHandler.get(WEB_TOKEN_KEY);
-            if (storedToken?.expiryTime > Date.now()) return storedToken.token;
-
-            const currentAccount = musixmatchAccountManager.getCurrentAccount();
+            const currentAccount = account || musixmatchAccountManager.getCurrentAccount();
             if (!currentAccount) throw new Error('No Musixmatch account available.');
 
-            const data = await this._makeWebRequest(new URL(`${WEB_BASE_URL}/token.get`), null, currentAccount);
-            const token = data.message?.body?.user_token;
-            if (!token || token.includes('UpgradeOnly')) throw new Error('Invalid token received from Musixmatch.');
+            const cached = webTokenCaches.get(currentAccount);
+            if (cached?.expiryTime > Date.now()) return cached.token;
+            if (webTokenPromises.has(currentAccount)) return webTokenPromises.get(currentAccount);
 
-            await kvHandler.set(WEB_TOKEN_KEY, { token, expiryTime: Date.now() + 3600000 }, 3600);
-            return token;
+            const promise = (async () => {
+                const data = await this._makeWebRequest(new URL(`${WEB_BASE_URL}/token.get`), null, currentAccount);
+                const token = data.message?.body?.user_token;
+                if (!token || token.includes('UpgradeOnly')) throw new Error('Invalid token received from Musixmatch.');
+
+                webTokenCaches.set(currentAccount, { token, expiryTime: Date.now() + 3600000 });
+                return token;
+            })().finally(() => webTokenPromises.delete(currentAccount));
+            webTokenPromises.set(currentAccount, promise);
+            return promise;
         } catch (error) {
             logger.error('Error getting user token:', error);
             throw error;
@@ -560,7 +551,7 @@ export class MusixmatchService {
 
         if (!account) throw new Error('No Musixmatch account available.');
 
-        const response = await fetch(url.toString(), {
+        const response = await fetchWithProxy(url.toString(), {
             headers: {
                 'authority': 'apic-desktop.musixmatch.com',
                 'User-Agent': account.USER_AGENT,
@@ -611,58 +602,77 @@ export class MusixmatchService {
             `${title} ${artist}`,
             title
         ];
-        let candidates = [];
-        for (const query of queries) {
-            const searchResults = await this.searchTrack(query, account, env);
-            const tracks = searchResults.message?.body?.track_list || searchResults.message?.body?.macro_result_list?.track_list || [];
-            if (tracks.length > 0) {
-                if (songISRC) {
-                    for (const t of tracks) {
-                        const track = t.track || t;
-                        if (track.track_isrc === songISRC) {
-                            return track;
-                        }
-                    }
-                }
 
-                candidates.push(...tracks.map(t => {
+        // Fire both queries in parallel
+        const searchResults = await Promise.allSettled(
+            queries.map(q => this.searchTrack(q, account, env))
+        );
+
+        let candidates = [];
+        for (const settled of searchResults) {
+            if (settled.status !== 'fulfilled') continue;
+            const tracks = settled.value?.message?.body?.track_list || settled.value?.message?.body?.macro_result_list?.track_list || [];
+            if (tracks.length === 0) continue;
+
+            // Early exit on exact ISRC match
+            if (songISRC) {
+                for (const t of tracks) {
                     const track = t.track || t;
-                    return {
-                        attributes: {
-                            name: track.track_name,
-                            artistName: track.artist_name,
-                            albumName: track.album_name,
-                            durationInMillis: track.track_length * 1000
-                        },
-                        originalTrack: track
-                    };
-                }));
-                const bestMatch = SimilarityUtils.findBestSongMatch(candidates, title, artist, album, duration, songISRC);
-                if (bestMatch) return bestMatch.candidate.originalTrack;
+                    if (track.track_isrc === songISRC) return track;
+                }
             }
+
+            candidates.push(...tracks.map(t => {
+                const track = t.track || t;
+                return {
+                    attributes: {
+                        name: track.track_name,
+                        artistName: track.artist_name,
+                        albumName: track.album_name,
+                        durationInMillis: track.track_length * 1000
+                    },
+                    originalTrack: track
+                };
+            }));
         }
-        return null;
+
+        if (candidates.length === 0) return null;
+        const bestMatch = SimilarityUtils.findBestSongMatch(candidates, title, artist, album, duration, songISRC);
+        return bestMatch ? bestMatch.candidate.originalTrack : null;
     }
 
     static async _fetchLyricsFromApi(trackId, account, env, requireWordSync) {
-        try {
-            const richLyrics = await this.getRichLyrics(trackId, account, env);
-            if (richLyrics?.message?.body?.richsync) {
-                return { lyrics: richLyrics, type: 'richsync' };
-            }
-        } catch (error) {
-            logger.warn('Failed to fetch richsync lyrics:', error);
-        }
-
-        if (!requireWordSync) {
+        if (requireWordSync) {
+            // Only need richsync, no point fetching subtitle
             try {
-                const subtitleLyrics = await this.getSubtitle(trackId, account, env);
-                if (subtitleLyrics?.message?.body?.subtitle) {
-                    return { lyrics: subtitleLyrics, type: 'subtitle' };
+                const richLyrics = await this.getRichLyrics(trackId, account, env);
+                if (richLyrics?.message?.body?.richsync) {
+                    return { lyrics: richLyrics, type: 'richsync' };
                 }
             } catch (error) {
-                logger.warn('Failed to fetch subtitle lyrics:', error);
+                logger.warn('Failed to fetch richsync lyrics:', error);
             }
+            return null;
+        }
+
+        // Fetch both in parallel — prefer richsync, fall back to subtitle
+        const [richResult, subtitleResult] = await Promise.allSettled([
+            this.getRichLyrics(trackId, account, env),
+            this.getSubtitle(trackId, account, env)
+        ]);
+
+        if (richResult.status === 'fulfilled' && richResult.value?.message?.body?.richsync) {
+            return { lyrics: richResult.value, type: 'richsync' };
+        }
+        if (richResult.status === 'rejected') {
+            logger.warn('Failed to fetch richsync lyrics:', richResult.reason);
+        }
+
+        if (subtitleResult.status === 'fulfilled' && subtitleResult.value?.message?.body?.subtitle) {
+            return { lyrics: subtitleResult.value, type: 'subtitle' };
+        }
+        if (subtitleResult.status === 'rejected') {
+            logger.warn('Failed to fetch subtitle lyrics:', subtitleResult.reason);
         }
 
         return null;

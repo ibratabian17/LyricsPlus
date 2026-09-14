@@ -1,6 +1,8 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { SERVER } from '../config.js';
 
 const requestContext = new AsyncLocalStorage();
+const MAX_BUFFER_LOGS = 100;
 
 export function runWithRequestContext(context, fn) {
     return requestContext.run(context, fn);
@@ -19,6 +21,7 @@ function formatArgs(args) {
 }
 
 function emit(level, args) {
+    if (SERVER.DISABLE_LOGGING) return;
     const store = requestContext.getStore();
     const id = store?.requestId;
     const prefix = id ? `[${id}] ` : '';
@@ -37,13 +40,18 @@ function emit(level, args) {
     // Local dev: buffer logs for grouped output
     const formatted = id ? [`[${id}]`, ...args] : args;
     if (store?.buffer) {
-        store.buffer.push({ level, args: formatted });
+        if (store.buffer.length < MAX_BUFFER_LOGS) {
+            store.buffer.push({ level, args: formatted });
+        } else if (store.buffer.length === MAX_BUFFER_LOGS) {
+            store.buffer.push({ level: 'warn', args: [`[${id || '?'}] ... logs truncated (max ${MAX_BUFFER_LOGS} per request reached)`] });
+        }
     } else {
         console[level](...formatted);
     }
 }
 
 export function flushLogs() {
+    if (SERVER.DISABLE_LOGGING) return;
     const store = requestContext.getStore();
     if (!store?.buffer || store.buffer.length === 0) return;
 

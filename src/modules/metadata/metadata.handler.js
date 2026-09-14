@@ -15,7 +15,6 @@ export async function handleMetadataGet(c) {
     const songDuration = query.duration;
 
     try {
-        const dev_token = await AppleMusicService.getAppleMusicAuth();
         const storefront = await AppleMusicService.getStorefront();
 
         const searchQueries = [
@@ -30,7 +29,7 @@ export async function handleMetadataGet(c) {
 
         for (const query of searchQueries) {
             try {
-                const searchData = await AppleMusicService.searchSong(query, dev_token, storefront);
+                const searchData = await AppleMusicService.searchSong(query, storefront);
                 const newCandidates = searchData.results?.songs?.data || [];
                 candidates = candidates.concat(newCandidates);
 
@@ -60,6 +59,6 @@ export async function handleMetadataGet(c) {
         }
     } catch (error) {
         console.error("Error in to get metadata:", error);
-        return c.json({ error: error.message }, 500);
+        return c.json({ error: "Internal Server Error" }, 500);
     }
 }

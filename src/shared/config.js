@@ -3,21 +3,83 @@ export const LYRICSPLUS = {
     ALLOW_SUBMISSIONS: false, //default USERTML_JSON are locked to official apis, set to true to allow crowdsourced submission
 };
 
+export const SERVER = {
+    PORT: process.env.PORT || 3000,
+    DISABLE_LOGGING: process.env.DISABLE_LOGGING === 'true',
+    PROXY: {
+        ENABLED: false,
+        ACCESS_TOKEN: process.env.PROXY_ACCESS_TOKEN || "",
+        URLS: [
+            "https://proxy-lyplus.prjktla.workers.dev/?url="
+        ],
+    },
+}
+
+// Environment runtime detection
+
+export const CACHE_CONFIG = {
+    GDRIVE_ENABLED: true,
+    // On by default. Queries run in a worker thread (db.worker.js), so the DB
+    // no longer blocks the main event loop; set DB_ENABLED=false to disable.
+    DB_ENABLED: process.env.DB_ENABLED !== 'false',
+    DB_PATH: (typeof process !== 'undefined' ? process.env.CACHE_DB_PATH : undefined) || 'database/lyrics_cache.db',
+};
+
+
+/**
+ * Parses a comma-separated env variable into an array of non-empty folder IDs.
+ * Falls back to the provided default string (also comma-splittable).
+ * @param {string|undefined} envValue
+ * @param {string} defaultValue
+ * @returns {string[]}
+ */
+function parseFolderIds(envValue, defaultValue) {
+    const raw = envValue || defaultValue || '';
+    return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
 export const GDRIVE = {
-    CACHED_SPOTIFY: process.env.GDRIVE_CACHED_SPOTIFY || "-2D0LTCsP1VSD", //Spotify
-    CACHED_TTML: process.env.GDRIVE_CACHED_TTML || "", //Apple Music
-    USERTML_JSON: process.env.GDRIVE_USERTML_JSON || "1RFoNsI5wAsRjQSVDOMaotDmMZNIQOWnW", //Lyrics+
-    CACHED_MUSIXMATCH: process.env.GDRIVE_CACHED_MUSIXMATCH || "", //Musixmatch
+    // Each value is an array of folder IDs. The first is the primary; extras are fallbacks.
+    // Set via env as comma-separated IDs, e.g. GDRIVE_CACHED_SPOTIFY="id1,id2,id3"
+    CACHED_SPOTIFY: parseFolderIds(process.env.GDRIVE_CACHED_SPOTIFY, ""), //Spotify
+    CACHED_TTML: parseFolderIds(process.env.GDRIVE_CACHED_TTML, ""), //Apple Music
+    USERTML_JSON: parseFolderIds(process.env.GDRIVE_USERTML_JSON, "1RFoNsI5wAsRjQSVDOMaotDmMZNIQOWnW"), //Lyrics+
+    CACHED_MUSIXMATCH: parseFolderIds(process.env.GDRIVE_CACHED_MUSIXMATCH, ""), //Musixmatch
+    CACHED_QQ: parseFolderIds(process.env.GDRIVE_CACHED_QQ, ""), //QQ Music
+    CACHED_DEEZER: parseFolderIds(process.env.GDRIVE_CACHED_DEEZER, ""),
     API_URL: "https://www.googleapis.com/drive/v3/files/",
     API_URL_UPDATE: "https://www.googleapis.com/upload/drive/v2/files/",
 };
 
-export const AUTH_KEY = {
-    //your gdrive tokem
+function parseGDriveAccounts(envValue, defaultAccounts) {
+    if (!envValue) return defaultAccounts;
+    try {
+        const parsed = JSON.parse(envValue);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    } catch {
+        // Fallback: expect format "CLIENT_ID1|CLIENT_SECRET1|REFRESH_TOKEN1,CLIENT_ID2|CLIENT_SECRET2|REFRESH_TOKEN2"
+        const accounts = envValue.split(',').map(item => {
+            const [client_id, client_secret, refresh_token, root] = item.split('|').map(s => s.trim());
+            if (client_id && client_secret && refresh_token) {
+                return { CLIENT_ID: client_id, CLIENT_SECRET: client_secret, REFRESH_TOKEN: refresh_token, ROOT: root || "" };
+            }
+            return null;
+        }).filter(Boolean);
+        if (accounts.length > 0) return accounts;
+    }
+    return defaultAccounts;
+}
+
+const DEFAULT_GDRIVE_ACCOUNT = {
     CLIENT_ID: process.env.AUTH_KEY_CLIENT_ID || "",
     CLIENT_SECRET: process.env.AUTH_KEY_CLIENT_SECRET || "",
     REFRESH_TOKEN: process.env.AUTH_KEY_REFRESH_TOKEN || "",
     ROOT: process.env.AUTH_KEY_ROOT || "",
+};
+
+export const AUTH_KEY = {
+    ...DEFAULT_GDRIVE_ACCOUNT,
+    ACCOUNTS: parseGDriveAccounts(process.env.GDRIVE_ACCOUNTS, [DEFAULT_GDRIVE_ACCOUNT]),
 };
 
 export const APPLE_MUSIC = {
@@ -48,9 +110,23 @@ export const SPOTIFY = {
     TOKEN_URL: "https://open.spotify.com/get_access_token?reason=transport&productType=web_player",
     ACCOUNTS: [
         {
-            CLIENT_ID: process.env.SPOTIFY_CLIENT_ID || "cbdd4b5851cd4d0fa249cacc1ea7a0e4",
-            CLIENT_SECRET: process.env.SPOTIFY_CLIENT_SECRET || "562d33b90615422ca4f6d703aacb45c9",
-            COOKIE: process.env.SPOTIFY_COOKIE || "sp_t=96771266227b46d8b68ab1e033768973; sp_landing=https%3A%2F%2Fopen.spotify.com%2F%3Fsp_cid%3D96771266227b46d8b68ab1e033768973%26device%3Ddesktop; sp_dc=AQAiuYC-8wzOhvLxtqqEG2CvVpH9qQcg6xQVujJjrrjT9fFBfqcKwomXTCG8E1WQ8aDT6FpK7-DhAimIhjKkzi-I1wttxPRD-rAZ2UBDeDdRlWnr8u7xUShvqwUYWWU7TS8YoBSfaL2ujiBF-J98f8AbTv2Qc_0lOWwM_UQIQ7Gt47nfhJUsIMqHLobZHOcWrQKTi4qvIVXWdx-5AumB0w20g9vXdDPUunEcP_KtjeYm63ojJHXGKNAPCj3dTM-e54la5Vi5zaMGN60; sp_key=6a87c3b6-2224-41ad-b6d9-98a67e80c506; OptanonAlertBoxClosed=2025-03-21T14:19:54.213Z; OptanonConsent=isGpcEnabled=0&datestamp=Fri+Mar+21+2025+22%3A12%3A17+GMT%2B0700+(Western+Indonesia+Time)&version=202411.2.0&browserGpcFlag=0&isIABGlobal=false&hosts=&landingPath=NotLandingPage&groups=s00%3A1%2Cf00%3A1%2Cm00%3A1%2Ct00%3A1%2Ci00%3A1%2Cf11%3A1%2Cm03%3A1&geolocation=ID%3BJT&AwaitingReconsent=false"
+            CLIENT_ID: process.env.SPOTIFY_CLIENT_ID || "",
+            CLIENT_SECRET: process.env.SPOTIFY_CLIENT_SECRET || "",
+            COOKIE: process.env.SPOTIFY_COOKIE || ""
+        }
+    ]
+};
+
+export const DEEZER = {
+    AUTH_URL: process.env.DEEZER_AUTH_URL || "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c",
+    GRAPHQL_URL: process.env.DEEZER_GRAPHQL_URL || "https://pipe.deezer.com/api",
+    SEARCH_URL: process.env.DEEZER_SEARCH_URL || "https://api.deezer.com/search/track",
+    ACCOUNTS: [
+        {
+            NAMEID: "DeezerDefault",
+            AUTH_TYPE: "refresh-token",
+            REFRESH_TOKEN: process.env.DEEZER_REFRESH_TOKEN || "",
+            ARL: process.env.DEEZER_ARL || "",
         }
     ]
 };
@@ -79,6 +155,12 @@ export class AccountManager {
         return this.accounts[this.currentIndex];
     }
 
+    getNextAccount(account) {
+        if (this.accounts.length <= 1) return null;
+        const index = this.accounts.indexOf(account);
+        return this.accounts[(Math.max(index, 0) + 1) % this.accounts.length];
+    }
+
     switchToNextAccount() {
         if (this.accounts.length <= 1) {
             console.warn("Only one account available, cannot switch.");
@@ -98,3 +180,4 @@ export class AccountManager {
 export const appleMusicAccountManager = new AccountManager(APPLE_MUSIC.ACCOUNTS);
 export const spotifyAccountManager = new AccountManager(SPOTIFY.ACCOUNTS);
 export const musixmatchAccountManager = new AccountManager(MUSIXMATCH.ACCOUNTS);
+export const deezerAccountManager = new AccountManager(DEEZER.ACCOUNTS);

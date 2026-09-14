@@ -40,7 +40,11 @@ async function verifyProofOfWork(challenge, nonce, difficulty) {
 export async function handleChallenge(c) {
     if (!LYRICSPLUS.JWT_SECRET) {
         console.error("CRITICAL: JWT_SECRET is not configured in config.js.");
-        return c.json({ error: "Server configuration error" }, 500);
+        return c.json({ error: "Server configuration error" }, 500, {
+            "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        });
     }
 
     const challenge = crypto.randomUUID();
@@ -49,15 +53,19 @@ export async function handleChallenge(c) {
     return c.json({
         token,
         difficulty: POW_DIFFICULTY
-    }, 200);
+    }, 200, {
+        "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    });
 }
 
 export async function handleSubmit(c) {
     try {
-        if(!LYRICSPLUS.ALLOW_SUBMISSIONS) {
+        if (!LYRICSPLUS.ALLOW_SUBMISSIONS) {
             return c.json({ error: "Submissions are currently disabled" }, 503);
         }
-        
+
         const payload = await c.req.json();
         const { proofOfWorkToken, nonce, ...lyricsSubmitData } = payload;
 

@@ -2,7 +2,7 @@
 
 This is the backend service for LyricsPlus, primarily functioning as a lyrics scraper and provider for Youly+. Its main purpose is to fetch platform-specific lyrics timelines for users.
 
-Due too high request traffic, the main server `https://lyricsplus.prjktla.my.id` unable to serve the lyrics properly. this project requires funding to run on a better server. I'm currently unable to cover the costs due to financial constraints. If you're interested in lending us your server, please feel free to do so.
+Due too high request traffic, the main server `https://lyricsplus.prjktla.my.id`  may unable to serve the lyrics properly due bandwidth limitation. this project requires funding to run on a better server. I'm currently unable to cover the costs due to financial constraints. If you're interested in lending us your server, please feel free to do so. and also the main server is dead because the provider tought this code is doing DoS to a Bank Mandiri.
 
 ## Features
 
@@ -12,7 +12,7 @@ Due too high request traffic, the main server `https://lyricsplus.prjktla.my.id`
 *   **Song Catalog Search**: Provides a search functionality for the song catalog.
 *   **Advanced Similarity Matching**: Matches songs across different services.
 *   **Caching**: Caches lyrics on Google Drive to optimize response times.
-*   **Multi-Environment Support**: Built with Hono.js for deployment across Node.js, Cloudflare Workers, and Vercel Edge Functions.
+*   **Multi-Environment Support**: Built with Hono.js for deployment across Bun, Node.js, Cloudflare Workers, and Vercel Edge Functions.
 
 ## How It Works
 
@@ -32,7 +32,7 @@ For a detailed list and explanation of all API endpoints, please refer to [docs/
 
 2. **Install dependencies**:
    ```bash
-   npm install
+   bun install
    ```
 
 3. **Configuration / Environment Variables**:
@@ -41,7 +41,7 @@ For a detailed list and explanation of all API endpoints, please refer to [docs/
    *   **Google Drive Setup** (For caching):
        *   Requires obtaining the `AUTH_KEY` details using `rsync` to get the necessary authentication keys for the service account to cache and fetch lyrics.
        *   Fields to configure: `AUTH_KEY_CLIENT_ID`, `AUTH_KEY_CLIENT_SECRET`, `AUTH_KEY_REFRESH_TOKEN`, `AUTH_KEY_ROOT`.
-       *   File configuration IDs: `GDRIVE_SEARCH_CACHE_FILE_ID`, `GDRIVE_SONGS_FILE_ID`, `GDRIVE_CACHED_SPOTIFY`, `GDRIVE_CACHED_TTML`, `GDRIVE_USERTML_JSON`, `GDRIVE_CACHED_MUSIXMATCH`, `GDRIVE_CACHED_QQ`.
+       *   File configuration IDs: `GDRIVE_CACHED_SPOTIFY`, `GDRIVE_CACHED_TTML`, `GDRIVE_USERTML_JSON`, `GDRIVE_CACHED_MUSIXMATCH`, `GDRIVE_CACHED_QQ`.
 
    *   **Apple Music Accounts**:
        *   **MANDATORY**: An active Apple Music subscription is required to fetch syllable-synced lyrics (`.ttml`).
@@ -60,24 +60,40 @@ For a detailed list and explanation of all API endpoints, please refer to [docs/
            *   For `web`: configure `MUSIXMATCH_USER_AGENT`, `MUSIXMATCH_COOKIE`.
            *   For `android`: configure `MUSIXMATCH_ANDROID_EMAIL`, `MUSIXMATCH_ANDROID_PASSWORD`.
 
-   *   **General**:
-       *   `JWT_SECRET`: Used for API keys to protect upload endpoints.
+    *   **General**:
+        *   `JWT_SECRET`: Used for API keys to protect upload endpoints.
+        *   `SUBMISSION_UPDATE_KEY`: Required in the `x-submission-update-key` header when replacing existing lyrics.
+        *   Cloudflare uses the configured `SUBMISSION_REPLAY_GUARD` Durable Object to consume proof-of-work challenges atomically. A single-process Bun/Node deployment may set `ALLOW_IN_MEMORY_REPLAY_GUARD=true`; do not enable it with multiple application instances.
+        *   Vercel and multi-instance Bun/Node deployments require `SUBMISSION_REPLAY_GUARD_URL` and `SUBMISSION_REPLAY_GUARD_TOKEN`. The service must atomically claim a `jti` until `expiresAt`, returning `201` for the first claim and `409` for replays. Submissions fail closed with `503` when no distributed guard is configured.
+        *   Standalone proxies require both `PROXY_ALLOWED_HOSTS` (comma-separated exact trusted hostnames) and `PROXY_ACCESS_TOKEN`. The backend uses the same `PROXY_ACCESS_TOKEN` when proxying is enabled.
 
 4. **Run the server**:
    To start the application locally:
    ```bash
-   npm start
+   bun run start
    ```
-   For development with Wrangler (Cloudflare Workers):
+   For development with hot reload:
    ```bash
-   npm run dev
+   bun run dev
    ```
+   For deployment with Wrangler (Cloudflare Workers):
+   ```bash
+   bun run deploy
+   ```
+
+5. **Verify changes**:
+   ```bash
+   bun test
+   bun audit
+   ```
+
+Google Drive cleanup tools support `DRY_RUN=true` to report planned deletions without modifying files.
 
 ## Deployment
 
 Configured for flexible deployment:
 
-*   **Vercel**: Via `vercel.json`.
+*   **Vercel**: Via `vercel.json`. Lyrics retrieval works without additional state; submissions require the atomic replay-guard HTTP service described above.
 *   **Cloudflare Workers**: Via `wrangler.toml`.
 
 ## Documentation

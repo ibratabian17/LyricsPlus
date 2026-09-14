@@ -4,7 +4,7 @@ This document outlines the architectural design of the LyricsPlus Backend, which
 
 ## Hono.js Framework
 
-Hono.js is a lightweight, fast, and edge-optimized web framework. It provides a minimalistic yet powerful API for building web applications and APIs, compatible with various JavaScript runtimes like Node.js, Cloudflare Workers, and Vercel Edge Functions.
+Hono.js is a lightweight, fast, and edge-optimized web framework. It provides a minimalistic yet powerful API for building web applications and APIs, compatible with various JavaScript runtimes like Bun, Node.js, Cloudflare Workers, and Vercel Edge Functions.
 
 ### Key Concepts in Hono.js
 
@@ -19,7 +19,7 @@ The project follows a modular structure, primarily organized within the `src/` d
 
 *   **`src/index.js`**: The main entry point for edge environments (e.g., Cloudflare Workers), exposing the Hono app's fetch handler.
 *   **`src/app/app.js`**: Initializes the Hono.js application instance and applies global middleware.
-*   **`src/app/server.js`**: Configures and starts the HTTP server for Node.js environments.
+*   **`src/app/server.js`**: Configures and starts the HTTP server using native `Bun.serve` (with fallback to `@hono/node-server` for Node.js).
 *   **`src/modules/`**: Contains feature-specific modules, each encapsulating its own routes, handlers, and services. This promotes separation of concerns and easier maintenance.
     *   Each module typically has a `handler.js` file that defines the module's routes and their corresponding logic. Some modules may also include a `controller.js` file for additional business logic or data processing.
 *   **`src/shared/`**: Contains common utilities, configurations, middleware, parsers, and services that are shared across different modules.
@@ -31,7 +31,7 @@ The project follows a modular structure, primarily organized within the `src/` d
 
 ## Request Flow
 
-1.  An incoming HTTP request is received by the server (e.g., Node.js, Cloudflare Worker).
+1.  An incoming HTTP request is received by the server (e.g., Bun, Node.js, Cloudflare Worker).
 2.  The request is passed to the `app` instance.
 3.  Global middleware (defined in `src/app/app.js`) are executed.
 4.  Hono.js matches the request path and method to a defined route within one of the modules in `src/modules/`.

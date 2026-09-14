@@ -9,7 +9,7 @@ export function convertQQToJSON(qrcString, exactMetadata = {}) {
         // next attribute or tag close to handle literal quotes inside the value.
         const attrMatch = qrcString.match(/LyricContent="([\s\S]*?)"\s*(?:\/?>|[a-zA-Z]+=)/);
         const lyricContent = attrMatch
-            ? attrMatch[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+            ? attrMatch[1].replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&')
             : qrcString;
 
         const { lines, agents } = parseQRC(lyricContent, exactMetadata);

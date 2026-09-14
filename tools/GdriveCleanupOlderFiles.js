@@ -5,6 +5,7 @@ const googleDrive = new GoogleDrive();
 const CONCURRENCY_LIMIT = Number(process.env.CONCURRENCY) || 30;
 const DRY_RUN = process.env.DRY_RUN === "true";
 const TARGET_FILTER = process.argv.slice(2).find(arg => !arg.startsWith("--")) || process.env.FOLDER || "";
+const SIX_MONTHS_MS = 6 * 30 * 24 * 60 * 60 * 1000; // Approximate 6 months in milliseconds
 
 const RETRY_OPTIONS = {
   maxAttempts: 5,
@@ -84,10 +85,12 @@ async function deleteBatch(files, cacheName, stats) {
 }
 
 /**
- * Cleans cache folder using streaming pages to keep memory usage O(1).
+ * Cleans up old cache files (older than 6 months) using server-side query filtering and streaming.
  */
-async function cleanCacheStream(folderId, cacheName) {
-  console.log(`[${cacheName}] Starting stream cleanup...`);
+async function cleanupOldCacheStream(folderId, cacheName) {
+  const cutoffDate = new Date(Date.now() - SIX_MONTHS_MS);
+  const cutoffIso = cutoffDate.toISOString();
+  console.log(`[${cacheName}] Scanning for files older than ${cutoffDate.toISOString().slice(0, 10)}...`);
 
   const startTime = Date.now();
   const stats = {
@@ -97,42 +100,51 @@ async function cleanCacheStream(folderId, cacheName) {
       const elapsedSec = (Date.now() - startTime) / 1000;
       const speed = elapsedSec > 0 ? (stats.deleted / elapsedSec).toFixed(1) : "0.0";
       process.stdout.write(
-        `\r[${cacheName}] ${stats.deleted} items ${DRY_RUN ? "would be deleted" : "deleted"} (${speed}/s)`
+        `\r[${cacheName}] ${stats.deleted} old file(s) ${DRY_RUN ? "would be deleted" : "deleted"} (${speed}/s)`
       );
     }
   };
 
+  // Google Drive server-side query: modifiedTime < cutoff
+  const extraQuery = `modifiedTime < '${cutoffIso}'`;
   let pageIndex = 0;
+  let totalFound = 0;
 
   for await (const { files } of googleDrive.listFilesStream(folderId, {
-    fields: "files(id,name)",
+    extraQuery,
+    fields: "files(id,name,modifiedTime,createdTime)",
     pageSize: 1000
   })) {
     if (isAborted) break;
 
     pageIndex++;
+    totalFound += files.length;
     if (files.length === 0 && pageIndex === 1) {
-      console.log(`[${cacheName}] Folder is already empty.`);
+      console.log(`[${cacheName}] No files older than 6 months found.`);
       return 0;
     }
 
     await deleteBatch(files, cacheName, stats);
   }
 
-  process.stdout.write("\n");
-  if (stats.failures.length > 0) {
-    console.warn(`[${cacheName}] ${stats.failures.length} deletion(s) failed.`);
+  if (totalFound > 0) {
+    process.stdout.write("\n");
+    if (stats.failures.length > 0) {
+      console.warn(`[${cacheName}] ${stats.failures.length} deletion(s) failed.`);
+    }
+    console.log(`[${cacheName}] Done. Total removed: ${stats.deleted} old file(s).`);
+  } else if (pageIndex > 1) {
+    console.log(`\n[${cacheName}] Done. No more old files found.`);
   }
 
-  console.log(`[${cacheName}] Done. Total deleted: ${stats.deleted}`);
   return stats.deleted;
 }
 
 async function main() {
   console.log("========================================");
-  console.log("     Google Drive Cache Cleanup         ");
-  console.log(`     Concurrency: ${CONCURRENCY_LIMIT} | Dry Run: ${DRY_RUN}`);
-  if (TARGET_FILTER) console.log(`     Filter: "${TARGET_FILTER}"`);
+  console.log("   Google Drive Cleanup (Older Files)   ");
+  console.log(`   Threshold: > 6 Months | Concurrency: ${CONCURRENCY_LIMIT} | Dry Run: ${DRY_RUN}`);
+  if (TARGET_FILTER) console.log(`   Filter: "${TARGET_FILTER}"`);
   console.log("========================================\n");
 
   const caches = [
@@ -155,14 +167,20 @@ async function main() {
         continue;
       }
 
-      grandTotal += await cleanCacheStream(id, folderName);
+      grandTotal += await cleanupOldCacheStream(id, folderName);
     }
   }
 
-  console.log(`\nAll cache cleanup finished. Grand Total: ${grandTotal} item(s).`);
+  console.log("\n========================================");
+  if (grandTotal === 0) {
+    console.log("No old files found. All caches are fresh!");
+  } else {
+    console.log(`Cleanup complete. Total removed: ${grandTotal} old file(s).`);
+  }
+  console.log("========================================");
 }
 
 main().catch((error) => {
-  console.error("Cache cleanup failed:", error);
+  console.error("Cleanup failed:", error);
   process.exitCode = 1;
 });

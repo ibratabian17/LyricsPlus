@@ -18,11 +18,11 @@ export function convertLRCLIBtoJSON(data) {
   }
 
   lines.forEach((line, index) => {
-    const match = line.match(/^\\[(\\d+):(\\d+)\\.(\\d+)]\\s*(.*)$/);
+    const match = line.match(/^\[(\d+):(\d+)\.(\d+)]\s*(.*)$/);
     if (match) {
       const minutes = parseInt(match[1], 10);
       const seconds = parseInt(match[2], 10);
-      const milliseconds = parseInt(match[3], 10);
+      const milliseconds = Math.round(parseInt(match[3], 10) * (1000 / (10 ** match[3].length)));
       const text = match[4];
 
       const time = minutes * 60000 + seconds * 1000 + milliseconds;

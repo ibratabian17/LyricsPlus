@@ -344,7 +344,8 @@ export class QQService {
             // For now, if it's LRC format, our parser wants QRC XML.
             // Let's wrap it.
             if (!content.includes("<QrcInfos>")) {
-                return `<?xml version="1.0" encoding="utf-8"?>\n<QrcInfos>\n<LyricInfo LyricCount="1">\n<Lyric_1 LyricType="1" LyricContent="${content}"/>\n</LyricInfo>\n</QrcInfos>`;
+                const escapedContent = content.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                return `<?xml version="1.0" encoding="utf-8"?>\n<QrcInfos>\n<LyricInfo LyricCount="1">\n<Lyric_1 LyricType="1" LyricContent="${escapedContent}"/>\n</LyricInfo>\n</QrcInfos>`;
             }
             return content;
         }

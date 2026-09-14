@@ -54,7 +54,7 @@ function parseSubtitleToRaw(subtitleBody) {
             acc.push({ time, text: text.trim() });
         }
         return acc;
-    }, []);
+    }, []).sort((a, b) => a.time - b.time);
 }
 
 function parseRichsyncToRaw(richsyncBody, requireWordSync) {
@@ -109,7 +109,7 @@ function processSubtitleLines(lines) {
         const nextLine = lines[index + 1];
         
         if (nextLine) {
-            duration = nextLine.time - line.time;
+            duration = Math.max(0, nextLine.time - line.time);
         }
 
         if (index > 0 && (line.time - lastLineEnd) > 15000) {

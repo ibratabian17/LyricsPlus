@@ -4,20 +4,26 @@
  * If all lines already have songPartIndex, returns the object unchanged.
  */
 export function normalizeV2(data) {
-  if (data.lyrics?.length > 0 && data.lyrics.every(l => l.element?.songPartIndex != null)) {
+  const lyrics = Array.isArray(data?.lyrics) ? data.lyrics : [];
+  if (lyrics.length === 0 || lyrics.every(l => l.element?.songPartIndex != null)) {
     return data;
   }
 
-  const songParts = [];
+  const existingPartCount = Array.isArray(data.metadata?.songParts) ? data.metadata.songParts.length : 0;
+  const songParts = (data.metadata?.songParts || []).map(part => ({ ...part }));
   let currentPartName = null;
   let currentPartIndex = -1;
 
-  const normalizedLyrics = data.lyrics.map(line => {
+  const normalizedLyrics = lyrics.map(line => {
+    if (line.element?.songPartIndex != null) {
+      currentPartName = null;
+      return line;
+    }
     const partName = line.element?.songPart || '';
 
     if (partName !== currentPartName) {
       currentPartName = partName;
-      currentPartIndex++;
+      currentPartIndex = songParts.length;
       songParts.push({ name: partName });
     }
 
@@ -32,6 +38,7 @@ export function normalizeV2(data) {
   normalizedLyrics.forEach(line => {
     const idx = line.element.songPartIndex;
     const part = songParts[idx];
+    if (!part || idx < existingPartCount) return;
     const endTime = line.time + line.duration;
 
     if (part.time == null || line.time < part.time) part.time = line.time;

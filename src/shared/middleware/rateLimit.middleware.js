@@ -1,64 +1,100 @@
 const rateLimitCache = new Map();
+const MAX_REQUESTS = Number(process.env.RATE_LIMIT_MAX) || 20;
+const LIMIT_MS = Number(process.env.RATE_LIMIT_WINDOW_MS) || 10000;
+const MAX_CACHE_ENTRIES = 5000;
+const PURGE_INTERVAL_MS = Math.max(LIMIT_MS, 15000);
+let _lastPurge = Date.now();
 
-const MAX_REQUESTS = 2;
-const LIMIT_MS = 10000;
+function getClientKey(c) {
+    if (c.env?.MY_RATE_LIMITER) {
+        return c.req.header('cf-connecting-ip') || 'cloudflare-unknown';
+    }
+
+    const cfConnectingIp = c.req.header('cf-connecting-ip');
+    if (cfConnectingIp) return cfConnectingIp;
+
+    const xVercelForwardedFor = c.req.header('x-vercel-forwarded-for');
+    if (xVercelForwardedFor) return xVercelForwardedFor.split(',')[0].trim();
+
+    const xForwardedFor = c.req.header('x-forwarded-for');
+    if (xForwardedFor) return xForwardedFor.split(',')[0].trim();
+
+    const xRealIp = c.req.header('x-real-ip');
+    if (xRealIp) return xRealIp;
+
+    if (typeof Bun !== 'undefined') {
+        try {
+            const server = c.env && ('server' in c.env ? c.env.server : c.env);
+            if (server && typeof server.requestIP === 'function') {
+                const info = server.requestIP(c.req.raw);
+                if (info?.address) return info.address;
+            }
+        } catch (e) {
+            // Ignore error and fall through
+        }
+    }
+
+    if (c.env?.incoming?.socket?.remoteAddress) {
+        return c.env.incoming.socket.remoteAddress;
+    }
+
+    if (c.env?.incoming?.connection?.remoteAddress) {
+        return c.env.incoming.connection.remoteAddress;
+    }
+
+    return 'direct-unknown';
+}
+
+function purgeExpiredEntries(now) {
+    _lastPurge = now;
+    for (const [key, entry] of rateLimitCache) {
+        if (now > entry.resetAt) {
+            rateLimitCache.delete(key);
+        }
+    }
+}
 
 export const rateLimiter = () => {
     return async (c, next) => {
-        if (c.req.method === 'OPTIONS') {
-            return await next();
-        }
+        if (c.req.method === 'OPTIONS') return await next();
 
-        let ip = c.req.header('cf-connecting-ip') || 
-                 c.req.header('x-vercel-forwarded-for') ||
-                 c.req.header('x-real-ip');
+        const ip = getClientKey(c);
 
-        if (!ip) {
-            const forwardedFor = c.req.header('x-forwarded-for');
-            if (forwardedFor) {
-                ip = forwardedFor.split(',')[0].trim();
-            }
-        }
-
-        ip = ip || 'unknown';
-
-        if (c.env && c.env.MY_RATE_LIMITER) {
+        if (c.env?.MY_RATE_LIMITER) {
             const { success } = await c.env.MY_RATE_LIMITER.limit({ key: ip });
             if (!success) {
-                return c.json({ 
-                    error: 'Too Many Requests', 
-                    message: `Rate limit exceeded. Please wait 10 seconds before trying again (${MAX_REQUESTS} requests per 10 seconds allowed).` 
+                return c.json({
+                    error: 'Too Many Requests',
+                    message: `Rate limit exceeded. Please wait 10 seconds before trying again (${MAX_REQUESTS} requests per 10 seconds allowed).`
                 }, 429);
             }
         } else {
             const now = Date.now();
-            if (ip !== 'unknown') {
-                const timestamps = rateLimitCache.get(ip) ?? [];
+            let entry = rateLimitCache.get(ip);
 
-                // Drop timestamps outside the current window
-                const windowStart = now - LIMIT_MS;
-                const recent = timestamps.filter(t => t > windowStart);
-
-                if (recent.length >= MAX_REQUESTS) {
-                    const remainingSecs = Math.ceil((recent[0] + LIMIT_MS - now) / 1000);
-                    return c.json({ 
-                        error: 'Too Many Requests', 
-                        message: `Rate limit exceeded. Please wait ${remainingSecs} seconds before trying again (${MAX_REQUESTS} requests per 10 seconds allowed).`
+            if (!entry || now > entry.resetAt) {
+                entry = { count: 1, resetAt: now + LIMIT_MS };
+                
+                // Evict oldest if map exceeds maximum capacity
+                if (rateLimitCache.size >= MAX_CACHE_ENTRIES && !rateLimitCache.has(ip)) {
+                    const oldestKey = rateLimitCache.keys().next().value;
+                    if (oldestKey) rateLimitCache.delete(oldestKey);
+                }
+                rateLimitCache.set(ip, entry);
+            } else {
+                entry.count++;
+                if (entry.count > MAX_REQUESTS) {
+                    const remainingSecs = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+                    return c.json({
+                        error: 'Too Many Requests',
+                        message: `Rate limit exceeded. Please wait ${remainingSecs} seconds before trying again (${MAX_REQUESTS} requests per ${Math.round(LIMIT_MS / 1000)} seconds allowed).`
                     }, 429);
                 }
-
-                recent.push(now);
-                rateLimitCache.set(ip, recent);
             }
 
-            // Purge stale entries when cache grows too large
-            if (rateLimitCache.size > 1000) {
-                const expireTime = now - LIMIT_MS;
-                for (const [key, timestamps] of rateLimitCache.entries()) {
-                    if (timestamps.every(t => t < expireTime)) {
-                        rateLimitCache.delete(key);
-                    }
-                }
+            // Periodic lightweight cleanup
+            if (rateLimitCache.size > 200 && now - _lastPurge > PURGE_INTERVAL_MS) {
+                purgeExpiredEntries(now);
             }
         }
 

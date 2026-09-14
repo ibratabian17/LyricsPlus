@@ -6,6 +6,14 @@ This document provides a detailed list and explanation of the API endpoints expo
 
 All primary API endpoints are organized modularly within the `src/modules/` directory. Each module's handler defines its specific routes.
 
+## Client Header Recommendation
+
+Clients may optionally include the `X-Client-Package` request header to identify the application making the request. This header should specify the app name and project link/source, and may include a URL to the application's homepage or project page. For example:
+
+`X-Client-Package: YouLyPlus <https://github.com/ibratabian17/YouLyPlus>`
+
+This is optional, but useful for custom controlling systems or analytics.
+
 ## Available Endpoints
 
 ### Lyrics Retrieval
@@ -107,17 +115,10 @@ This approach ensures that providing an `isrc` or `platformId` alongside `title`
         *   `songTitle` (required): The title of the song.
         *   `songArtist` (required): The artist of the song.
         *   `songAlbum` (optional): The album of the song.
-        *   `songDuration` (required): The duration of the song in milliseconds.
+        *   `songDuration` (required): The duration of the song in seconds.
         *   `lyricsData` (required): The synchronized lyrics content (e.g., in LRC or KPOE format).
-        *   `forceUpload` (optional): Boolean. Set to `true` to force upload, potentially bypassing some existing data checks.
+        *   `forceUpload` (optional): Boolean. Replacing an existing file requires the `x-submission-update-key` header and a configured `SUBMISSION_UPDATE_KEY`.
     *   **Response**: Confirmation of submission or error details.
-
-### Test Endpoints
-
-*   **`GET /v1/test/musixmatch`**
-    *   **Description**: A non-functional placeholder endpoint for Musixmatch integration testing. This endpoint does not currently provide any active functionality.
-    *   **Parameters**: None.
-    *   **Response**: Empty or placeholder response.
 
 ## Error Handling
 
