@@ -6,18 +6,107 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// NormalizeV2 migrates line elements using a legacy songPart string to a
-// songPartIndex pointing into metadata.songParts, deriving time/duration for
-// the newly created parts. Returns the input unchanged when lines are empty
-// or already indexed.
+// IsFlatLyrics reports whether lyrics are in flat V1 format (marked by isLineEnding).
+func IsFlatLyrics(lyrics []domain.Line) bool {
+	if len(lyrics) == 0 {
+		return false
+	}
+	for _, l := range lyrics {
+		if l.IsLineEnding != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// NestFlatLyrics groups flat V1-style lines into nested V2 lines with syllable arrays,
+// delimited strictly by isLineEnding == 1.
+func NestFlatLyrics(lyrics []domain.Line) []domain.Line {
+	var nested []domain.Line
+	var current *domain.Line
+
+	finalizeGroup := func() {
+		if current == nil {
+			return
+		}
+		if len(current.Syllabus) > 0 {
+			earliest := current.Syllabus[0].Time
+			latestEnd := 0
+			for _, syl := range current.Syllabus {
+				if syl.Time < earliest {
+					earliest = syl.Time
+				}
+				if end := syl.Time + syl.Duration; end > latestEnd {
+					latestEnd = end
+				}
+			}
+			current.Time = earliest
+			current.Duration = latestEnd - earliest
+		}
+		current.Text = strings.TrimSpace(current.Text)
+		current.IsLineEnding = nil
+		nested = append(nested, *current)
+	}
+
+	for _, seg := range lyrics {
+		if current == nil {
+			current = &domain.Line{
+				Time:     seg.Time,
+				Duration: seg.Duration,
+				Syllabus: []domain.Syllable{},
+				Element:  seg.Element,
+			}
+		}
+
+		current.Text += seg.Text
+		syl := domain.Syllable{
+			Time:         seg.Time,
+			Duration:     seg.Duration,
+			Text:         seg.Text,
+			IsBackground: seg.Element.IsBackground,
+		}
+		current.Syllabus = append(current.Syllabus, syl)
+
+		if seg.IsLineEnding != nil && *seg.IsLineEnding == 1 {
+			finalizeGroup()
+			current = nil
+		}
+	}
+
+	if current != nil {
+		finalizeGroup()
+	}
+
+	return nested
+}
+
+// NormalizeV2 migrates flat lyrics to nested V2 lines and line elements using a
+// legacy songPart string to a songPartIndex pointing into metadata.songParts,
+// deriving time/duration for the newly created parts.
 func NormalizeV2(resp *domain.LyricsResponse) *domain.LyricsResponse {
 	if resp == nil {
 		return nil
 	}
-	lyrics := resp.Lyrics
-	if len(lyrics) == 0 {
+	if len(resp.Lyrics) == 0 {
 		return resp
 	}
+
+	if IsFlatLyrics(resp.Lyrics) {
+		if strings.EqualFold(string(resp.Type), string(domain.SyncTypeLine)) {
+			for i := range resp.Lyrics {
+				resp.Lyrics[i].IsLineEnding = nil
+				if resp.Lyrics[i].Syllabus == nil {
+					resp.Lyrics[i].Syllabus = []domain.Syllable{}
+				}
+			}
+			resp.Type = domain.SyncTypeLine
+		} else {
+			resp.Lyrics = NestFlatLyrics(resp.Lyrics)
+			resp.Type = domain.SyncTypeWord
+		}
+	}
+
+	lyrics := resp.Lyrics
 	allIndexed := true
 	for i := range lyrics {
 		if lyrics[i].Element.SongPartIndex == nil {
@@ -93,7 +182,7 @@ func V1ToV2(v1 *domain.V1Response) *domain.LyricsResponse {
 	}
 	var groupedLyrics []domain.Line
 
-	if v1.Type == string(domain.SyncTypeLine) {
+	if strings.EqualFold(v1.Type, string(domain.SyncTypeLine)) {
 		for _, seg := range v1.Lyrics {
 			groupedLyrics = append(groupedLyrics, domain.Line{
 				Time:     seg.Time,
@@ -101,9 +190,10 @@ func V1ToV2(v1 *domain.V1Response) *domain.LyricsResponse {
 				Text:     seg.Text,
 				Syllabus: []domain.Syllable{},
 				Element: domain.LineElement{
-					Key:      seg.Element.Key,
-					SongPart: seg.Element.SongPart,
-					Singer:   seg.Element.Singer,
+					Key:          seg.Element.Key,
+					SongPart:     seg.Element.SongPart,
+					Singer:       seg.Element.Singer,
+					IsBackground: seg.Element.IsBackground,
 				},
 			})
 		}
@@ -134,20 +224,19 @@ func V1ToV2(v1 *domain.V1Response) *domain.LyricsResponse {
 					Time:     seg.Time,
 					Syllabus: []domain.Syllable{},
 					Element: domain.LineElement{
-						Key:      seg.Element.Key,
-						SongPart: seg.Element.SongPart,
-						Singer:   seg.Element.Singer,
+						Key:          seg.Element.Key,
+						SongPart:     seg.Element.SongPart,
+						Singer:       seg.Element.Singer,
+						IsBackground: seg.Element.IsBackground,
 					},
 				}
 			}
 			current.Text += seg.Text
 			syl := domain.Syllable{
-				Time:     seg.Time,
-				Duration: seg.Duration,
-				Text:     seg.Text,
-			}
-			if seg.Element.IsBackground {
-				syl.IsBackground = true
+				Time:         seg.Time,
+				Duration:     seg.Duration,
+				Text:         seg.Text,
+				IsBackground: seg.Element.IsBackground,
 			}
 			current.Syllabus = append(current.Syllabus, syl)
 			if seg.IsLineEnding == 1 {
@@ -160,9 +249,15 @@ func V1ToV2(v1 *domain.V1Response) *domain.LyricsResponse {
 		}
 	}
 
-	typ := domain.SyncType(v1.Type)
-	if v1.Type == string(domain.SyncTypeSyllable) {
+	var typ domain.SyncType
+	switch {
+	case strings.EqualFold(v1.Type, string(domain.SyncTypeLine)):
+		typ = domain.SyncTypeLine
+	case strings.EqualFold(v1.Type, string(domain.SyncTypeWord)),
+		strings.EqualFold(v1.Type, string(domain.SyncTypeSyllable)):
 		typ = domain.SyncTypeWord
+	default:
+		typ = domain.SyncType(v1.Type)
 	}
 
 	cached := v1.Cached
@@ -253,8 +348,11 @@ func V2ToV1(v2 *domain.LyricsResponse) *domain.V1Response {
 	}
 
 	typ := string(v2.Type)
-	if v2.Type == domain.SyncTypeWord {
+	if strings.EqualFold(string(v2.Type), string(domain.SyncTypeWord)) ||
+		strings.EqualFold(string(v2.Type), string(domain.SyncTypeSyllable)) {
 		typ = string(domain.SyncTypeSyllable)
+	} else if strings.EqualFold(string(v2.Type), string(domain.SyncTypeLine)) {
+		typ = string(domain.SyncTypeLine)
 	}
 
 	cached := v2.Cached

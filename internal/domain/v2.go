@@ -74,7 +74,8 @@ type Line struct {
 	Time            int              `json:"time"`     // ms from track start
 	Duration        int              `json:"duration"` // ms
 	Text            string           `json:"text"`
-	Syllabus        []Syllable       `json:"syllabus"` // populated for word sync
+	IsLineEnding    *int             `json:"isLineEnding,omitempty"` // legacy V1 line terminal flag
+	Syllabus        []Syllable       `json:"syllabus"`               // populated for word sync
 	Element         LineElement      `json:"element"`
 	Translation     *Translation     `json:"translation,omitempty"`
 	Transliteration *Transliteration `json:"transliteration,omitempty"`
@@ -95,6 +96,7 @@ type LineElement struct {
 	Singer        string `json:"singer,omitempty"`        // agent alias
 	SongPartIndex *int   `json:"songPartIndex,omitempty"` // index into Metadata.SongParts
 	SongPart      string `json:"songPart,omitempty"`      // deprecated V1 string name
+	IsBackground  bool   `json:"isBackground,omitempty"`
 }
 
 // Translation is a localized subtitle for a line.

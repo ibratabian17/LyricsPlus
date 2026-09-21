@@ -242,6 +242,99 @@ func TestV2ToV1ResolvesSongPart(t *testing.T) {
 	_ = idx1
 }
 
+func TestNormalizeV2FlatV1ToNestedV2(t *testing.T) {
+	isEnd0 := 0
+	isEnd1 := 1
+	flatResp := &domain.LyricsResponse{
+		Type: "Word",
+		Lyrics: []domain.Line{
+			{Time: 23876, Duration: 432, Text: "Ter", IsLineEnding: &isEnd0, Element: domain.LineElement{Key: "L1", SongPart: "INTRO", Singer: "v1"}},
+			{Time: 24308, Duration: 408, Text: "u", IsLineEnding: &isEnd0, Element: domain.LineElement{Key: "L1", SongPart: "INTRO", Singer: "v1"}},
+			{Time: 24716, Duration: 1428, Text: "kir ", IsLineEnding: &isEnd1, Element: domain.LineElement{Key: "L1", SongPart: "INTRO", Singer: "v1"}},
+			{Time: 31406, Duration: 474, Text: "Tak ", IsLineEnding: &isEnd0, Element: domain.LineElement{Key: "L3", SongPart: "INTRO", Singer: "v1"}},
+			{Time: 31880, Duration: 468, Text: "a", IsLineEnding: &isEnd1, Element: domain.LineElement{Key: "L3", SongPart: "INTRO", Singer: "v1"}},
+		},
+	}
+
+	nested := NormalizeV2(flatResp)
+	if nested == nil {
+		t.Fatalf("NormalizeV2 returned nil")
+	}
+	if nested.Type != domain.SyncTypeWord {
+		t.Errorf("expected type Word, got %q", nested.Type)
+	}
+	if len(nested.Lyrics) != 2 {
+		t.Fatalf("expected 2 lines, got %d", len(nested.Lyrics))
+	}
+	if nested.Lyrics[0].Text != "Terukir" {
+		t.Errorf("line 0 text = %q, want 'Terukir'", nested.Lyrics[0].Text)
+	}
+	if len(nested.Lyrics[0].Syllabus) != 3 {
+		t.Fatalf("line 0 syllabus count = %d, want 3", len(nested.Lyrics[0].Syllabus))
+	}
+	if nested.Lyrics[0].IsLineEnding != nil {
+		t.Errorf("expected nil IsLineEnding on nested V2 line")
+	}
+	if nested.Lyrics[0].Element.SongPartIndex == nil || *nested.Lyrics[0].Element.SongPartIndex != 0 {
+		t.Errorf("expected SongPartIndex 0, got %+v", nested.Lyrics[0].Element.SongPartIndex)
+	}
+	if len(nested.Metadata.SongParts) != 1 || nested.Metadata.SongParts[0].Name != "INTRO" {
+		t.Errorf("metadata songParts = %+v", nested.Metadata.SongParts)
+	}
+
+	// Test V2ToV1 roundtrip
+	v1 := V2ToV1(nested)
+	if v1.Type != "syllable" {
+		t.Errorf("v1.Type = %q, want 'syllable'", v1.Type)
+	}
+	if len(v1.Lyrics) != 5 {
+		t.Fatalf("expected 5 flat segments, got %d", len(v1.Lyrics))
+	}
+	if v1.Lyrics[2].IsLineEnding != 1 || v1.Lyrics[4].IsLineEnding != 1 {
+		t.Errorf("v1 line ending flags wrong: seg2=%d, seg4=%d", v1.Lyrics[2].IsLineEnding, v1.Lyrics[4].IsLineEnding)
+	}
+	if v1.Lyrics[0].IsLineEnding != 0 {
+		t.Errorf("seg0 should not be line ending: %d", v1.Lyrics[0].IsLineEnding)
+	}
+}
+
+func TestNormalizeV2BackgroundVocalsInSameLine(t *testing.T) {
+	isEnd0 := 0
+	isEnd1 := 1
+	flatResp := &domain.LyricsResponse{
+		Type: "Word",
+		Lyrics: []domain.Line{
+			{Time: 1000, Duration: 500, Text: "Hello ", IsLineEnding: &isEnd0, Element: domain.LineElement{Key: "L1", Singer: "v1"}},
+			{Time: 1500, Duration: 500, Text: "(hello)", IsLineEnding: &isEnd1, Element: domain.LineElement{Key: "L2", Singer: "v1", IsBackground: true}},
+		},
+	}
+
+	nested := NormalizeV2(flatResp)
+	if len(nested.Lyrics) != 1 {
+		t.Fatalf("expected 1 line for background vocal without preceding isLineEnding, got %d", len(nested.Lyrics))
+	}
+	if nested.Lyrics[0].Text != "Hello (hello)" {
+		t.Errorf("text = %q, want 'Hello (hello)'", nested.Lyrics[0].Text)
+	}
+	if len(nested.Lyrics[0].Syllabus) != 2 {
+		t.Fatalf("syllabus count = %d, want 2", len(nested.Lyrics[0].Syllabus))
+	}
+	if !nested.Lyrics[0].Syllabus[1].IsBackground {
+		t.Errorf("expected syllabus[1] to have IsBackground = true")
+	}
+
+	v1 := V2ToV1(nested)
+	if len(v1.Lyrics) != 2 {
+		t.Fatalf("expected 2 flat segments, got %d", len(v1.Lyrics))
+	}
+	if v1.Lyrics[0].IsLineEnding != 0 || v1.Lyrics[1].IsLineEnding != 1 {
+		t.Errorf("line endings: %d, %d", v1.Lyrics[0].IsLineEnding, v1.Lyrics[1].IsLineEnding)
+	}
+	if !v1.Lyrics[1].Element.IsBackground {
+		t.Errorf("expected v1.Lyrics[1].Element.IsBackground = true")
+	}
+}
+
 func TestParseQQQRC(t *testing.T) {
 	qrc := `<?xml version="1.0" encoding="utf-8"?>
 <QrcInfos><LyricInfo LyricCount="1">
