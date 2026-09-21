@@ -51,3 +51,18 @@ func TestSignDeterministic(t *testing.T) {
 		t.Errorf("signature must differ for different payloads")
 	}
 }
+
+func TestIsQQMid(t *testing.T) {
+	if !isQQMid("002vPwdB2H0fGA") {
+		t.Errorf("expected 002vPwdB2H0fGA to be valid QQ mid")
+	}
+	if isQQMid("1658571287") {
+		t.Errorf("Apple Music id 1658571287 should not be QQ mid")
+	}
+	if isQQMid("4cOdK2wGLETKBW3PvgPWqT") {
+		t.Errorf("Spotify id should not be QQ mid")
+	}
+	if isQQMid("") {
+		t.Errorf("empty string should not be QQ mid")
+	}
+}

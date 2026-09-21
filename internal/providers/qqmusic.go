@@ -38,7 +38,10 @@ func (p *QQMusicProvider) Name() string     { return qqmusicName }
 func (p *QQMusicProvider) Configured() bool { return true }
 
 func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
-	songMid := q.PlatformID
+	songMid := ""
+	if isQQMid(q.PlatformID) {
+		songMid = q.PlatformID
+	}
 	songTitle := q.Title
 	songArtist := q.Artist
 	songAlbum := q.Album
@@ -248,6 +251,10 @@ func processLyric(content string) (string, error) {
 	}
 
 	return content, nil
+}
+
+func isQQMid(id string) bool {
+	return len(id) == 14 && strings.HasPrefix(id, "00")
 }
 
 func isHexString(s string) bool {
