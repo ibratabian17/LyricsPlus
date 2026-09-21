@@ -191,13 +191,11 @@ func (h *Lyrics) GetTTML(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "TTML conversion failed"})
 		return
 	}
+	h.setProcessing(start, resp)
 	w.Header().Set("Cache-Control", cacheControlPublic)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"ttml": string(xmlData),
-		"processingTime": map[string]int64{
-			"timeElapsed":   time.Since(start).Milliseconds(),
-			"lastProcessed": time.Now().UnixMilli(),
-		},
+		"ttml":           string(xmlData),
+		"processingTime": resp.ProcessingTime,
 	})
 }
 

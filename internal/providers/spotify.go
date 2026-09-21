@@ -97,6 +97,11 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	}
 
 	trackID := q.PlatformID
+	songTitle := q.Title
+	songArtist := q.Artist
+	songAlbum := q.Album
+	songISRC := q.ISRC
+
 	if trackID == "" {
 		var tracks []spotifyTrack
 		if q.ISRC != "" {
@@ -141,6 +146,18 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 			return nil, nil
 		}
 		trackID = best.Candidate.PlatformID
+		if best.Candidate.Title != "" {
+			songTitle = best.Candidate.Title
+		}
+		if best.Candidate.Artist != "" {
+			songArtist = best.Candidate.Artist
+		}
+		if best.Candidate.Album != "" {
+			songAlbum = best.Candidate.Album
+		}
+		if best.Candidate.ISRC != "" {
+			songISRC = best.Candidate.ISRC
+		}
 	}
 
 	if trackID == "" {
@@ -159,6 +176,16 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 
 	converted.Cached = domain.CacheNone
 	converted.RawData = string(lyricsJSON)
+	converted.ProcessingTime = &domain.ProcessTiming{
+		SelectedSongMetadata: &domain.PickedSongMetadata{
+			Source:         "Spotify",
+			Title:          songTitle,
+			Artist:         songArtist,
+			Album:          songAlbum,
+			SongISRC:       songISRC,
+			SongPlatformID: trackID,
+		},
+	}
 	return converted, nil
 }
 

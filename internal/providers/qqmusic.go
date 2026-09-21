@@ -120,9 +120,9 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	}
 
 	resp.Metadata.Source = "QQ Music"
-	resp.Metadata.Title = songTitle
-	resp.Metadata.Artist = songArtist
-	resp.Metadata.Album = songAlbum
+	resp.Metadata.Title = ""
+	resp.Metadata.Artist = ""
+	resp.Metadata.Album = ""
 	if songDuration > 0 {
 		tMin := songDuration / 60000
 		tSec := float64(songDuration%60000) / 1000.0
@@ -130,6 +130,16 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	}
 	resp.Cached = domain.CacheNone
 	resp.RawData = qrcContent
+	resp.ProcessingTime = &domain.ProcessTiming{
+		SelectedSongMetadata: &domain.PickedSongMetadata{
+			Source:         "QQ Music",
+			Title:          songTitle,
+			Artist:         songArtist,
+			Album:          songAlbum,
+			SongISRC:       q.ISRC,
+			SongPlatformID: songMid,
+		},
+	}
 
 	return resp, nil
 }

@@ -78,6 +78,11 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 	}
 
 	trackID := q.PlatformID
+	songTitle := q.Title
+	songArtist := q.Artist
+	songAlbum := q.Album
+	songISRC := q.ISRC
+
 	if trackID == "" {
 		tracks, err := p.SearchTrack(ctx, strings.TrimSpace(q.Title+" "+q.Artist), 10)
 		if err != nil || len(tracks) == 0 {
@@ -103,6 +108,18 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 			return nil, nil
 		}
 		trackID = best.Candidate.PlatformID
+		if best.Candidate.Title != "" {
+			songTitle = best.Candidate.Title
+		}
+		if best.Candidate.Artist != "" {
+			songArtist = best.Candidate.Artist
+		}
+		if best.Candidate.Album != "" {
+			songAlbum = best.Candidate.Album
+		}
+		if best.Candidate.ISRC != "" {
+			songISRC = best.Candidate.ISRC
+		}
 	}
 
 	if trackID == "" {
@@ -121,6 +138,16 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 
 	converted.Cached = domain.CacheNone
 	converted.RawData = string(lyricsJSON)
+	converted.ProcessingTime = &domain.ProcessTiming{
+		SelectedSongMetadata: &domain.PickedSongMetadata{
+			Source:         "Deezer",
+			Title:          songTitle,
+			Artist:         songArtist,
+			Album:          songAlbum,
+			SongISRC:       songISRC,
+			SongPlatformID: trackID,
+		},
+	}
 	return converted, nil
 }
 

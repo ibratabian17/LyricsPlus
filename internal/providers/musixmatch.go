@@ -151,6 +151,16 @@ func (p *MusixmatchProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 
 	converted.Cached = domain.CacheNone
 	converted.RawData = string(envelopeJSON)
+	converted.ProcessingTime = &domain.ProcessTiming{
+		SelectedSongMetadata: &domain.PickedSongMetadata{
+			Source:         "Musixmatch",
+			Title:          matchedTrack.TrackName,
+			Artist:         matchedTrack.ArtistName,
+			Album:          matchedTrack.AlbumName,
+			SongISRC:       matchedTrack.TrackISRC,
+			SongPlatformID: strconv.FormatInt(matchedTrack.TrackID, 10),
+		},
+	}
 	return converted, nil
 }
 
