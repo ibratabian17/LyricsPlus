@@ -230,7 +230,7 @@ func main() {
 					rem := gdrive.CircuitBreakerRemaining()
 					if rem > 0 {
 						select {
-						case <-time.After(rem + 500*time.Millisecond):
+						case <-time.After(rem + 300*time.Millisecond):
 						case <-ctx.Done():
 							return
 						}
@@ -346,7 +346,7 @@ func main() {
 					if rem > 0 {
 						fmt.Printf("\n[*] Waiting %v for rate limit cooldown...\n", rem)
 						select {
-						case <-time.After(rem + 500*time.Millisecond):
+						case <-time.After(rem + 300*time.Millisecond):
 						case <-ctx.Done():
 							break
 						}
