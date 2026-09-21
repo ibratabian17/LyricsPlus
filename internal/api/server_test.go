@@ -28,9 +28,15 @@ import (
 type fakeSource struct {
 	resp *domain.LyricsResponse
 	err  error
+	name string
 }
 
-func (f *fakeSource) Name() string { return "spotify" }
+func (f *fakeSource) Name() string {
+	if f.name != "" {
+		return f.name
+	}
+	return "spotify"
+}
 
 func (f *fakeSource) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
 	return f.resp, f.err
@@ -224,11 +230,46 @@ func TestLyricsGetRaw(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
 		t.Fatalf("expected application/json for spotify raw, got %q", ct)
 	}
+	if cd := rec.Header().Get("Content-Disposition"); cd != "inline" {
+		t.Fatalf("expected Content-Disposition=inline, got %q", cd)
+	}
 	if sz := rec.Header().Get("X-Lyrics-Source"); sz != "spotify" {
 		t.Fatalf("expected X-Lyrics-Source=spotify, got %q", sz)
 	}
 	if strings.TrimSpace(rec.Body.String()) != raw {
 		t.Fatalf("raw body mismatch: %q", rec.Body.String())
+	}
+
+	// Apple Music returns application/xml and Content-Disposition: inline
+	respApple := sampleWordLyrics()
+	respApple.Metadata.Source = "Apple Music"
+	respApple.RawData = raw
+	hApple := buildTestRouter(t, baseTestConfig(), &fakeSource{resp: respApple, name: "apple"})
+	recApple := doGet(t, hApple, "/v1/raw/get?title=Hello&artist=Adele&source=apple")
+	if recApple.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recApple.Code, recApple.Body.String())
+	}
+	if ct := recApple.Header().Get("Content-Type"); ct != "application/xml" {
+		t.Fatalf("expected application/xml for apple raw, got %q", ct)
+	}
+	if cd := recApple.Header().Get("Content-Disposition"); cd != "inline" {
+		t.Fatalf("expected Content-Disposition=inline, got %q", cd)
+	}
+
+	// Deezer returns text/plain and Content-Disposition: inline
+	respDeezer := sampleWordLyrics()
+	respDeezer.Metadata.Source = "Deezer"
+	respDeezer.RawData = "[00:01.00] Hello"
+	hDeezer := buildTestRouter(t, baseTestConfig(), &fakeSource{resp: respDeezer, name: "deezer"})
+	recDeezer := doGet(t, hDeezer, "/v1/raw/get?title=Hello&artist=Adele&source=deezer")
+	if recDeezer.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", recDeezer.Code, recDeezer.Body.String())
+	}
+	if ct := recDeezer.Header().Get("Content-Type"); ct != "text/plain" {
+		t.Fatalf("expected text/plain for deezer raw, got %q", ct)
+	}
+	if cd := recDeezer.Header().Get("Content-Disposition"); cd != "inline" {
+		t.Fatalf("expected Content-Disposition=inline, got %q", cd)
 	}
 }
 

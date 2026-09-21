@@ -223,19 +223,41 @@ func (h *Lyrics) GetRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType := "application/octet-stream"
-	switch strings.ToLower(strings.ReplaceAll(raw.Source, "-word", "")) {
-	case "apple", "qq":
-		contentType = "application/xml"
-	case "musixmatch", "spotify":
-		contentType = "application/json"
-	}
+	contentType := resolveRawContentType(raw.Source, raw.Raw)
 
 	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", "inline")
 	w.Header().Set("Cache-Control", cacheControlPublic)
 	w.Header().Set("X-Lyrics-Source", raw.Source)
 	w.Header().Set("X-Processing-Time", strconv.FormatInt(time.Since(start).Milliseconds(), 10)+"ms")
 	_, _ = w.Write([]byte(raw.Raw))
+}
+
+func resolveRawContentType(source, raw string) string {
+	src := strings.ToLower(source)
+	trimmed := strings.TrimSpace(raw)
+
+	if strings.Contains(src, "spotify") || strings.Contains(src, "musixmatch") {
+		return "application/json"
+	}
+	if strings.Contains(src, "apple") || strings.Contains(src, "qq") || strings.Contains(src, "qaple") {
+		if strings.HasPrefix(trimmed, "{") {
+			return "application/json"
+		}
+		return "application/xml"
+	}
+	if strings.Contains(src, "deezer") {
+		return "text/plain"
+	}
+
+	if strings.HasPrefix(trimmed, "<") {
+		return "application/xml"
+	}
+	if strings.HasPrefix(trimmed, "{") || (strings.HasPrefix(trimmed, "[") && json.Valid([]byte(trimmed))) {
+		return "application/json"
+	}
+
+	return "text/plain"
 }
 
 // logFetch reports the outcome and returns true when err is non-nil.
