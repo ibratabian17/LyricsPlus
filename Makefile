@@ -20,7 +20,8 @@ GO         := go
 build:
 	@mkdir -p bin
 	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/server
-	@echo "built $(BINARY) (version $(VERSION), commit $(COMMIT), built $(BUILD_DATE))"
+	$(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/gdrive_sync ./cmd/gdrive_sync
+	@echo "built $(BINARY) and bin/gdrive_sync (version $(VERSION), commit $(COMMIT), built $(BUILD_DATE))"
 
 run: build
 	./$(BINARY)

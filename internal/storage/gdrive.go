@@ -99,7 +99,7 @@ func (g *GDriveClient) Config() config.GDrive {
 func (g *GDriveClient) isCircuitOpen() bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	if !g.circuitOpen {
+	if g.consecutiveErrors < 0 || !g.circuitOpen {
 		return false
 	}
 	return time.Now().Before(g.circuitOpenUntil)
@@ -108,12 +108,45 @@ func (g *GDriveClient) isCircuitOpen() bool {
 func (g *GDriveClient) recordRateLimitError() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.consecutiveErrors < 0 {
+		return
+	}
 	g.consecutiveErrors++
 	if g.consecutiveErrors >= 5 {
 		g.circuitOpen = true
 		g.circuitOpenUntil = time.Now().Add(60 * time.Second)
 		g.consecutiveErrors = 0
 	}
+}
+
+// ResetCircuitBreaker clears any tripped circuit breaker state.
+func (g *GDriveClient) ResetCircuitBreaker() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.circuitOpen = false
+	g.consecutiveErrors = 0
+}
+
+// CircuitBreakerRemaining returns remaining duration if breaker is open, or 0.
+func (g *GDriveClient) CircuitBreakerRemaining() time.Duration {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	if !g.circuitOpen {
+		return 0
+	}
+	rem := time.Until(g.circuitOpenUntil)
+	if rem <= 0 {
+		return 0
+	}
+	return rem
+}
+
+// DisableCircuitBreaker disables the circuit breaker mechanism.
+func (g *GDriveClient) DisableCircuitBreaker() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.circuitOpen = false
+	g.consecutiveErrors = -1
 }
 
 func (g *GDriveClient) recordSuccess() {

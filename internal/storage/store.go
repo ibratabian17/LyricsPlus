@@ -34,7 +34,7 @@ type Row struct {
 const lyricsCreateTable = `
 CREATE TABLE IF NOT EXISTS lyrics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  filename TEXT UNIQUE NOT NULL,
+  filename TEXT NOT NULL,
   content BLOB NOT NULL,
   isrc TEXT,
   platform_id TEXT,
@@ -42,8 +42,10 @@ CREATE TABLE IF NOT EXISTS lyrics (
   title TEXT,
   artist TEXT,
   duration_ms INTEGER DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  UNIQUE(filename, source)
 );
+CREATE INDEX IF NOT EXISTS idx_lyrics_filename ON lyrics(filename);
 CREATE INDEX IF NOT EXISTS idx_lyrics_isrc ON lyrics(isrc);
 CREATE INDEX IF NOT EXISTS idx_lyrics_platform ON lyrics(platform_id);
 CREATE INDEX IF NOT EXISTS idx_lyrics_title_artist ON lyrics(title, artist);
@@ -184,7 +186,7 @@ func (s *Store) queryExisting(ctx context.Context, keywords []string) ([]*Row, e
 		args = append(args, pat, pat)
 	}
 	q := `SELECT ` + storeRowColumns + ` FROM lyrics WHERE ` + strings.Join(conds, " AND ") +
-		` ORDER BY created_at DESC LIMIT 5`
+		` ORDER BY created_at DESC LIMIT 20`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -238,11 +240,10 @@ func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
 	row.ContentJSON = CompressContent(row.ContentJSON)
 	const upsert = `INSERT INTO lyrics (filename, content, isrc, platform_id, source, title, artist, duration_ms, created_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(filename) DO UPDATE SET
+ON CONFLICT(filename, source) DO UPDATE SET
   content = excluded.content,
   isrc = excluded.isrc,
   platform_id = excluded.platform_id,
-  source = excluded.source,
   title = excluded.title,
   artist = excluded.artist,
   duration_ms = excluded.duration_ms,

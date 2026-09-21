@@ -7,16 +7,19 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"lyricsplus/backend/internal/config"
+	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/storage"
 	_ "modernc.org/sqlite"
 )
@@ -35,14 +38,19 @@ type fileJob struct {
 func main() {
 	configPath := flag.String("config", "", "Path to configuration file (.json or .env)")
 	dbPath := flag.String("db", "", "Target SQLite database file")
-	concurrency := flag.Int("concurrency", 600, "Number of concurrent download workers")
+	concurrency := flag.Int("concurrency", 150, "Number of concurrent download workers")
 	checkpointPath := flag.String("checkpoint", "data/.gdrive_sync_checkpoint.json", "Checkpoint file path for resuming")
 	resetCheckpoint := flag.Bool("reset", false, "Start migration from scratch, ignoring checkpoint")
+	redoErrors := flag.Bool("redo", false, "Rescan folders and redo missing/errored files (skips existing)")
 	flag.Parse()
 
 	cfg := config.Load(*configPath)
+	targetDB := cfg.Storage.DBPath
 	if *dbPath != "" {
-		cfg.Storage.DBPath = *dbPath
+		targetDB = *dbPath
+	}
+	if targetDB == "" {
+		targetDB = "database/lyrics_cache.db"
 	}
 
 	httpClient := &http.Client{Timeout: 60 * time.Second}
@@ -79,12 +87,12 @@ func main() {
 	}
 	fmt.Println("OK!")
 
-	dbDir := filepath.Dir(*dbPath)
+	dbDir := filepath.Dir(targetDB)
 	_ = os.MkdirAll(dbDir, 0755)
 
-	db, err := sql.Open("sqlite", *dbPath)
+	db, err := sql.Open("sqlite", targetDB)
 	if err != nil {
-		log.Fatalf("Failed to open SQLite database: %v", err)
+		log.Fatalf("Failed to open SQLite database (%s): %v", targetDB, err)
 	}
 	defer func() { _ = db.Close() }()
 
@@ -92,9 +100,27 @@ func main() {
 		log.Fatalf("Failed to init SQLite schema: %v", err)
 	}
 
+	// Load existing (source::filename) into an in-memory index for O(1) deduplication
+	existingMap := make(map[string]struct{})
+	var existingMu sync.RWMutex
+	rows, err := db.Query("SELECT filename, source FROM lyrics")
+	if err == nil {
+		for rows.Next() {
+			var fn, src string
+			if err := rows.Scan(&fn, &src); err == nil {
+				existingMap[src+"::"+fn] = struct{}{}
+			}
+		}
+		_ = rows.Close()
+	}
+	fmt.Printf("[*] Loaded %d existing entries from database (%s).\n", len(existingMap), targetDB)
+
 	cp := loadCheckpoint(*checkpointPath)
-	if *resetCheckpoint {
+	if *resetCheckpoint || *redoErrors {
 		cp = Checkpoint{FolderTokens: make(map[string]string)}
+		if *redoErrors {
+			fmt.Println("[*] Redo mode enabled: will scan folders and download only missing/failed files.")
+		}
 	}
 
 	folderTasks := []struct {
@@ -118,6 +144,7 @@ func main() {
 	}()
 
 	var totalScanned atomic.Int64
+	var totalSkipped atomic.Int64
 	var totalDownloaded atomic.Int64
 	var totalSaved atomic.Int64
 	totalSaved.Store(cp.TotalSaved)
@@ -145,6 +172,11 @@ func main() {
 				totalErrors.Add(int64(len(batch)))
 			} else {
 				totalSaved.Add(int64(len(batch)))
+				existingMu.Lock()
+				for _, r := range batch {
+					existingMap[r.Source+"::"+r.Filename] = struct{}{}
+				}
+				existingMu.Unlock()
 			}
 			batch = batch[:0]
 		}
@@ -166,6 +198,9 @@ func main() {
 		}
 	}()
 
+	var failedJobs []fileJob
+	var failedMu sync.Mutex
+
 	var workerWg sync.WaitGroup
 	for w := 0; w < *concurrency; w++ {
 		workerWg.Add(1)
@@ -175,22 +210,94 @@ func main() {
 				if ctx.Err() != nil {
 					return
 				}
-				content, err := gdrive.FetchFile(ctx, job.item.ID)
-				if err != nil {
-					totalErrors.Add(1)
+
+				// Check again if already saved
+				existingMu.RLock()
+				_, alreadyExists := existingMap[job.source+"::"+job.item.Name]
+				existingMu.RUnlock()
+				if alreadyExists {
+					totalSkipped.Add(1)
 					continue
 				}
+
+				// Download with retry & backoff
+				var content []byte
+				var downloadErr error
+				for attempt := 0; attempt < 5; attempt++ {
+					if ctx.Err() != nil {
+						return
+					}
+					rem := gdrive.CircuitBreakerRemaining()
+					if rem > 0 {
+						select {
+						case <-time.After(rem + 500*time.Millisecond):
+						case <-ctx.Done():
+							return
+						}
+					}
+
+					content, downloadErr = gdrive.FetchFile(ctx, job.item.ID)
+					if downloadErr == nil {
+						break
+					}
+
+					backoff := time.Duration(1<<attempt)*time.Second + time.Duration(rand.Intn(500))*time.Millisecond
+					if backoff > 20*time.Second {
+						backoff = 20 * time.Second
+					}
+					select {
+					case <-time.After(backoff):
+					case <-ctx.Done():
+						return
+					}
+				}
+
+				if downloadErr != nil {
+					totalErrors.Add(1)
+					failedMu.Lock()
+					failedJobs = append(failedJobs, job)
+					failedMu.Unlock()
+					continue
+				}
+
 				totalDownloaded.Add(1)
 
 				parsed := storage.ParseFilename(job.item.Name)
+				contentToStore := content
+				trimmed := strings.TrimSpace(string(content))
+				if strings.HasPrefix(trimmed, "<") {
+					if job.source == "apple" || strings.HasSuffix(strings.ToLower(job.item.Name), ".ttml") {
+						if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+							p.RawData = string(content)
+							if b, err := json.Marshal(p); err == nil {
+								contentToStore = b
+							}
+						}
+					} else if job.source == "qq" || strings.HasSuffix(strings.ToLower(job.item.Name), ".qrc") {
+						p := parsers.ParseQQQRC(trimmed, parsers.ExactMetadata{
+							Title:      parsed.Title,
+							Artist:     parsed.Artist,
+							DurationMs: parsed.DurationMS,
+							PlatformID: parsed.PlatformID,
+						})
+						if p != nil && len(p.Lyrics) > 0 {
+							p.RawData = string(content)
+							if b, err := json.Marshal(p); err == nil {
+								contentToStore = b
+							}
+						}
+					}
+				}
+
 				row := &storage.Row{
 					Filename:    job.item.Name,
-					ContentJSON: storage.CompressContent(content),
+					ContentJSON: storage.CompressContent(contentToStore),
 					ISRC:        parsed.ISRC,
 					PlatformID:  parsed.PlatformID,
 					Source:      job.source,
 					Title:       parsed.Title,
 					Artist:      parsed.Artist,
+					DurationMS:  parsed.DurationMS,
 					CreatedAt:   job.item.CreatedTime,
 				}
 				if row.CreatedAt.IsZero() {
@@ -212,8 +319,8 @@ func main() {
 			case <-ticker.C:
 				elapsed := time.Since(startTime).Seconds()
 				rate := float64(totalDownloaded.Load()) / elapsed
-				fmt.Printf("\r  Scanned: %d | Downloaded: %d | Saved: %d | Speed: %.1f files/s | Errors: %d    ",
-					totalScanned.Load(), totalDownloaded.Load(), totalSaved.Load(), rate, totalErrors.Load())
+				fmt.Printf("\r  Scanned: %d | Skipped: %d | Downloaded: %d | Saved: %d | Speed: %.1f files/s | Errors: %d    ",
+					totalScanned.Load(), totalSkipped.Load(), totalDownloaded.Load(), totalSaved.Load(), rate, totalErrors.Load())
 			}
 		}
 	}()
@@ -228,15 +335,57 @@ func main() {
 			fmt.Printf("\n--> Processing source '%s' (Folder: %s)...\n", task.source, folderID)
 
 			for ctx.Err() == nil {
-				res, err := gdrive.SearchFiles(ctx, []string{folderID}, "", 1000, pageToken)
-				if err != nil {
-					fmt.Printf("\n[!] GDrive search error on folder %s: %v\n", folderID, err)
-					time.Sleep(2 * time.Second)
+				var res *storage.FileListResponse
+				var err error
+
+				for searchAttempt := 0; searchAttempt < 10; searchAttempt++ {
+					if ctx.Err() != nil {
+						break
+					}
+					rem := gdrive.CircuitBreakerRemaining()
+					if rem > 0 {
+						fmt.Printf("\n[*] Waiting %v for rate limit cooldown...\n", rem)
+						select {
+						case <-time.After(rem + 500*time.Millisecond):
+						case <-ctx.Done():
+							break
+						}
+					}
+
+					res, err = gdrive.SearchFiles(ctx, []string{folderID}, "", 1000, pageToken)
+					if err == nil {
+						break
+					}
+
+					backoff := time.Duration(2<<searchAttempt) * time.Second
+					if backoff > 45*time.Second {
+						backoff = 45 * time.Second
+					}
+					fmt.Printf("\n[!] GDrive search error on folder %s: %v. Retrying in %v...\n", folderID, err, backoff)
+					select {
+					case <-time.After(backoff):
+					case <-ctx.Done():
+						break
+					}
+				}
+
+				if err != nil || res == nil {
+					fmt.Printf("\n[!] Failed to search folder %s after retries: %v\n", folderID, err)
 					break
 				}
 
 				for _, item := range res.Files {
 					totalScanned.Add(1)
+
+					existingMu.RLock()
+					_, exists := existingMap[task.source+"::"+item.Name]
+					existingMu.RUnlock()
+
+					if exists {
+						totalSkipped.Add(1)
+						continue
+					}
+
 					jobQueue <- fileJob{item: item, source: task.source, folder: folderID}
 				}
 
@@ -254,11 +403,109 @@ func main() {
 
 	close(jobQueue)
 	workerWg.Wait()
+
+	// Second pass: retry failed downloads with relaxed concurrency
+	failedMu.Lock()
+	numFailed := len(failedJobs)
+	failedMu.Unlock()
+
+	if numFailed > 0 && ctx.Err() == nil {
+		fmt.Printf("\n\n[*] Attempting second pass for %d failed downloads...\n", numFailed)
+		gdrive.ResetCircuitBreaker()
+		time.Sleep(3 * time.Second)
+
+		retryQueue := make(chan fileJob, numFailed)
+		for _, j := range failedJobs {
+			retryQueue <- j
+		}
+		close(retryQueue)
+
+		var retryWg sync.WaitGroup
+		retryWorkers := 10
+		if retryWorkers > numFailed {
+			retryWorkers = numFailed
+		}
+
+		for rw := 0; rw < retryWorkers; rw++ {
+			retryWg.Add(1)
+			go func() {
+				defer retryWg.Done()
+				for job := range retryQueue {
+					if ctx.Err() != nil {
+						return
+					}
+					existingMu.RLock()
+					_, exists := existingMap[job.source+"::"+job.item.Name]
+					existingMu.RUnlock()
+					if exists {
+						continue
+					}
+
+					content, err := gdrive.FetchFile(ctx, job.item.ID)
+					if err != nil {
+						time.Sleep(2 * time.Second)
+						content, err = gdrive.FetchFile(ctx, job.item.ID)
+					}
+					if err != nil {
+						continue
+					}
+
+					totalDownloaded.Add(1)
+					totalErrors.Add(-1) // recovered!
+
+					parsed := storage.ParseFilename(job.item.Name)
+					contentToStore := content
+					trimmed := strings.TrimSpace(string(content))
+					if strings.HasPrefix(trimmed, "<") {
+						if job.source == "apple" || strings.HasSuffix(strings.ToLower(job.item.Name), ".ttml") {
+							if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+								p.RawData = string(content)
+								if b, err := json.Marshal(p); err == nil {
+									contentToStore = b
+								}
+							}
+						} else if job.source == "qq" || strings.HasSuffix(strings.ToLower(job.item.Name), ".qrc") {
+							p := parsers.ParseQQQRC(trimmed, parsers.ExactMetadata{
+								Title:      parsed.Title,
+								Artist:     parsed.Artist,
+								DurationMs: parsed.DurationMS,
+								PlatformID: parsed.PlatformID,
+							})
+							if p != nil && len(p.Lyrics) > 0 {
+								p.RawData = string(content)
+								if b, err := json.Marshal(p); err == nil {
+									contentToStore = b
+								}
+							}
+						}
+					}
+
+					row := &storage.Row{
+						Filename:    job.item.Name,
+						ContentJSON: storage.CompressContent(contentToStore),
+						ISRC:        parsed.ISRC,
+						PlatformID:  parsed.PlatformID,
+						Source:      job.source,
+						Title:       parsed.Title,
+						Artist:      parsed.Artist,
+						DurationMS:  parsed.DurationMS,
+						CreatedAt:   job.item.CreatedTime,
+					}
+					if row.CreatedAt.IsZero() {
+						row.CreatedAt = time.Now()
+					}
+					saveQueue <- row
+				}
+			}()
+		}
+		retryWg.Wait()
+	}
+
 	close(saveQueue)
 	writerWg.Wait()
 
 	if err := createIndexes(db); err != nil {
-		log.Fatalf("Failed to create indexes: %v", err)
+		log.Printf("Failed to create indexes: %v", err)
 	}
 	// Fold the WAL into the main DB file and reclaim free pages.
 	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
@@ -276,9 +523,12 @@ func main() {
 	fmt.Printf("                   Sync Completed!                       \n")
 	fmt.Printf("=========================================================\n")
 	fmt.Printf("Total Elapsed:    %v\n", elapsed)
-	fmt.Printf("Total Files:      %d\n", totalSaved.Load())
+	fmt.Printf("Total Scanned:    %d\n", totalScanned.Load())
+	fmt.Printf("Total Skipped:    %d (already up to date)\n", totalSkipped.Load())
+	fmt.Printf("Total Downloaded: %d\n", totalDownloaded.Load())
+	fmt.Printf("Total In DB:      %d\n", totalSaved.Load())
 	fmt.Printf("Total Errors:     %d\n", totalErrors.Load())
-	fmt.Printf("Database:         %s\n", *dbPath)
+	fmt.Printf("Database:         %s\n", targetDB)
 	fmt.Printf("Checkpoint:       %s\n\n", *checkpointPath)
 }
 
@@ -300,7 +550,7 @@ func initSchema(db *sql.DB) error {
 	schema := `
 CREATE TABLE IF NOT EXISTS lyrics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  filename TEXT UNIQUE NOT NULL,
+  filename TEXT NOT NULL,
   content BLOB NOT NULL,
   isrc TEXT,
   platform_id TEXT,
@@ -308,17 +558,14 @@ CREATE TABLE IF NOT EXISTS lyrics (
   title TEXT,
   artist TEXT,
   duration_ms INTEGER DEFAULT 0,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  UNIQUE(filename, source)
 );
 `
 	_, err := db.Exec(schema)
 	return err
 }
 
-// insertBatch writes rows inside a single transaction. SQLite ONLY applies
-// groups of statements atomically: one implicit transaction per statement would
-// fsync (and lock) thousands of times. The prepared statement is reused per row,
-// measured faster than multi-row VALUES on the pure-Go sqlite driver.
 func insertBatch(db *sql.DB, rows []*storage.Row) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -327,8 +574,8 @@ func insertBatch(db *sql.DB, rows []*storage.Row) error {
 	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.Prepare(`
-INSERT OR IGNORE INTO lyrics (filename, content, isrc, platform_id, source, title, artist, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT OR IGNORE INTO lyrics (filename, content, isrc, platform_id, source, title, artist, duration_ms, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `)
 	if err != nil {
 		return err
@@ -336,7 +583,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	defer func() { _ = stmt.Close() }()
 
 	for _, r := range rows {
-		_, err := stmt.Exec(r.Filename, r.ContentJSON, r.ISRC, r.PlatformID, r.Source, r.Title, r.Artist, r.CreatedAt.UnixMilli())
+		_, err := stmt.Exec(r.Filename, r.ContentJSON, r.ISRC, r.PlatformID, r.Source, r.Title, r.Artist, r.DurationMS, r.CreatedAt.UnixMilli())
 		if err != nil {
 			return err
 		}
@@ -347,6 +594,7 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 
 func createIndexes(db *sql.DB) error {
 	_, err := db.Exec(`
+CREATE INDEX IF NOT EXISTS idx_lyrics_filename ON lyrics(filename);
 CREATE INDEX IF NOT EXISTS idx_lyrics_isrc ON lyrics(isrc);
 CREATE INDEX IF NOT EXISTS idx_lyrics_platform ON lyrics(platform_id);
 CREATE INDEX IF NOT EXISTS idx_lyrics_title_artist ON lyrics(title, artist);
@@ -370,6 +618,9 @@ func loadCheckpoint(path string) Checkpoint {
 }
 
 func saveCheckpoint(path string, cp Checkpoint) {
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return
+	}
 	data, err := json.MarshalIndent(cp, "", "  ")
 	if err != nil {
 		return

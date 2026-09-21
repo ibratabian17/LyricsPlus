@@ -5,23 +5,24 @@
 set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="$DIR/gdrive_sync"
+BIN="$DIR/bin/gdrive_sync"
 PID_FILE="$DIR/data/.gdrive_sync.pid"
 LOG_FILE="$DIR/data/gdrive_sync.log"
 
-CONCURRENCY=500
+CONCURRENCY=150
 RESET_FLAG=""
+REDO_FLAG=""
 CONFIG_FLAG=""
 RUN_BG=false
 CHECK_STATUS=false
 STOP_RUN=false
 
-mkdir -p "$DIR/data" "$DIR/database"
+mkdir -p "$DIR/data" "$DIR/database" "$DIR/bin"
 
 # Ensure binary is compiled
 if [ ! -f "$BIN" ]; then
     echo "[*] Compiling gdrive_sync binary..."
-    (cd "$DIR" && go build -o gdrive_sync ./cmd/gdrive_sync)
+    (cd "$DIR" && go build -o bin/gdrive_sync ./cmd/gdrive_sync)
 fi
 
 # Parse CLI arguments
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
             RESET_FLAG="-reset"
             shift
             ;;
+        --redo)
+            REDO_FLAG="-redo"
+            shift
+            ;;
         --config)
             CONFIG_FLAG="-config $2"
             shift 2
@@ -61,7 +66,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --status             Check status of background migration"
             echo "  --stop               Gracefully stop background migration"
             echo "  --reset              Start migration from scratch (ignore existing checkpoint)"
-            echo "  --concurrency, -c N  Number of concurrent download workers (default: 500)"
+            echo "  --redo               Rescan folders and download missing/errored files (skips existing)"
+            echo "  --concurrency, -c N  Number of concurrent download workers (default: 150)"
             echo "  --help, -h           Show this help message"
             exit 0
             ;;
@@ -129,7 +135,7 @@ fi
 # Run in background mode
 if [ "$RUN_BG" = true ]; then
     echo "[+] Starting gdrive_sync in background (concurrency: $CONCURRENCY)..."
-    nohup "$BIN" $CONFIG_FLAG -concurrency "$CONCURRENCY" $RESET_FLAG >> "$LOG_FILE" 2>&1 &
+    nohup "$BIN" $CONFIG_FLAG -concurrency "$CONCURRENCY" $RESET_FLAG $REDO_FLAG >> "$LOG_FILE" 2>&1 &
     PID=$!
     echo "$PID" > "$PID_FILE"
     echo "[+] Running with PID: $PID"
@@ -142,4 +148,4 @@ fi
 echo "[+] Starting gdrive_sync in foreground (concurrency: $CONCURRENCY)..."
 echo "[*] Press Ctrl+C at any time to save checkpoint and exit."
 echo ""
-exec "$BIN" $CONFIG_FLAG -concurrency "$CONCURRENCY" $RESET_FLAG
+exec "$BIN" $CONFIG_FLAG -concurrency "$CONCURRENCY" $RESET_FLAG $REDO_FLAG

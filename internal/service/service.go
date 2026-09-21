@@ -119,7 +119,9 @@ func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredS
 			if e, ok := s.MemCache.Get(rawCacheKey(q)); ok && e != nil {
 				var entry rawCacheEntry
 				if json.Unmarshal(e.Body, &entry) == nil && entry.Raw != "" {
-					return &RawResult{Source: entry.Source, Raw: entry.Raw}, nil
+					if matchSource(entry.Source, preferredSources) {
+						return &RawResult{Source: entry.Source, Raw: entry.Raw}, nil
+					}
 				}
 			}
 		}
@@ -156,6 +158,9 @@ func (s *Service) fromMemory(ctx context.Context, q domain.SearchQuery) (*domain
 	}
 	var resp domain.LyricsResponse
 	if json.Unmarshal(e.Body, &resp) != nil || len(resp.Lyrics) == 0 {
+		return nil, false
+	}
+	if !matchSource(resp.Metadata.Source, q.Sources) {
 		return nil, false
 	}
 	if resp.ProcessingTime == nil {
@@ -199,39 +204,95 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		return nil, false
 	}
 	var row *storage.Row
-	var ok bool
+	bestPrio := -1
+
 	if q.ISRC != "" || q.PlatformID != "" {
-		if row, ok = s.Store.GetExact(ctx, q.ISRC, q.PlatformID); !ok {
+		if r, ok := s.Store.GetExact(ctx, q.ISRC, q.PlatformID); ok && r != nil {
+			src := rowSource(r)
+			prio := sourcePriority(src, q.Sources)
+			if prio >= 0 {
+				row = r
+				bestPrio = prio
+			}
+		} else if q.IDOnly() {
 			return nil, false
 		}
 	}
-	if row == nil {
+	if (row == nil || bestPrio > 0) && (q.Title != "" || q.Artist != "") {
 		keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
 		if rows, ok2 := s.Store.GetExisting(ctx, keywords); ok2 && len(rows) > 0 {
-			row = rows[0]
+			for _, r := range rows {
+				if r == nil || len(r.ContentJSON) == 0 {
+					continue
+				}
+				src := rowSource(r)
+				prio := sourcePriority(src, q.Sources)
+				if prio >= 0 && (bestPrio == -1 || prio < bestPrio) {
+					row = r
+					bestPrio = prio
+					if bestPrio == 0 {
+						break
+					}
+				}
+			}
 		}
 	}
 	if row == nil || len(row.ContentJSON) == 0 {
 		return nil, false
 	}
+
+	// If explicit sources were specified and top preference (index 0) was not found in cache,
+	// do not return a lower-priority fallback from cache so providers can race live.
+	if len(q.Sources) > 0 && bestPrio > 0 {
+		return nil, false
+	}
+
 	var resp domain.LyricsResponse
-	if err := json.Unmarshal(row.ContentJSON, &resp); err != nil || len(resp.Lyrics) == 0 {
+	trimmedRaw := strings.TrimSpace(string(row.ContentJSON))
+	if strings.HasPrefix(trimmedRaw, "<") {
+		if strings.HasSuffix(strings.ToLower(row.Filename), ".ttml") || strings.EqualFold(row.Source, "apple") {
+			if p, err := parsers.TTMLToJSON(row.ContentJSON); err == nil && p != nil && len(p.Lyrics) > 0 {
+				resp = *p
+			}
+		} else if strings.HasSuffix(strings.ToLower(row.Filename), ".qrc") || strings.EqualFold(row.Source, "qq") {
+			p := parsers.ParseQQQRC(trimmedRaw, parsers.ExactMetadata{
+				Title:      row.Title,
+				Artist:     row.Artist,
+				DurationMs: row.DurationMS,
+				PlatformID: row.PlatformID,
+			})
+			if p != nil && len(p.Lyrics) > 0 {
+				resp = *p
+			}
+		}
+	}
+	if len(resp.Lyrics) == 0 {
+		if err := json.Unmarshal(row.ContentJSON, &resp); err != nil || len(resp.Lyrics) == 0 {
+			return nil, false
+		}
+	}
+	winner := row.Source
+	if winner == "" {
+		if resp.ProcessingTime != nil && resp.ProcessingTime.WinnerSource != nil && *resp.ProcessingTime.WinnerSource != "" {
+			winner = *resp.ProcessingTime.WinnerSource
+		} else {
+			winner = providerNameForSource(resp.Metadata.Source)
+		}
+	}
+	finalPrio := sourcePriority(winner, q.Sources)
+	if finalPrio < 0 || (len(q.Sources) > 0 && finalPrio > 0) {
 		return nil, false
 	}
 	resp = *parsers.NormalizeV2(&resp)
 	resp.RawData = string(row.ContentJSON)
 	resp.Cached = domain.CacheDatabase
-	if row.Source == "lyricsplus" {
+	if row.Source == "lyricsplus" && !strings.HasPrefix(resp.Metadata.Source, "Lyrics+") {
 		resp.Metadata.Source = "Lyrics+"
 	}
 	if resp.ProcessingTime == nil {
 		resp.ProcessingTime = &domain.ProcessTiming{}
 	}
 	if resp.ProcessingTime.WinnerSource == nil {
-		winner := row.Source
-		if winner == "" {
-			winner = providerNameForSource(resp.Metadata.Source)
-		}
 		resp.ProcessingTime.WinnerSource = &winner
 	}
 	title := row.Title
@@ -348,26 +409,99 @@ func providerDisplayName(source string) string {
 // providerNameForSource maps a metadata source label back to the racer's
 // provider name, so cache hits can report a winner.
 func providerNameForSource(source string) string {
-	switch source {
-	case "Spotify":
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "spotify":
 		return "spotify"
-	case "Apple", "Apple Music":
+	case "apple", "apple music":
 		return "apple"
-	case "QQ Music", "QQ":
+	case "qq music", "qq", "qqmusic":
 		return "qq"
-	case "Musixmatch":
+	case "musixmatch":
 		return "musixmatch"
-	case "Deezer":
+	case "musixmatch-word":
+		return "musixmatch-word"
+	case "deezer":
 		return "deezer"
 	default:
 		return "lyricsplus"
 	}
 }
 
-func extFor(source string) string {
-	switch source {
-	case "Apple Music", "Apple", "QQ Music", "QQ":
-		return "xml"
+// sourcePriority returns the 0-indexed position of candidate in allowed,
+// or -1 if candidate is not allowed. If allowed is empty, returns 0.
+func sourcePriority(candidate string, allowed []string) int {
+	if len(allowed) == 0 {
+		return 0
 	}
-	return "json"
+	candNorm := providerNameForSource(candidate)
+	for i, a := range allowed {
+		aNorm := providerNameForSource(a)
+		if aNorm == candNorm {
+			return i
+		}
+		if aNorm == "musixmatch" && candNorm == "musixmatch-word" {
+			return i
+		}
+	}
+	return -1
+}
+
+func matchSource(candidate string, allowed []string) bool {
+	return sourcePriority(candidate, allowed) >= 0
+}
+
+func rowSource(r *storage.Row) string {
+	if r == nil {
+		return ""
+	}
+	if r.Source != "" {
+		return r.Source
+	}
+	trimmed := strings.TrimSpace(string(r.ContentJSON))
+	if strings.HasPrefix(trimmed, "<") {
+		if strings.HasSuffix(strings.ToLower(r.Filename), ".ttml") {
+			return "apple"
+		}
+		if strings.HasSuffix(strings.ToLower(r.Filename), ".qrc") {
+			return "qq"
+		}
+	}
+	var partial struct {
+		Metadata struct {
+			Source string `json:"source"`
+		} `json:"metadata"`
+		ProcessingTime *struct {
+			WinnerSource *string `json:"winnerSource"`
+		} `json:"processingTime"`
+	}
+	if json.Unmarshal(r.ContentJSON, &partial) == nil {
+		if partial.ProcessingTime != nil && partial.ProcessingTime.WinnerSource != nil && *partial.ProcessingTime.WinnerSource != "" {
+			return *partial.ProcessingTime.WinnerSource
+		}
+		if partial.Metadata.Source != "" {
+			return partial.Metadata.Source
+		}
+	}
+	return ""
+}
+
+func extFor(source string) string {
+	s := strings.ToLower(strings.TrimSpace(source))
+	if strings.HasPrefix(s, "lyrics+") || strings.HasPrefix(s, "lyricsplus") {
+		return "json"
+	}
+	switch s {
+	case "apple", "apple music":
+		return "ttml"
+	case "qq", "qq music", "qqmusic":
+		return "qrc"
+	default:
+		if strings.Contains(s, "apple") && !strings.Contains(s, "lyrics") {
+			return "ttml"
+		}
+		if strings.Contains(s, "qq") && !strings.Contains(s, "lyrics") {
+			return "qrc"
+		}
+		return "json"
+	}
 }

@@ -10,7 +10,6 @@ import (
 	"unicode"
 
 	"lyricsplus/backend/internal/domain"
-	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/similarity"
 )
 
@@ -683,19 +682,21 @@ func splitWordByNorms(appleText string, qqNorms []string) []string {
 		base = m[1]
 		trail = m[2]
 	}
+	baseRunes := []rune(base)
 	var parts []string
 	pos := 0
 
 	for i := 0; i < len(qqNorms); i++ {
-		if i == len(qqNorms)-1 || pos >= len(base) {
-			parts = append(parts, base[pos:]+trail)
+		if i == len(qqNorms)-1 || pos >= len(baseRunes) {
+			parts = append(parts, string(baseRunes[pos:])+trail)
 			break
 		}
-		length := len(qqNorms[i])
-		if len(base)-pos < length {
-			length = len(base) - pos
+		normRunes := []rune(qqNorms[i])
+		length := len(normRunes)
+		if len(baseRunes)-pos < length {
+			length = len(baseRunes) - pos
 		}
-		parts = append(parts, base[pos:pos+length])
+		parts = append(parts, string(baseRunes[pos:pos+length]))
 		pos += length
 	}
 	return parts
@@ -1021,7 +1022,7 @@ func RetimeAppleLinesFromQQ(appleLines, wordLines []domain.Line) []domain.Line {
 	return result
 }
 
-// MergeAppleMetadataIntoWordSync merges Apple Line sync with QQ Word sync, matching JS mergeAppleMetadataIntoWordSync.
+// MergeAppleMetadataIntoWordSync merges Apple Line sync with QQ Word sync
 func MergeAppleMetadataIntoWordSync(appleData, wordSyncData *domain.LyricsResponse) *domain.LyricsResponse {
 	if appleData == nil || wordSyncData == nil {
 		if wordSyncData != nil {
@@ -1030,7 +1031,8 @@ func MergeAppleMetadataIntoWordSync(appleData, wordSyncData *domain.LyricsRespon
 		return appleData
 	}
 
-	if appleData.Type == domain.SyncTypeWord || appleData.Type == domain.SyncTypeSyllable {
+	typeLower := strings.ToLower(string(appleData.Type))
+	if typeLower == "word" || typeLower == "syllable" {
 		return nil
 	}
 
@@ -1132,6 +1134,15 @@ func MergeAppleMetadataIntoWordSync(appleData, wordSyncData *domain.LyricsRespon
 		agents = wordMeta.Agents
 	}
 
+	lang := appleMeta.Language
+	if lang == "" {
+		lang = wordMeta.Language
+	}
+	totalDur := appleMeta.TotalDuration
+	if totalDur == "" {
+		totalDur = wordMeta.TotalDuration
+	}
+
 	mergedMetadata := domain.LyricsMetadata{
 		Source:         fmt.Sprintf("QQ/Apple (%s)", mode),
 		Title:          wordMeta.Title,
@@ -1141,8 +1152,8 @@ func MergeAppleMetadataIntoWordSync(appleData, wordSyncData *domain.LyricsRespon
 		LeadingSilence: wordMeta.LeadingSilence,
 		Agents:         agents,
 		SongParts:      appleMeta.SongParts,
-		Language:       appleMeta.Language,
-		TotalDuration:  appleMeta.TotalDuration,
+		Language:       lang,
+		TotalDuration:  totalDur,
 	}
 	if mergedMetadata.LeadingSilence == "" {
 		mergedMetadata.LeadingSilence = "0.000"
@@ -1162,5 +1173,5 @@ func MergeAppleMetadataIntoWordSync(appleData, wordSyncData *domain.LyricsRespon
 	out.Metadata = mergedMetadata
 	out.Lyrics = mergedLyrics
 
-	return parsers.NormalizeV2(&out)
+	return &out
 }
