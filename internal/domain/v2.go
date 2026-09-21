@@ -120,10 +120,12 @@ type SourceStatus struct {
 
 // PickedSongMetadata identifies the song the pipeline resolved for the query.
 type PickedSongMetadata struct {
-	Source string `json:"source"`
-	Title  string `json:"title,omitempty"`
-	Artist string `json:"artist,omitempty"`
-	Album  string `json:"album,omitempty"`
+	Source         string `json:"source"`
+	Title          string `json:"title,omitempty"`
+	Artist         string `json:"artist,omitempty"`
+	Album          string `json:"album,omitempty"`
+	SongISRC       string `json:"songISRC,omitempty"`
+	SongPlatformID string `json:"songPlatformId,omitempty"`
 }
 
 // ProcessTiming measures server-side processing windows and carries the

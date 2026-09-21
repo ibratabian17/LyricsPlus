@@ -167,8 +167,43 @@ func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	}
 
 	parsed.Metadata.Source = "Apple"
+	if len(bestMatch.Attributes.SongwriterNames) > 0 && len(parsed.Metadata.SongWriters) == 0 {
+		parsed.Metadata.SongWriters = bestMatch.Attributes.SongwriterNames
+	}
 	parsed.Cached = domain.CacheNone
 	parsed.RawData = ttmlContent
+
+	songTitle := bestMatch.Attributes.Name
+	if songTitle == "" {
+		songTitle = q.Title
+	}
+	songArtist := bestMatch.Attributes.ArtistName
+	if songArtist == "" {
+		songArtist = q.Artist
+	}
+	songAlbum := bestMatch.Attributes.AlbumName
+	if songAlbum == "" {
+		songAlbum = q.Album
+	}
+	songISRC := bestMatch.Attributes.ISRC
+	if songISRC == "" {
+		songISRC = q.ISRC
+	}
+	songPlatformID := bestMatch.ID
+	if songPlatformID == "" {
+		songPlatformID = q.PlatformID
+	}
+
+	parsed.ProcessingTime = &domain.ProcessTiming{
+		SelectedSongMetadata: &domain.PickedSongMetadata{
+			Source:         "Apple",
+			Title:          songTitle,
+			Artist:         songArtist,
+			Album:          songAlbum,
+			SongISRC:       songISRC,
+			SongPlatformID: songPlatformID,
+		},
+	}
 
 	return parsed, nil
 }

@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"lyricsplus/backend/internal/domain"
@@ -59,9 +60,7 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 
 	resp := res.Resp
 	now := time.Now()
-	if resp.ProcessingTime == nil {
-		resp.ProcessingTime = buildProcessTiming(res, now.UnixMilli())
-	}
+	resp.ProcessingTime = buildProcessTiming(res, q, now.UnixMilli())
 	if resp.KpoeTools == "" {
 		resp.KpoeTools = "lyricsplus"
 	}
@@ -76,14 +75,28 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 			if err != nil {
 				return
 			}
+			title := q.Title
+			artist := q.Artist
+			album := q.Album
+			if resp.ProcessingTime != nil && resp.ProcessingTime.SelectedSongMetadata != nil {
+				if resp.ProcessingTime.SelectedSongMetadata.Title != "" {
+					title = resp.ProcessingTime.SelectedSongMetadata.Title
+				}
+				if resp.ProcessingTime.SelectedSongMetadata.Artist != "" {
+					artist = resp.ProcessingTime.SelectedSongMetadata.Artist
+				}
+				if resp.ProcessingTime.SelectedSongMetadata.Album != "" {
+					album = resp.ProcessingTime.SelectedSongMetadata.Album
+				}
+			}
 			row := &storage.Row{
-				Filename:    storage.CanonicalFilename(resp.Metadata.Artist, resp.Metadata.Title, resp.Metadata.Album, q.Duration, q.ISRC, q.PlatformID, extFor(resp.Metadata.Source)),
+				Filename:    storage.CanonicalFilename(artist, title, album, q.Duration, q.ISRC, q.PlatformID, extFor(resp.Metadata.Source)),
 				ContentJSON: contentJSON,
 				ISRC:        q.ISRC,
 				PlatformID:  q.PlatformID,
 				Source:      winner,
-				Title:       resp.Metadata.Title,
-				Artist:      resp.Metadata.Artist,
+				Title:       title,
+				Artist:      artist,
 				DurationMS:  q.Duration,
 				CreatedAt:   now,
 			}
@@ -146,7 +159,37 @@ func (s *Service) fromMemory(ctx context.Context, q domain.SearchQuery) (*domain
 		return nil, false
 	}
 	if resp.ProcessingTime == nil {
-		resp.ProcessingTime = cacheProcessTiming(providerNameForSource(resp.Metadata.Source), time.Now().UnixMilli(), &resp.Metadata)
+		resp.ProcessingTime = &domain.ProcessTiming{}
+	}
+	if resp.ProcessingTime.WinnerSource == nil {
+		winner := providerNameForSource(resp.Metadata.Source)
+		resp.ProcessingTime.WinnerSource = &winner
+	}
+	if resp.ProcessingTime.SelectedSongMetadata == nil {
+		resp.ProcessingTime.SelectedSongMetadata = &domain.PickedSongMetadata{
+			Source:         providerDisplayName(*resp.ProcessingTime.WinnerSource),
+			Title:          q.Title,
+			Artist:         q.Artist,
+			Album:          q.Album,
+			SongISRC:       q.ISRC,
+			SongPlatformID: q.PlatformID,
+		}
+	} else {
+		if resp.ProcessingTime.SelectedSongMetadata.Title == "" {
+			resp.ProcessingTime.SelectedSongMetadata.Title = q.Title
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.Artist == "" {
+			resp.ProcessingTime.SelectedSongMetadata.Artist = q.Artist
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.Album == "" {
+			resp.ProcessingTime.SelectedSongMetadata.Album = q.Album
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.SongISRC == "" {
+			resp.ProcessingTime.SelectedSongMetadata.SongISRC = q.ISRC
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.SongPlatformID == "" {
+			resp.ProcessingTime.SelectedSongMetadata.SongPlatformID = q.PlatformID
+		}
 	}
 	return &resp, true
 }
@@ -182,7 +225,57 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		resp.Metadata.Source = "Lyrics+"
 	}
 	if resp.ProcessingTime == nil {
-		resp.ProcessingTime = cacheProcessTiming(row.Source, time.Now().UnixMilli(), &resp.Metadata)
+		resp.ProcessingTime = &domain.ProcessTiming{}
+	}
+	if resp.ProcessingTime.WinnerSource == nil {
+		winner := row.Source
+		if winner == "" {
+			winner = providerNameForSource(resp.Metadata.Source)
+		}
+		resp.ProcessingTime.WinnerSource = &winner
+	}
+	title := row.Title
+	if title == "" {
+		title = q.Title
+	}
+	artist := row.Artist
+	if artist == "" {
+		artist = q.Artist
+	}
+	album := q.Album
+	isrc := row.ISRC
+	if isrc == "" {
+		isrc = q.ISRC
+	}
+	platID := row.PlatformID
+	if platID == "" {
+		platID = q.PlatformID
+	}
+	if resp.ProcessingTime.SelectedSongMetadata == nil {
+		resp.ProcessingTime.SelectedSongMetadata = &domain.PickedSongMetadata{
+			Source:         providerDisplayName(*resp.ProcessingTime.WinnerSource),
+			Title:          title,
+			Artist:         artist,
+			Album:          album,
+			SongISRC:       isrc,
+			SongPlatformID: platID,
+		}
+	} else {
+		if resp.ProcessingTime.SelectedSongMetadata.Title == "" {
+			resp.ProcessingTime.SelectedSongMetadata.Title = title
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.Artist == "" {
+			resp.ProcessingTime.SelectedSongMetadata.Artist = artist
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.Album == "" {
+			resp.ProcessingTime.SelectedSongMetadata.Album = album
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.SongISRC == "" {
+			resp.ProcessingTime.SelectedSongMetadata.SongISRC = isrc
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.SongPlatformID == "" {
+			resp.ProcessingTime.SelectedSongMetadata.SongPlatformID = platID
+		}
 	}
 	return &resp, true
 }
@@ -201,7 +294,7 @@ func (s *Service) cacheResponse(ctx context.Context, q domain.SearchQuery, resp 
 	}
 }
 
-func buildProcessTiming(res *orchestrator.Result, lastProcessed int64) *domain.ProcessTiming {
+func buildProcessTiming(res *orchestrator.Result, q domain.SearchQuery, lastProcessed int64) *domain.ProcessTiming {
 	statuses := make(map[string]domain.SourceStatus, len(res.SourcesStatus))
 	for name, out := range res.SourcesStatus {
 		ms := out.ElapsedMs
@@ -209,41 +302,47 @@ func buildProcessTiming(res *orchestrator.Result, lastProcessed int64) *domain.P
 	}
 	winner := res.Source
 	prio := res.Priority
+
+	var selMeta *domain.PickedSongMetadata
+	if res.Resp != nil && res.Resp.ProcessingTime != nil && res.Resp.ProcessingTime.SelectedSongMetadata != nil {
+		selMeta = res.Resp.ProcessingTime.SelectedSongMetadata
+	} else {
+		sourceName := providerDisplayName(winner)
+		selMeta = &domain.PickedSongMetadata{
+			Source:         sourceName,
+			Title:          q.Title,
+			Artist:         q.Artist,
+			Album:          q.Album,
+			SongISRC:       q.ISRC,
+			SongPlatformID: q.PlatformID,
+		}
+	}
+
 	return &domain.ProcessTiming{
 		LastProcessed:        lastProcessed,
 		TotalElapsedMs:       res.Elapsed.Milliseconds(),
 		WinnerSource:         &winner,
 		SyncPriority:         &prio,
 		SourcesStatus:        statuses,
-		SelectedSongMetadata: pickedSongMeta(res.Resp),
+		SelectedSongMetadata: selMeta,
 	}
 }
 
-// cacheProcessTiming builds the processingTime for a database cache hit, where
-// no race diagnostics exist; only the cached row's identity is known.
-func cacheProcessTiming(rowSource string, lastProcessed int64, meta *domain.LyricsMetadata) *domain.ProcessTiming {
-	winner := rowSource
-	return &domain.ProcessTiming{
-		LastProcessed:        lastProcessed,
-		WinnerSource:         &winner,
-		SelectedSongMetadata: pickedSongMeta(&domain.LyricsResponse{Metadata: *meta}),
+func providerDisplayName(source string) string {
+	switch strings.ToLower(source) {
+	case "spotify":
+		return "Spotify"
+	case "apple", "apple music":
+		return "Apple"
+	case "qq", "qq music":
+		return "QQ Music"
+	case "musixmatch":
+		return "Musixmatch"
+	case "deezer":
+		return "Deezer"
+	default:
+		return "Lyrics+"
 	}
-}
-
-func pickedSongMeta(resp *domain.LyricsResponse) *domain.PickedSongMetadata {
-	if resp == nil {
-		return nil
-	}
-	met := &domain.PickedSongMetadata{
-		Source: resp.Metadata.Source,
-		Title:  resp.Metadata.Title,
-		Artist: resp.Metadata.Artist,
-		Album:  resp.Metadata.Album,
-	}
-	if met.Source == "" {
-		met.Source = "Lyrics+"
-	}
-	return met
 }
 
 // providerNameForSource maps a metadata source label back to the racer's
