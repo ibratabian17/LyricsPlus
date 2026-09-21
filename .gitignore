@@ -1,0 +1,16 @@
+.DS_Store
+*.db
+*.db-shm
+*.db-wal
+*.tmp.db
+*.db.gz
+*.log
+data/
+database/
+bin/
+/server
+/gdrive_sync
+.env
+auth.json
+*.auth.json
+data/auth.json

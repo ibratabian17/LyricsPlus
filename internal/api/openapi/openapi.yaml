@@ -1,0 +1,714 @@
+openapi: 3.0.3
+info:
+  title: LyricsPlus Backend API
+  version: 1.0.0
+  description: >-
+    Synced-lyrics aggregation API. It fetches timestamped (word- and line-level)
+    lyrics from several providers (Apple Music, Spotify, Musixmatch, Deezer, QQ
+    Music, and the LyricsPlus UGC store), normalizes them into a canonical V2
+    payload, caches results, and serves the legacy V1 and Apple Music TTML
+    variants. Interactive viewer: /docs. Prose reference: docs/endpoints.md.
+  license:
+    name: Apache-2.0
+servers:
+  - url: /
+tags:
+  - name: Lyrics
+    description: Synchronized lyrics retrieval (V1, V2, TTML, raw).
+  - name: Catalog
+    description: Song catalog search and Apple Music metadata.
+  - name: LyricsPlus
+    description: User-generated lyrics proof-of-work challenge and submission.
+  - name: Ops
+    description: Health and API documentation endpoints.
+paths:
+  /:
+    get:
+      tags: [Ops]
+      summary: Service banner
+      responses:
+        "200":
+          description: Plain text service banner.
+  /health:
+    get:
+      tags: [Ops]
+      summary: Liveness probe
+      description: Returns 200 while the process is healthy. Never throttled.
+      responses:
+        "200":
+          description: Service is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /readyz:
+    get:
+      tags: [Ops]
+      summary: Readiness probe
+      description: >-
+        Returns 200 when the backing SQLite cache is reachable, otherwise 503.
+        Never throttled.
+      responses:
+        "200":
+          description: Service is ready.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Backing cache is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+  /openapi.yaml:
+    get:
+      tags: [Ops]
+      summary: OpenAPI specification
+      responses:
+        "200":
+          description: The OpenAPI 3.0.3 specification as YAML.
+  /docs:
+    get:
+      tags: [Ops]
+      summary: Interactive API viewer
+      responses:
+        "200":
+          description: Swagger UI HTML document.
+  /v2/lyrics/get:
+    get:
+      tags: [Lyrics]
+      summary: Fetch lyrics in the canonical V2 format
+      parameters:
+        - $ref: "#/components/parameters/Title"
+        - $ref: "#/components/parameters/Artist"
+        - $ref: "#/components/parameters/Album"
+        - $ref: "#/components/parameters/Duration"
+        - $ref: "#/components/parameters/ISRC"
+        - $ref: "#/components/parameters/PlatformId"
+        - $ref: "#/components/parameters/Source"
+        - $ref: "#/components/parameters/ForceReload"
+      responses:
+        "200":
+          description: Normalized V2 lyrics payload.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=3600, s-maxage=86400, immutable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LyricsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServerBusy"
+  /v1/lyrics/get:
+    get:
+      tags: [Lyrics]
+      summary: Fetch lyrics in the legacy V1 (flat token segment) format
+      description: Converts the canonical V2 payload to the flat V1 segment layout.
+      parameters:
+        - $ref: "#/components/parameters/Title"
+        - $ref: "#/components/parameters/Artist"
+        - $ref: "#/components/parameters/Album"
+        - $ref: "#/components/parameters/Duration"
+        - $ref: "#/components/parameters/ISRC"
+        - $ref: "#/components/parameters/PlatformId"
+        - $ref: "#/components/parameters/Source"
+        - $ref: "#/components/parameters/ForceReload"
+      responses:
+        "200":
+          description: Flat V1 lyrics payload.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/V1Response"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServerBusy"
+  /v1/ttml/get:
+    get:
+      tags: [Lyrics]
+      summary: Fetch lyrics serialized as Apple Music TTML
+      description: Returns the best hit converted to TTML inside a JSON envelope.
+      parameters:
+        - $ref: "#/components/parameters/Title"
+        - $ref: "#/components/parameters/Artist"
+        - $ref: "#/components/parameters/Album"
+        - $ref: "#/components/parameters/Duration"
+        - $ref: "#/components/parameters/ISRC"
+        - $ref: "#/components/parameters/PlatformId"
+        - $ref: "#/components/parameters/Source"
+        - $ref: "#/components/parameters/ForceReload"
+      responses:
+        "200":
+          description: TTML serialization.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ttml:
+                    type: string
+                    example: "<tt xmlns:...></tt>"
+                  processingTime:
+                    $ref: "#/components/schemas/ProcessTiming"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: TTML conversion failed.
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServerBusy"
+  /v1/raw/get:
+    get:
+      tags: [Lyrics]
+      summary: Fetch the raw provider payload verbatim
+      description: >-
+        Returns the unparsed upstream response. Content-Type is
+        application/xml for Apple/QQ and application/json for
+        Musixmatch/Spotify sources.
+      parameters:
+        - $ref: "#/components/parameters/Title"
+        - $ref: "#/components/parameters/Artist"
+        - $ref: "#/components/parameters/Album"
+        - $ref: "#/components/parameters/Duration"
+        - $ref: "#/components/parameters/ISRC"
+        - $ref: "#/components/parameters/PlatformId"
+        - $ref: "#/components/parameters/Source"
+        - $ref: "#/components/parameters/ForceReload"
+      responses:
+        "200":
+          description: Raw upstream payload.
+          headers:
+            X-Lyrics-Source:
+              schema:
+                type: string
+            X-Processing-Time:
+              schema:
+                type: string
+          content:
+            application/xml:
+              schema: { type: string }
+            application/json:
+              schema: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: Raw data not available for the best result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  source: { type: string }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/ServerBusy"
+  /v1/songlist/search:
+    get:
+      tags: [Catalog]
+      summary: Search the aggregated song catalog
+      description: >-
+        Queries Apple Music, Spotify and Musixmatch in parallel, normalizes and
+        merges the results, de-duplicating by ISRC then by title/artist/album.
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query string.
+          schema: { type: string }
+      responses:
+        "200":
+          description: Aggregated catalog results.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/SongCatalogItem"
+                  processingTime:
+                    $ref: "#/components/schemas/ProcessTiming"
+        "400":
+          description: Missing required parameter q.
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerBusy"
+  /v1/metadata/get:
+    get:
+      tags: [Catalog]
+      summary: Fetch Apple Music metadata for a track
+      parameters:
+        - name: title
+          in: query
+          required: true
+          schema: { type: string }
+        - name: artist
+          in: query
+          required: true
+          schema: { type: string }
+        - name: album
+          in: query
+          schema: { type: string }
+        - name: duration
+          in: query
+          description: Track duration in seconds (may carry millisecond decimals).
+          schema: { type: number }
+      responses:
+        "200":
+          description: Apple Music metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metadata:
+                    $ref: "#/components/schemas/SongMetadata"
+        "400":
+          description: Missing required parameters title and artist.
+        "404":
+          description: Could not find metadata.
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/ServerBusy"
+  /v1/lyricsplus/challenge:
+    get:
+      tags: [LyricsPlus]
+      summary: Issue a proof-of-work challenge token
+      description: >-
+        Returns a short-lived signed JWT carrying a random challenge. Solving
+        requires finding a nonce whose SHA-256(challenge + nonce) begins with
+        `difficulty` zero-bits. Used by /v1/lyricsplus/submit.
+      responses:
+        "200":
+          description: PoW challenge token.
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: no-store, no-cache, must-revalidate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: Signed challenge JWT.
+                  difficulty:
+                    type: integer
+                    example: 5
+        "500":
+          description: Server configuration error (missing issuer).
+  /v1/lyricsplus/submit:
+    post:
+      tags: [LyricsPlus]
+      summary: Submit user-generated lyrics with proof of work
+      description: >-
+        Persists normalized UGC lyrics to the cache and Google Drive. Guarded by
+        a vandalism heuristic unless LYRICSPLUS_ACCEPT_VANDALISM is enabled.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitRequest"
+      responses:
+        "200":
+          description: Submission accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, example: true }
+                  message: { type: string }
+                  filename:
+                    type: string
+                    description: Canonical cache filename of the submission.
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "413":
+          description: Request body exceeds the configured limit (1 MiB default).
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          description: Submissions disabled or server busy.
+components:
+  parameters:
+    Title:
+      name: title
+      in: query
+      description: Track title. Required unless isrc or platformId is given.
+      schema: { type: string }
+    Artist:
+      name: artist
+      in: query
+      description: Artist name. Required unless isrc or platformId is given.
+      schema: { type: string }
+    Album:
+      name: album
+      in: query
+      description: Album name (optional hint for matching).
+      schema: { type: string }
+    Duration:
+      name: duration
+      in: query
+      description: Track duration in seconds (may carry millisecond decimals). Coerced to milliseconds.
+      schema: { type: number, example: 232.123 }
+    ISRC:
+      name: isrc
+      in: query
+      description: International Standard Recording Code. Enables direct cache lookup.
+      schema: { type: string }
+    PlatformId:
+      name: platformId
+      in: query
+      description: Upstream platform track ID. Enables direct cache lookup.
+      schema: { type: string }
+    Source:
+      name: source
+      in: query
+      description: Comma-separated provider preference, e.g. musixmatch,spotify,qq.
+      schema: { type: string }
+    ForceReload:
+      name: forceReload
+      in: query
+      description: Bypass all cache layers and race providers fresh.
+      schema: { type: boolean }
+  responses:
+    BadRequest:
+      description: Invalid or missing request parameters.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+    NotFound:
+      description: No lyrics found for the query.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+    RateLimited:
+      description: Too many requests within the sliding window.
+      headers:
+        Retry-After:
+          schema: { type: string }
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+              message: { type: string }
+    ServerBusy:
+      description: Concurrency limit hit or service overloaded.
+      headers:
+        Retry-After:
+          schema: { type: string }
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error: { type: string }
+              message: { type: string }
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        service:
+          type: string
+          example: lyricsplus-backend
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+        commit:
+          type: string
+          example: 70711b0
+        buildDate:
+          type: string
+          example: "2026-09-21T04:36:31Z"
+        uptimeSeconds:
+          type: integer
+        database:
+          type: string
+          enum: [ok, unavailable, not_configured]
+    Agent:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [person, group]
+        name: { type: string }
+        alias: { type: string }
+      required: [type, name, alias]
+    SongPart:
+      type: object
+      properties:
+        name: { type: string }
+        time:
+          type: integer
+          description: Start offset in milliseconds.
+        duration:
+          type: integer
+          description: Duration in milliseconds.
+        divIndex:
+          type: integer
+          description: TTML div mapping index.
+    AudioMetadata:
+      type: object
+      properties:
+        lyricOffset: { type: string }
+        role: { type: string }
+    LyricsMetadata:
+      type: object
+      properties:
+        source: { type: string }
+        title: { type: string }
+        artist: { type: string }
+        album: { type: string }
+        songWriters:
+          type: array
+          items: { type: string }
+        leadingSilence: { type: string }
+        agents:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/Agent"
+        songParts:
+          type: array
+          items:
+            $ref: "#/components/schemas/SongPart"
+        language: { type: string }
+        totalDuration: { type: string }
+        curator: { type: string }
+        audio:
+          type: array
+          items:
+            $ref: "#/components/schemas/AudioMetadata"
+    Syllable:
+      type: object
+      properties:
+        time:
+          type: integer
+          description: Milliseconds from track start.
+        duration:
+          type: integer
+        text: { type: string }
+        isBackground: { type: boolean }
+        synthetic:
+          type: boolean
+          description: True when interpolated by the alignment engine.
+    Translation:
+      type: object
+      properties:
+        lang: { type: string }
+        text: { type: string }
+    Transliteration:
+      type: object
+      properties:
+        lang: { type: string }
+        text: { type: string }
+        syllabus:
+          type: array
+          items:
+            $ref: "#/components/schemas/Syllable"
+    LineElement:
+      type: object
+      properties:
+        key: { type: string }
+        singer: { type: string }
+        songPartIndex:
+          type: integer
+        songPart: { type: string }
+    Line:
+      type: object
+      properties:
+        time:
+          type: integer
+          description: Milliseconds from track start.
+        duration:
+          type: integer
+        text: { type: string }
+        syllabus:
+          type: array
+          items:
+            $ref: "#/components/schemas/Syllable"
+        element:
+          $ref: "#/components/schemas/LineElement"
+        translation:
+          $ref: "#/components/schemas/Translation"
+        transliteration:
+          $ref: "#/components/schemas/Transliteration"
+    SourceStatus:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [OK, BAD, RTO, SKIP]
+        elapsedMs:
+          type: integer
+    PickedSongMetadata:
+      type: object
+      properties:
+        source: { type: string }
+        title: { type: string }
+        artist: { type: string }
+        album: { type: string }
+    ProcessTiming:
+      type: object
+      properties:
+        timeElapsed: { type: integer }
+        lastProcessed: { type: integer }
+        totalElapsedMs: { type: integer }
+        winnerSource: { type: string }
+        syncPriority:
+          type: integer
+          enum: [0, 1, 2, 3]
+        sourcesStatus:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/SourceStatus"
+        selectedSongMetadata:
+          $ref: "#/components/schemas/PickedSongMetadata"
+    LyricsResponse:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [Word, Line, None, syllable]
+        KpoeTools: { type: string }
+        metadata:
+          $ref: "#/components/schemas/LyricsMetadata"
+        ignoreSponsorblock: { type: boolean }
+        lyrics:
+          type: array
+          items:
+            $ref: "#/components/schemas/Line"
+        cached:
+          type: string
+          enum: [None, GDrive, Database, UserJSON]
+        processingTime:
+          $ref: "#/components/schemas/ProcessTiming"
+    V1SegmentElement:
+      type: object
+      properties:
+        key: { type: string }
+        songPart: { type: string }
+        singer: { type: string }
+        isBackground: { type: boolean }
+    V1Segment:
+      type: object
+      properties:
+        time:
+          type: integer
+        duration:
+          type: integer
+        text: { type: string }
+        isLineEnding:
+          type: integer
+          enum: [0, 1]
+        element:
+          $ref: "#/components/schemas/V1SegmentElement"
+    V1Response:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [syllable, Line]
+        KpoeTools: { type: string }
+        metadata:
+          $ref: "#/components/schemas/LyricsMetadata"
+        lyrics:
+          type: array
+          items:
+            $ref: "#/components/schemas/V1Segment"
+        cached:
+          type: string
+        processingTime:
+          $ref: "#/components/schemas/ProcessTiming"
+    SongCatalogItem:
+      type: object
+      properties:
+        id:
+          type: object
+          additionalProperties: { type: string }
+        sourceId: { type: string }
+        title: { type: string }
+        artist: { type: string }
+        album: { type: string }
+        albumArtUrl: { type: string }
+        durationMs: { type: integer }
+        isrc: { type: string }
+        songwriters:
+          type: array
+          items: { type: string }
+        availability:
+          type: array
+          items: { type: string }
+        externalUrls:
+          type: object
+          additionalProperties: { type: string }
+    SongMetadata:
+      type: object
+      description: Sanitized Apple Music track metadata.
+      properties:
+        id: { type: string }
+        title: { type: string }
+        artist: { type: string }
+        album: { type: string }
+        albumArtUrl: { type: string }
+        durationMs: { type: integer }
+        isrc: { type: string }
+        songwriters:
+          type: array
+          items: { type: string }
+    SubmitRequest:
+      type: object
+      required: [proofOfWorkToken, nonce, songTitle, songArtist, songDuration, lyricsData]
+      properties:
+        proofOfWorkToken:
+          type: string
+          description: JWT obtained from /v1/lyricsplus/challenge.
+        nonce:
+          type: string
+          description: PoW solution for the challenge.
+        songTitle: { type: string }
+        songArtist: { type: string }
+        songAlbum: { type: string }
+        songDuration:
+          type: string
+          description: Track duration in seconds (may carry millisecond decimals).
+        songISRC: { type: string }
+        songPlatformId: { type: string }
+        lyricsData:
+          $ref: "#/components/schemas/LyricsResponse"
+        forceUpload: { type: boolean }

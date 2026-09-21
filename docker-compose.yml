@@ -1,0 +1,36 @@
+services:
+  backend:
+    build:
+      context: .
+      args:
+        VERSION: dev
+    image: lyricsplus-backend
+    container_name: lyricsplus-backend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: "3000"
+      # Structured logging toggle + tuning.
+      DISABLE_LOGGING: "false"
+      LOG_LEVEL: "info"
+      LOG_FORMAT: "text"
+      # Rate limiting / query guardrails.
+      RATE_LIMIT_REQUESTS: "20"
+      RATE_LIMIT_WINDOW_MS: "10000"
+      # UGC (proof-of-work) submissions. Set a strong secret in production.
+      ALLOW_SUBMISSIONS: "true"
+      JWT_SECRET: "change-me-in-production"
+      LYRICSPLUS_POW_DIFFICULTY: "5"
+      # Google Drive caching is disabled inside the container by default.
+      GDRIVE_ENABLED: "false"
+      DAILY_DUMP_ENABLED: "false"
+    volumes:
+      - ./database:/app/database
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

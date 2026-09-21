@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Pre-commit hook: block commits that break formatting, vet, or tests.
+# Enabled via: git config core.hooksPath .githooks   (or "make hooks-install")
+set -e
+
+echo "[pre-commit] gofmt..."
+unformatted="$(gofmt -l .)"
+if [ -n "$unformatted" ]; then
+    echo "These files are not gofmt-formatted:"
+    echo "$unformatted"
+    exit 1
+fi
+
+echo "[pre-commit] go vet..."
+go vet ./...
+
+echo "[pre-commit] go test..."
+go test ./...

@@ -1,0 +1,21 @@
+version: "2"
+
+# Lint gates for the LyricsPlus backend. The "standard" default set is used,
+# with two scoped relaxations:
+#   - QF1003: tagged-switch quickfix on the delicate qaple.go matching engine.
+#   - ST1005: errMissingRequired is a contractual public error string.
+linters:
+  default: standard
+  settings:
+    staticcheck:
+      checks:
+        - all
+        - -QF1003
+        - -ST1005
+  exclusions:
+    rules:
+      # Dead helper functions predating the Go rewrite (cleanup tracked under
+      # the roadmap "dead code cleanup" work item; not in this change set).
+      - path: internal/storage/util.go|internal/parsers/util.go|internal/parsers/ttml.go|internal/storage/gdrive.go
+        linters:
+          - unused

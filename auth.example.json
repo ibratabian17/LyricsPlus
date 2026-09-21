@@ -1,0 +1,34 @@
+{
+  "client_id": "your-google-oauth-client-id.apps.googleusercontent.com",
+  "client_secret": "your-google-oauth-client-secret",
+  "refresh_token": "your-google-oauth-refresh-token",
+  "root": "your-google-drive-root-folder-id",
+  "gdrive": {
+    "enabled": false,
+    "folders": {
+      "user_tml": "",
+      "ttml": "",
+      "spotify": "",
+      "musixmatch": "",
+      "qq": "",
+      "deezer": "",
+      "backup": ""
+    }
+  },
+  "provider": {
+    "spotify_cookie": "",
+    "spotify_client_id": "",
+    "spotify_client_secret": "",
+    "musixmatch_cookie": "",
+    "musixmatch_user_agent": "",
+    "musixmatch_android_email": "",
+    "musixmatch_android_password": "",
+    "apple_music_android_auth_token": "",
+    "apple_music_android_dsid": "",
+    "apple_music_android_user_agent": "",
+    "apple_music_android_cookie": "",
+    "apple_music_storefront": "in",
+    "apple_music_auth_token": ""
+  },
+  "jwt_secret": "your-secure-jwt-secret"
+}
