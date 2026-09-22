@@ -192,7 +192,11 @@ func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []stri
 		idxByName[n] = i
 	}
 
-	ch := make(chan *Result, len(names))
+	type phaseOutcome struct {
+		name string
+		res  *Result
+	}
+	ch := make(chan phaseOutcome, len(names))
 	var wg sync.WaitGroup
 	for _, n := range names {
 		if !r.has(n) {
@@ -202,7 +206,7 @@ func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []stri
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			ch <- r.TryFetch(phaseCtx, name, q)
+			ch <- phaseOutcome{name: name, res: r.TryFetch(phaseCtx, name, q)}
 		}(n)
 	}
 
@@ -217,14 +221,14 @@ func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []stri
 	complete := make([]bool, len(names))
 	for {
 		select {
-		case res := <-ch:
+		case out := <-ch:
 			finished++
-			i := idxByName[res.Source]
-			results[i] = res
+			i := idxByName[out.name]
+			results[i] = out.res
 			complete[i] = true
-			if res.Priority >= PriorityWord && !r.earlierPending(complete, i) {
+			if out.res != nil && out.res.Priority >= PriorityWord {
 				cancel()
-				return res
+				return out.res
 			}
 			if finished == len(names) {
 				return pickWinner(results, names)
@@ -281,15 +285,6 @@ func (r *Racer) raceForPriority(ctx context.Context, q domain.SearchQuery, names
 	}
 }
 
-func (r *Racer) earlierPending(complete []bool, i int) bool {
-	for j := 0; j < i; j++ {
-		if !complete[j] {
-			return true
-		}
-	}
-	return false
-}
-
 func pickWinner(results []*Result, names []string) *Result {
 	bestPrio := -1
 	var best []*Result
@@ -318,9 +313,20 @@ func pickWinner(results []*Result, names []string) *Result {
 	for i, n := range names {
 		idx[n] = i
 	}
+	nameOrder := func(source string) int {
+		if i, ok := idx[source]; ok {
+			return i
+		}
+		if source == "qaple" {
+			if i, ok := idx["lyricsplus"]; ok {
+				return i
+			}
+		}
+		return 999
+	}
 	winner := best[0]
 	for _, res := range best[1:] {
-		if idx[res.Source] < idx[winner.Source] {
+		if nameOrder(res.Source) < nameOrder(winner.Source) {
 			winner = res
 		}
 	}

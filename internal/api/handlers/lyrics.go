@@ -97,7 +97,7 @@ func (h *Lyrics) parseParams(r *http.Request) (*lyricsParams, error) {
 	if s := strings.TrimSpace(v.Get("source")); s != "" {
 		for _, p := range strings.Split(s, ",") {
 			if t := strings.TrimSpace(p); t != "" {
-				sources = append(sources, t)
+				sources = append(sources, service.ProviderNameForSource(t))
 			}
 		}
 	}

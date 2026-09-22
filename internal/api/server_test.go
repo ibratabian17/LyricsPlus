@@ -242,7 +242,7 @@ func TestLyricsGetRaw(t *testing.T) {
 
 	// Apple Music returns application/xml and Content-Disposition: inline
 	respApple := sampleWordLyrics()
-	respApple.Metadata.Source = "Apple Music"
+	respApple.Metadata.Source = "Apple"
 	respApple.RawData = raw
 	hApple := buildTestRouter(t, baseTestConfig(), &fakeSource{resp: respApple, name: "apple"})
 	recApple := doGet(t, hApple, "/v1/raw/get?title=Hello&artist=Adele&source=apple")

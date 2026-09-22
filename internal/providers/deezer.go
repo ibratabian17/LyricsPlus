@@ -136,6 +136,7 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 		return nil, nil
 	}
 
+	converted.Metadata.Source = "Deezer"
 	converted.Cached = domain.CacheNone
 	converted.RawData = string(lyricsJSON)
 	converted.ProcessingTime = &domain.ProcessTiming{

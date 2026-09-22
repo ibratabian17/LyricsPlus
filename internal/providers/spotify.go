@@ -174,6 +174,9 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 		return nil, nil
 	}
 
+	if converted.Metadata.Source == "" {
+		converted.Metadata.Source = "Spotify"
+	}
 	converted.Cached = domain.CacheNone
 	converted.RawData = string(lyricsJSON)
 	converted.ProcessingTime = &domain.ProcessTiming{

@@ -123,9 +123,15 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	}
 
 	resp.Metadata.Source = "QQ Music"
-	resp.Metadata.Title = ""
-	resp.Metadata.Artist = ""
-	resp.Metadata.Album = ""
+	if songTitle != "" {
+		resp.Metadata.Title = songTitle
+	}
+	if songArtist != "" {
+		resp.Metadata.Artist = songArtist
+	}
+	if songAlbum != "" {
+		resp.Metadata.Album = songAlbum
+	}
 	if songDuration > 0 {
 		tMin := songDuration / 60000
 		tSec := float64(songDuration%60000) / 1000.0

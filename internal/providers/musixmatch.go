@@ -149,6 +149,7 @@ func (p *MusixmatchProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		return nil, nil
 	}
 
+	converted.Metadata.Source = "Musixmatch"
 	converted.Cached = domain.CacheNone
 	converted.RawData = string(envelopeJSON)
 	converted.ProcessingTime = &domain.ProcessTiming{

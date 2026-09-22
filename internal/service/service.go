@@ -130,6 +130,22 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 	}
 
 	resp := res.Resp
+	switch {
+	case strings.EqualFold(res.Source, "apple") || resp.Metadata.Source == "Apple Music":
+		resp.Metadata.Source = "Apple"
+	case strings.EqualFold(res.Source, "lyricsplus") && !strings.HasPrefix(resp.Metadata.Source, "Lyrics+"):
+		resp.Metadata.Source = "Lyrics+"
+	case strings.EqualFold(res.Source, "qq"):
+		resp.Metadata.Source = "QQ Music"
+	case strings.EqualFold(res.Source, "deezer"):
+		resp.Metadata.Source = "Deezer"
+	case strings.EqualFold(res.Source, "musixmatch") || strings.EqualFold(res.Source, "musixmatch-word"):
+		resp.Metadata.Source = "Musixmatch"
+	case strings.EqualFold(res.Source, "spotify"):
+		if resp.Metadata.Source == "" {
+			resp.Metadata.Source = "Spotify"
+		}
+	}
 	now := time.Now()
 	resp.ProcessingTime = buildProcessTiming(res, q, now.UnixMilli())
 	if resp.KpoeTools == "" {
@@ -238,6 +254,11 @@ func (s *Service) fromMemory(ctx context.Context, q domain.SearchQuery) (*domain
 	var resp domain.LyricsResponse
 	if json.Unmarshal(e.Body, &resp) != nil || len(resp.Lyrics) == 0 {
 		return nil, false
+	}
+	if resp.Metadata.Source == "Apple Music" {
+		resp.Metadata.Source = "Apple"
+	} else if strings.EqualFold(resp.Metadata.Source, "lyricsplus") {
+		resp.Metadata.Source = "Lyrics+"
 	}
 	if !matchSource(resp.Metadata.Source, q.Sources) {
 		return nil, false
@@ -382,8 +403,21 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	resp = parsers.NormalizeV2(resp)
 	resp.RawData = string(row.ContentJSON)
 	resp.Cached = domain.CacheDatabase
-	if row.Source == "lyricsplus" && !strings.HasPrefix(resp.Metadata.Source, "Lyrics+") {
+	switch {
+	case strings.EqualFold(row.Source, "apple") || resp.Metadata.Source == "Apple Music":
+		resp.Metadata.Source = "Apple"
+	case strings.EqualFold(row.Source, "lyricsplus") && !strings.HasPrefix(resp.Metadata.Source, "Lyrics+"):
 		resp.Metadata.Source = "Lyrics+"
+	case strings.EqualFold(row.Source, "qq"):
+		resp.Metadata.Source = "QQ Music"
+	case strings.EqualFold(row.Source, "deezer"):
+		resp.Metadata.Source = "Deezer"
+	case strings.EqualFold(row.Source, "musixmatch") || strings.EqualFold(row.Source, "musixmatch-word"):
+		resp.Metadata.Source = "Musixmatch"
+	case strings.EqualFold(row.Source, "spotify"):
+		if resp.Metadata.Source == "" {
+			resp.Metadata.Source = "Spotify"
+		}
 	}
 	if resp.ProcessingTime == nil {
 		resp.ProcessingTime = &domain.ProcessTiming{}
@@ -449,10 +483,15 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 	case strings.EqualFold(src, "apple"):
 		if isXML {
 			if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+				p.Metadata.Source = "Apple"
 				return p
 			}
 		}
-		return parseNormalizedJSON(trimmedRaw)
+		res := parseNormalizedJSON(trimmedRaw)
+		if res != nil {
+			res.Metadata.Source = "Apple"
+		}
+		return res
 	case strings.EqualFold(src, "qq"):
 		if isXML {
 			p := parsers.ParseQQQRC(trimmedRaw, parsers.ExactMetadata{
@@ -466,29 +505,59 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			}
 		}
 		return parseNormalizedJSON(trimmedRaw)
+	case strings.EqualFold(src, "deezer"):
+		if p, err := parsers.NormalizeDeezerLyrics(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+			p.Metadata.Source = "Deezer"
+			return p
+		}
+		res := parseNormalizedJSON(trimmedRaw)
+		if res != nil {
+			res.Metadata.Source = "Deezer"
+		}
+		return res
 	case strings.EqualFold(src, "musixmatch"):
 		if p, err := parsers.ConvertMusixmatchToJSON(content, false); err == nil && p != nil && len(p.Lyrics) > 0 {
+			p.Metadata.Source = "Musixmatch"
 			return p
 		}
+		res := parseNormalizedJSON(trimmedRaw)
+		if res != nil {
+			res.Metadata.Source = "Musixmatch"
+		}
+		return res
 	case strings.EqualFold(src, "spotify"):
 		if p, err := parsers.ConvertSpotifyToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+			if p.Metadata.Source == "" {
+				p.Metadata.Source = "Spotify"
+			}
 			return p
 		}
+		res := parseNormalizedJSON(trimmedRaw)
+		if res != nil && res.Metadata.Source == "" {
+			res.Metadata.Source = "Spotify"
+		}
+		return res
 	case strings.EqualFold(src, "lyricsplus"), src == "":
 		if strings.Contains(trimmedRaw, `"isLineEnding"`) {
 			coerced := kpoeToolsRe.ReplaceAllString(trimmedRaw, `"KpoeTools": "$1"`)
 			var v1 domain.V1Response
 			if json.Unmarshal([]byte(coerced), &v1) == nil && len(v1.Lyrics) > 0 {
 				if p := parsers.V1ToV2(&v1); p != nil && len(p.Lyrics) > 0 {
+					p.Metadata.Source = "Lyrics+"
 					return p
 				}
 			}
 		}
-		return parseNormalizedJSON(trimmedRaw)
+		res := parseNormalizedJSON(trimmedRaw)
+		if res != nil && strings.EqualFold(src, "lyricsplus") && !strings.HasPrefix(res.Metadata.Source, "Lyrics+") {
+			res.Metadata.Source = "Lyrics+"
+		}
+		return res
 	}
 
 	if isXML {
 		if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+			p.Metadata.Source = "Apple"
 			return p
 		}
 		p := parsers.ParseQQQRC(trimmedRaw, parsers.ExactMetadata{
@@ -498,6 +567,7 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			PlatformID: row.PlatformID,
 		})
 		if p != nil && len(p.Lyrics) > 0 {
+			p.Metadata.Source = "QQ Music"
 			return p
 		}
 	}
@@ -526,6 +596,9 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 func parseNormalizedJSON(trimmedRaw string) *domain.LyricsResponse {
 	var resp domain.LyricsResponse
 	if json.Unmarshal(coercedForKpoe(trimmedRaw), &resp) == nil && len(resp.Lyrics) > 0 {
+		if resp.Metadata.Source == "Apple Music" {
+			resp.Metadata.Source = "Apple"
+		}
 		return &resp
 	}
 	return nil
@@ -616,9 +689,9 @@ func providerDisplayName(source string) string {
 	}
 }
 
-// providerNameForSource maps a metadata source label back to the racer's
+// ProviderNameForSource maps a metadata source label back to the racer's
 // provider name, so cache hits can report a winner.
-func providerNameForSource(source string) string {
+func ProviderNameForSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
 	switch s {
 	case "spotify":
@@ -644,6 +717,8 @@ func providerNameForSource(source string) string {
 		return "lyricsplus"
 	}
 }
+
+var providerNameForSource = ProviderNameForSource
 
 // sourcePriority returns the 0-indexed position of candidate in allowed,
 // or -1 if candidate is not allowed. If allowed is empty, returns 0.
@@ -741,6 +816,25 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 		valid = append(valid, r)
 	}
 	if len(valid) == 0 {
+		return nil, -1
+	}
+
+	// When explicit sources are requested, evaluate in order of source priority
+	if len(q.Sources) > 0 {
+		for prio := 0; prio < len(q.Sources); prio++ {
+			var prioRows []*storage.Row
+			for _, r := range valid {
+				if sourcePriority(rowSource(r), q.Sources) == prio {
+					prioRows = append(prioRows, r)
+				}
+			}
+			if len(prioRows) == 0 {
+				continue
+			}
+			if matched, _ := pickBestRow(prioRows, domain.SearchQuery{Title: q.Title, Artist: q.Artist, Album: q.Album, Duration: q.Duration, ISRC: q.ISRC, PlatformID: q.PlatformID}); matched != nil {
+				return matched, prio
+			}
+		}
 		return nil, -1
 	}
 
