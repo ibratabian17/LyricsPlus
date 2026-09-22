@@ -86,22 +86,35 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 			}
 		}
 		if row == nil && (q.Title != "" && q.Artist != "") {
+			if rows, ok := st.GetByTitleArtist(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
+				row = rows[0]
+			}
+		}
+		if row == nil && (q.Title != "" && q.Artist != "") {
 			keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
 			if rows, ok := st.GetExisting(ctx, keywords); ok && len(rows) > 0 {
 				row = rows[0]
 			}
 		}
 
-		if row != nil && len(row.ContentJSON) > 0 {
-			var resp domain.LyricsResponse
-			if json.Unmarshal(row.ContentJSON, &resp) == nil && len(resp.Lyrics) > 0 {
-				norm := parsers.NormalizeV2(&resp)
-				norm.Metadata.Source = "Lyrics+"
-				norm.Cached = domain.CacheUserJSON
-				norm.RawData = string(row.ContentJSON)
-				lpResult = norm
-				if hasWordSync(norm) {
-					return norm, nil
+		if row != nil {
+			if len(row.ContentJSON) == 0 {
+				content, err := st.GetContent(ctx, row.ID)
+				if err == nil {
+					row.ContentJSON = content
+				}
+			}
+			if len(row.ContentJSON) > 0 {
+				var resp domain.LyricsResponse
+				if json.Unmarshal(row.ContentJSON, &resp) == nil && len(resp.Lyrics) > 0 {
+					norm := parsers.NormalizeV2(&resp)
+					norm.Metadata.Source = "Lyrics+"
+					norm.Cached = domain.CacheUserJSON
+					norm.RawData = string(row.ContentJSON)
+					lpResult = norm
+					if hasWordSync(norm) {
+						return norm, nil
+					}
 				}
 			}
 		}

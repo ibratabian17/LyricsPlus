@@ -203,11 +203,15 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	if s.Store == nil {
 		return nil, false
 	}
+	dbCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer cancel()
+
 	var row *storage.Row
 	bestPrio := -1
 
+	// 1. Exact ID match (ISRC / Platform ID) via B-Tree index (<1ms)
 	if q.ISRC != "" || q.PlatformID != "" {
-		if r, ok := s.Store.GetExact(ctx, q.ISRC, q.PlatformID); ok && r != nil {
+		if r, ok := s.Store.GetExact(dbCtx, q.ISRC, q.PlatformID); ok && r != nil {
 			src := rowSource(r)
 			prio := sourcePriority(src, q.Sources)
 			if prio >= 0 {
@@ -218,11 +222,12 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 			return nil, false
 		}
 	}
-	if (row == nil || bestPrio > 0) && (q.Title != "" || q.Artist != "") {
-		keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
-		if rows, ok2 := s.Store.GetExisting(ctx, keywords); ok2 && len(rows) > 0 {
+
+	// 2. Exact Title + Artist match via idx_lyrics_title_artist B-Tree index (<1ms)
+	if (row == nil || bestPrio > 0) && (q.Title != "" && q.Artist != "") {
+		if rows, ok := s.Store.GetByTitleArtist(dbCtx, q.Title, q.Artist); ok && len(rows) > 0 {
 			for _, r := range rows {
-				if r == nil || len(r.ContentJSON) == 0 {
+				if r == nil {
 					continue
 				}
 				src := rowSource(r)
@@ -237,7 +242,28 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 			}
 		}
 	}
-	if row == nil || len(row.ContentJSON) == 0 {
+
+	// 3. Fallback: bounded keyword search if still not found
+	if (row == nil || bestPrio > 0) && (q.Title != "" || q.Artist != "") {
+		keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
+		if rows, ok2 := s.Store.GetExisting(dbCtx, keywords); ok2 && len(rows) > 0 {
+			for _, r := range rows {
+				if r == nil {
+					continue
+				}
+				src := rowSource(r)
+				prio := sourcePriority(src, q.Sources)
+				if prio >= 0 && (bestPrio == -1 || prio < bestPrio) {
+					row = r
+					bestPrio = prio
+					if bestPrio == 0 {
+						break
+					}
+				}
+			}
+		}
+	}
+	if row == nil {
 		return nil, false
 	}
 
@@ -245,6 +271,15 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	// do not return a lower-priority fallback from cache so providers can race live.
 	if len(q.Sources) > 0 && bestPrio > 0 {
 		return nil, false
+	}
+
+	// Fetch ContentJSON deferred if empty
+	if len(row.ContentJSON) == 0 {
+		content, err := s.Store.GetContent(dbCtx, row.ID)
+		if err != nil || len(content) == 0 {
+			return nil, false
+		}
+		row.ContentJSON = content
 	}
 
 	var resp domain.LyricsResponse
