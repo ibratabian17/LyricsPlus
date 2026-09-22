@@ -25,6 +25,40 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func (h *Lyrics) writeNotFound(w http.ResponseWriter, start time.Time, nf *service.NotFoundError) {
+	w.Header().Set("Cache-Control", cacheControlNoStore)
+	writeJSON(w, http.StatusNotFound, map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": nf.Message,
+			"status":  404,
+			"details": map[string]interface{}{
+				"searchedSources": nf.Sources,
+				"songInfo": map[string]interface{}{
+					"title":  nf.SongTitle,
+					"artist": nf.SongArtist,
+					"album":  nf.SongAlbum,
+				},
+			},
+		},
+		"processingTime": h.notFoundProcessing(start, nf),
+	})
+}
+
+func (h *Lyrics) notFoundProcessing(start time.Time, nf *service.NotFoundError) map[string]interface{} {
+	status := nf.SourceStatuses
+	if status == nil {
+		status = map[string]domain.SourceStatus{}
+	}
+	return map[string]interface{}{
+		"timeElapsed":    time.Since(start).Milliseconds(),
+		"lastProcessed":  time.Now().UnixMilli(),
+		"totalElapsedMs": nf.TotalMs,
+		"winnerSource":   nil,
+		"syncPriority":   nil,
+		"sourcesStatus":  status,
+	}
+}
+
 var errMissingRequired = errors.New("Missing required parameters: (title and artist) or isrc or platformId")
 
 type lyricsParams struct {
@@ -109,10 +143,17 @@ func (h *Lyrics) GetV2(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	resp, err := h.Service.FetchLyrics(r.Context(), p.query, p.sources, p.forceReload)
-	if h.logFetch(r, "v2", p.query, start, resp, err) {
-		w.Header().Set("Cache-Control", cacheControlNoStore)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal Server Error"})
-		return
+	if err != nil {
+		var nf *service.NotFoundError
+		if errors.As(err, &nf) {
+			h.writeNotFound(w, start, nf)
+			return
+		}
+		if h.logFetch(r, "v2", p.query, start, resp, err) {
+			w.Header().Set("Cache-Control", cacheControlNoStore)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal Server Error"})
+			return
+		}
 	}
 	if resp == nil {
 		w.Header().Set("Cache-Control", cacheControlNoStore)
@@ -134,10 +175,17 @@ func (h *Lyrics) GetV1(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	resp, err := h.Service.FetchLyrics(r.Context(), p.query, p.sources, p.forceReload)
-	if h.logFetch(r, "v1", p.query, start, resp, err) {
-		w.Header().Set("Cache-Control", cacheControlNoStore)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal Server Error"})
-		return
+	if err != nil {
+		var nf *service.NotFoundError
+		if errors.As(err, &nf) {
+			h.writeNotFound(w, start, nf)
+			return
+		}
+		if h.logFetch(r, "v1", p.query, start, resp, err) {
+			w.Header().Set("Cache-Control", cacheControlNoStore)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal Server Error"})
+			return
+		}
 	}
 	if resp == nil {
 		w.Header().Set("Cache-Control", cacheControlNoStore)
@@ -173,10 +221,17 @@ func (h *Lyrics) GetTTML(w http.ResponseWriter, r *http.Request) {
 	}
 	start := time.Now()
 	resp, err := h.Service.FetchLyrics(r.Context(), p.query, p.sources, p.forceReload)
-	if h.logFetch(r, "ttml", p.query, start, resp, err) {
-		w.Header().Set("Cache-Control", cacheControlNoStore)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal Server Error"})
-		return
+	if err != nil {
+		var nf *service.NotFoundError
+		if errors.As(err, &nf) {
+			h.writeNotFound(w, start, nf)
+			return
+		}
+		if h.logFetch(r, "ttml", p.query, start, resp, err) {
+			w.Header().Set("Cache-Control", cacheControlNoStore)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal Server Error"})
+			return
+		}
 	}
 	if resp == nil {
 		w.Header().Set("Cache-Control", cacheControlNoStore)
@@ -209,6 +264,21 @@ func (h *Lyrics) GetRaw(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	raw, err := h.Service.FetchRaw(r.Context(), p.query, p.sources, p.forceReload)
 	if err != nil {
+		var nf *service.NotFoundError
+		if errors.As(err, &nf) {
+			if nf.Source != "" {
+				body := map[string]interface{}{
+					"error":          nf.Message,
+					"source":         nf.Source,
+					"processingTime": h.notFoundProcessing(start, nf),
+				}
+				w.Header().Set("Cache-Control", cacheControlNoStore)
+				writeJSON(w, http.StatusNotFound, body)
+				return
+			}
+			h.writeNotFound(w, start, nf)
+			return
+		}
 		h.logf("raw fetch failed: %v", err)
 		w.Header().Set("Cache-Control", cacheControlNoStore)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal Server Error"})
@@ -273,7 +343,7 @@ func (h *Lyrics) logFetch(r *http.Request, format string, q domain.SearchQuery, 
 	if resp != nil {
 		source = resp.Metadata.Source
 	}
-	h.Logger.Infof("lyrics format=%s artist=%q title=%q source=%s took=%s",
+	h.Logger.Debugf("lyrics format=%s artist=%q title=%q source=%s took=%s",
 		format, q.Artist, q.Title, source, time.Since(start).Round(time.Millisecond))
 	return false
 }

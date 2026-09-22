@@ -62,7 +62,7 @@ func Tracing(l *logger.Logger) func(http.Handler) http.Handler {
 			start := time.Now()
 			sw := &statusWriter{ResponseWriter: w, status: 200}
 			next.ServeHTTP(sw, r.WithContext(ctx))
-			l.Info("request",
+			l.Debug("request",
 				slog.String("id", id),
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
@@ -115,7 +115,11 @@ func Compression(next http.Handler) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Encoding", "gzip")
-		gz := gzip.NewWriter(w)
+		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
 		defer func() { _ = gz.Close() }()
 		next.ServeHTTP(gzipResponseWriter{ResponseWriter: w, gw: gz}, r)
 	})

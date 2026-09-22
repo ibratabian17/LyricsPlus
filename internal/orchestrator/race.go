@@ -27,6 +27,7 @@ type Result struct {
 	Err      error
 	Elapsed  time.Duration
 	Status   string // "OK", "BAD", "RTO", "SKIP"
+	Pipeline time.Duration
 	// SourcesStatus maps provider name -> outcome for the whole race.
 	SourcesStatus map[string]SourceOutcome
 }
@@ -39,10 +40,11 @@ type SourceOutcome struct {
 
 // Racer performs the two-phase speculative fetch.
 type Racer struct {
-	sources map[string]Source
-	timeout time.Duration
-	mu      sync.Mutex
-	status  map[string]SourceOutcome
+	sources   map[string]Source
+	timeout   time.Duration
+	mu        sync.Mutex
+	status    map[string]SourceOutcome
+	raceStart time.Time
 }
 
 func NewRacer(sources []Source, timeout time.Duration) *Racer {
@@ -118,7 +120,8 @@ func (r *Racer) has(name string) bool {
 // Race orchestrates the full two-phase algorithm.
 func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources []string) *Result {
 	r.Reset()
-	order := sourceOrder(q, preferredSources)
+	r.raceStart = time.Now()
+	order := SourceOrder(q, preferredSources)
 	phase1 := order
 	if len(phase1) > 2 {
 		phase1 = phase1[:2]
@@ -161,6 +164,7 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 func (r *Racer) finalize(res *Result) *Result {
 	if res != nil {
 		res.SourcesStatus = r.Snapshot()
+		res.Pipeline = time.Since(r.raceStart)
 	}
 	return res
 }

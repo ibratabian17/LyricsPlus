@@ -23,7 +23,7 @@ func NewDedup(racer *Racer) *Dedup {
 // in the Result; the shared result is deep-copied per caller to avoid mutation.
 func (d *Dedup) Get(ctx context.Context, q domain.SearchQuery, preferredSources []string) (*Result, error) {
 	if len(preferredSources) == 0 {
-		preferredSources = sourceOrder(q, nil)
+		preferredSources = SourceOrder(q, nil)
 	}
 	key := q.NormalizeKey()
 

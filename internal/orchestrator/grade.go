@@ -58,8 +58,8 @@ func Grade(resp *domain.LyricsResponse, source string) int {
 	return PriorityUnsync
 }
 
-// abilitySourceOrder returns the source list per the id-only rule.
-func sourceOrder(query domain.SearchQuery, preferred []string) []string {
+// SourceOrder returns the source list per the id-only rule.
+func SourceOrder(query domain.SearchQuery, preferred []string) []string {
 	if len(preferred) > 0 {
 		return preferred
 	}

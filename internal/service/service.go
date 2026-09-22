@@ -4,6 +4,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"regexp"
 	"strings"
 	"time"
 
@@ -31,6 +32,72 @@ type RawResult struct {
 	TotalMs int64
 }
 
+type NotFoundError struct {
+	Message        string
+	Sources        []string
+	SongTitle      string
+	SongArtist     string
+	SongAlbum      string
+	TotalMs        int64
+	SourceStatuses map[string]domain.SourceStatus
+	Source         string
+}
+
+func (e *NotFoundError) Error() string { return e.Message }
+
+func decorateCacheHit(resp *domain.LyricsResponse, q domain.SearchQuery, preferredSources []string, pipeline time.Duration) {
+	if resp == nil {
+		return
+	}
+	if resp.ProcessingTime == nil {
+		resp.ProcessingTime = &domain.ProcessTiming{}
+	}
+	if resp.ProcessingTime.TotalElapsedMs == 0 {
+		resp.ProcessingTime.TotalElapsedMs = pipeline.Milliseconds()
+	}
+	if len(resp.ProcessingTime.SourcesStatus) > 0 {
+		return
+	}
+	winner := ""
+	if resp.ProcessingTime.WinnerSource != nil {
+		winner = *resp.ProcessingTime.WinnerSource
+	} else if resp.Metadata.Source != "" {
+		winner = resp.Metadata.Source
+	}
+	winName := providerNameForSource(winner)
+	status := make(map[string]domain.SourceStatus)
+	for _, src := range orchestrator.SourceOrder(q, preferredSources) {
+		status[src] = domain.SourceStatus{Status: "SKIP"}
+	}
+	if winName != "" {
+		status[winName] = domain.SourceStatus{Status: "OK"}
+	}
+	resp.ProcessingTime.SourcesStatus = status
+}
+
+func (s *Service) buildNotFound(q domain.SearchQuery, preferredSources []string, res *orchestrator.Result, elapsed time.Duration) *NotFoundError {
+	sources := orchestrator.SourceOrder(q, preferredSources)
+	status := make(map[string]domain.SourceStatus, len(sources))
+	for _, src := range sources {
+		status[src] = domain.SourceStatus{Status: "SKIP"}
+	}
+	if res != nil {
+		for name, out := range res.SourcesStatus {
+			ms := out.ElapsedMs
+			status[name] = domain.SourceStatus{Status: out.Status, ElapsedMs: &ms}
+		}
+	}
+	return &NotFoundError{
+		Message:        "Lyrics not found in sources: " + strings.Join(sources, ", "),
+		Sources:        sources,
+		SongTitle:      q.Title,
+		SongArtist:     q.Artist,
+		SongAlbum:      q.Album,
+		TotalMs:        elapsed.Milliseconds(),
+		SourceStatuses: status,
+	}
+}
+
 type rawCacheEntry struct {
 	Source string `json:"source"`
 	Raw    string `json:"raw"`
@@ -42,11 +109,14 @@ func rawCacheKey(q domain.SearchQuery) string    { return "raw::" + q.NormalizeK
 // FetchLyrics resolves lyrics for a query, consulting the memory cache and
 // SQLite store before racing providers. Cache writes are never blocking.
 func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*domain.LyricsResponse, error) {
+	start := time.Now()
 	if !forceReload {
 		if resp, ok := s.fromMemory(ctx, q); ok {
+			decorateCacheHit(resp, q, preferredSources, time.Since(start))
 			return resp, nil
 		}
 		if resp, ok := s.fromStore(ctx, q); ok {
+			decorateCacheHit(resp, q, preferredSources, time.Since(start))
 			return resp, nil
 		}
 	}
@@ -56,7 +126,7 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 		return nil, err
 	}
 	if res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
-		return nil, nil
+		return nil, s.buildNotFound(q, preferredSources, res, time.Since(start))
 	}
 
 	resp := res.Resp
@@ -115,6 +185,7 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 
 // FetchRaw returns the raw provider payload for /v1/raw/get.
 func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*RawResult, error) {
+	start := time.Now()
 	if !forceReload {
 		if s.MemCache != nil {
 			if e, ok := s.MemCache.Get(rawCacheKey(q)); ok && e != nil {
@@ -132,8 +203,14 @@ func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredS
 	if err != nil {
 		return nil, err
 	}
-	if res == nil || res.Resp == nil || res.Resp.RawData == "" {
-		return nil, nil
+	if res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
+		return nil, s.buildNotFound(q, preferredSources, res, time.Since(start))
+	}
+	if res.Resp.RawData == "" {
+		nf := s.buildNotFound(q, preferredSources, res, time.Since(start))
+		nf.Message = "Raw data is not available for this result"
+		nf.Source = res.Source
+		return nil, nf
 	}
 
 	raw := &RawResult{
@@ -209,6 +286,7 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 
 	var row *storage.Row
 	bestPrio := -1
+	var candidates []*storage.Row
 
 	// 1. Exact ID match (ISRC / Platform ID) via B-Tree index (<1ms)
 	if q.ISRC != "" || q.PlatformID != "" {
@@ -227,6 +305,7 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	// 2. Exact Title + Artist match via idx_lyrics_title_artist B-Tree index (<1ms)
 	if (row == nil || bestPrio > 0) && (q.Title != "" && q.Artist != "") {
 		if rows, ok := s.Store.GetByTitleArtist(dbCtx, q.Title, q.Artist); ok && len(rows) > 0 {
+			candidates = append(candidates, rows...)
 			if matched, p := pickBestRow(rows, q); matched != nil {
 				if bestPrio == -1 || p < bestPrio {
 					row = matched
@@ -240,6 +319,7 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	if (row == nil || bestPrio > 0) && (q.Title != "" || q.Artist != "") {
 		keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
 		if rows, ok2 := s.Store.GetExisting(dbCtx, keywords); ok2 && len(rows) > 0 {
+			candidates = append(candidates, rows...)
 			if matched, p := pickBestRow(rows, q); matched != nil {
 				if bestPrio == -1 || p < bestPrio {
 					row = matched
@@ -258,38 +338,33 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		return nil, false
 	}
 
-	// Fetch ContentJSON deferred if empty
-	if len(row.ContentJSON) == 0 {
-		content, err := s.Store.GetContent(dbCtx, row.ID)
-		if err != nil || len(content) == 0 {
-			return nil, false
+	var resp *domain.LyricsResponse
+	seen := make(map[int64]struct{}, len(candidates)+1)
+	for _, cand := range append([]*storage.Row{row}, candidates...) {
+		if cand == nil {
+			continue
 		}
-		row.ContentJSON = content
-	}
-
-	var resp domain.LyricsResponse
-	trimmedRaw := strings.TrimSpace(string(row.ContentJSON))
-	if strings.HasPrefix(trimmedRaw, "<") {
-		if strings.HasSuffix(strings.ToLower(row.Filename), ".ttml") || strings.EqualFold(row.Source, "apple") {
-			if p, err := parsers.TTMLToJSON(row.ContentJSON); err == nil && p != nil && len(p.Lyrics) > 0 {
-				resp = *p
+		if _, dup := seen[cand.ID]; dup {
+			continue
+		}
+		seen[cand.ID] = struct{}{}
+		content := cand.ContentJSON
+		if len(content) == 0 {
+			c, err := s.Store.GetContent(dbCtx, cand.ID)
+			if err != nil || len(c) == 0 {
+				continue
 			}
-		} else if strings.HasSuffix(strings.ToLower(row.Filename), ".qrc") || strings.EqualFold(row.Source, "qq") {
-			p := parsers.ParseQQQRC(trimmedRaw, parsers.ExactMetadata{
-				Title:      row.Title,
-				Artist:     row.Artist,
-				DurationMs: row.DurationMS,
-				PlatformID: row.PlatformID,
-			})
-			if p != nil && len(p.Lyrics) > 0 {
-				resp = *p
-			}
+			content = c
+		}
+		parsed := parseStoredContent(cand, content)
+		if parsed != nil && len(parsed.Lyrics) > 0 {
+			resp = parsed
+			row = cand
+			break
 		}
 	}
-	if len(resp.Lyrics) == 0 {
-		if err := json.Unmarshal(row.ContentJSON, &resp); err != nil || len(resp.Lyrics) == 0 {
-			return nil, false
-		}
+	if resp == nil {
+		return nil, false
 	}
 	winner := row.Source
 	if winner == "" {
@@ -303,7 +378,7 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	if finalPrio < 0 || (len(q.Sources) > 0 && finalPrio > 0) {
 		return nil, false
 	}
-	resp = *parsers.NormalizeV2(&resp)
+	resp = parsers.NormalizeV2(resp)
 	resp.RawData = string(row.ContentJSON)
 	resp.Cached = domain.CacheDatabase
 	if row.Source == "lyricsplus" && !strings.HasPrefix(resp.Metadata.Source, "Lyrics+") {
@@ -358,7 +433,107 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 			resp.ProcessingTime.SelectedSongMetadata.SongPlatformID = platID
 		}
 	}
-	return &resp, true
+	return resp, true
+}
+
+func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse {
+	trimmedRaw := strings.TrimSpace(string(content))
+	src := row.Source
+	if src == "" {
+		src = rowSource(row)
+	}
+	isXML := strings.HasPrefix(trimmedRaw, "<")
+
+	switch {
+	case strings.EqualFold(src, "apple"):
+		if isXML {
+			if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+				return p
+			}
+		}
+		return parseNormalizedJSON(trimmedRaw)
+	case strings.EqualFold(src, "qq"):
+		if isXML {
+			p := parsers.ParseQQQRC(trimmedRaw, parsers.ExactMetadata{
+				Title:      row.Title,
+				Artist:     row.Artist,
+				DurationMs: row.DurationMS,
+				PlatformID: row.PlatformID,
+			})
+			if p != nil && len(p.Lyrics) > 0 {
+				return p
+			}
+		}
+		return parseNormalizedJSON(trimmedRaw)
+	case strings.EqualFold(src, "musixmatch"):
+		if p, err := parsers.ConvertMusixmatchToJSON(content, false); err == nil && p != nil && len(p.Lyrics) > 0 {
+			return p
+		}
+	case strings.EqualFold(src, "spotify"):
+		if p, err := parsers.ConvertSpotifyToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+			return p
+		}
+	case strings.EqualFold(src, "lyricsplus"), src == "":
+		if strings.Contains(trimmedRaw, `"isLineEnding"`) {
+			coerced := kpoeToolsRe.ReplaceAllString(trimmedRaw, `"KpoeTools": "$1"`)
+			var v1 domain.V1Response
+			if json.Unmarshal([]byte(coerced), &v1) == nil && len(v1.Lyrics) > 0 {
+				if p := parsers.V1ToV2(&v1); p != nil && len(p.Lyrics) > 0 {
+					return p
+				}
+			}
+		}
+		return parseNormalizedJSON(trimmedRaw)
+	}
+
+	if isXML {
+		if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+			return p
+		}
+		p := parsers.ParseQQQRC(trimmedRaw, parsers.ExactMetadata{
+			Title:      row.Title,
+			Artist:     row.Artist,
+			DurationMs: row.DurationMS,
+			PlatformID: row.PlatformID,
+		})
+		if p != nil && len(p.Lyrics) > 0 {
+			return p
+		}
+	}
+	if strings.Contains(trimmedRaw, `"syncType"`) && strings.Contains(trimmedRaw, `"lines"`) {
+		if p, err := parsers.ConvertSpotifyToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+			return p
+		}
+	}
+	if strings.Contains(trimmedRaw, `"message"`) && (strings.Contains(trimmedRaw, `"subtitle_body"`) || strings.Contains(trimmedRaw, `"richsync_body"`)) {
+		if p, err := parsers.ConvertMusixmatchToJSON(content, false); err == nil && p != nil && len(p.Lyrics) > 0 {
+			return p
+		}
+	}
+	if strings.Contains(trimmedRaw, `"isLineEnding"`) {
+		coerced := kpoeToolsRe.ReplaceAllString(trimmedRaw, `"KpoeTools": "$1"`)
+		var v1 domain.V1Response
+		if json.Unmarshal([]byte(coerced), &v1) == nil && len(v1.Lyrics) > 0 {
+			if p := parsers.V1ToV2(&v1); p != nil && len(p.Lyrics) > 0 {
+				return p
+			}
+		}
+	}
+	return parseNormalizedJSON(trimmedRaw)
+}
+
+func parseNormalizedJSON(trimmedRaw string) *domain.LyricsResponse {
+	var resp domain.LyricsResponse
+	if json.Unmarshal(coercedForKpoe(trimmedRaw), &resp) == nil && len(resp.Lyrics) > 0 {
+		return &resp
+	}
+	return nil
+}
+
+var kpoeToolsRe = regexp.MustCompile(`"KpoeTools"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)`)
+
+func coercedForKpoe(trimmedRaw string) []byte {
+	return []byte(kpoeToolsRe.ReplaceAllString(trimmedRaw, `"KpoeTools": "$1"`))
 }
 
 func (s *Service) cacheResponse(ctx context.Context, q domain.SearchQuery, resp *domain.LyricsResponse, winner string) {
@@ -399,9 +574,13 @@ func buildProcessTiming(res *orchestrator.Result, q domain.SearchQuery, lastProc
 		}
 	}
 
+	totalMs := res.Elapsed.Milliseconds()
+	if res.Pipeline > 0 {
+		totalMs = res.Pipeline.Milliseconds()
+	}
 	return &domain.ProcessTiming{
 		LastProcessed:        lastProcessed,
-		TotalElapsedMs:       res.Elapsed.Milliseconds(),
+		TotalElapsedMs:       totalMs,
 		WinnerSource:         &winner,
 		SyncPriority:         &prio,
 		SourcesStatus:        statuses,
