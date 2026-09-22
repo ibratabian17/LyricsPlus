@@ -162,10 +162,12 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 }
 
 func (r *Racer) finalize(res *Result) *Result {
-	if res != nil {
-		res.SourcesStatus = r.Snapshot()
-		res.Pipeline = time.Since(r.raceStart)
+	snap := r.Snapshot()
+	if res == nil {
+		res = &Result{}
 	}
+	res.SourcesStatus = snap
+	res.Pipeline = time.Since(r.raceStart)
 	return res
 }
 
