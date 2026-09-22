@@ -11,6 +11,7 @@ import (
 	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/orchestrator"
 	"lyricsplus/backend/internal/parsers"
+	"lyricsplus/backend/internal/similarity"
 	"lyricsplus/backend/internal/storage"
 )
 
@@ -226,18 +227,10 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	// 2. Exact Title + Artist match via idx_lyrics_title_artist B-Tree index (<1ms)
 	if (row == nil || bestPrio > 0) && (q.Title != "" && q.Artist != "") {
 		if rows, ok := s.Store.GetByTitleArtist(dbCtx, q.Title, q.Artist); ok && len(rows) > 0 {
-			for _, r := range rows {
-				if r == nil {
-					continue
-				}
-				src := rowSource(r)
-				prio := sourcePriority(src, q.Sources)
-				if prio >= 0 && (bestPrio == -1 || prio < bestPrio) {
-					row = r
-					bestPrio = prio
-					if bestPrio == 0 {
-						break
-					}
+			if matched, p := pickBestRow(rows, q); matched != nil {
+				if bestPrio == -1 || p < bestPrio {
+					row = matched
+					bestPrio = p
 				}
 			}
 		}
@@ -247,18 +240,10 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	if (row == nil || bestPrio > 0) && (q.Title != "" || q.Artist != "") {
 		keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
 		if rows, ok2 := s.Store.GetExisting(dbCtx, keywords); ok2 && len(rows) > 0 {
-			for _, r := range rows {
-				if r == nil {
-					continue
-				}
-				src := rowSource(r)
-				prio := sourcePriority(src, q.Sources)
-				if prio >= 0 && (bestPrio == -1 || prio < bestPrio) {
-					row = r
-					bestPrio = prio
-					if bestPrio == 0 {
-						break
-					}
+			if matched, p := pickBestRow(rows, q); matched != nil {
+				if bestPrio == -1 || p < bestPrio {
+					row = matched
+					bestPrio = p
 				}
 			}
 		}
@@ -539,4 +524,83 @@ func extFor(source string) string {
 		}
 		return "json"
 	}
+}
+
+// pickBestRow evaluates duplicate candidates by duration, album similarity, and source preference.
+func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) {
+	if len(rows) == 0 {
+		return nil, -1
+	}
+
+	var valid []*storage.Row
+	for _, r := range rows {
+		if r == nil {
+			continue
+		}
+		if len(q.Sources) > 0 && sourcePriority(rowSource(r), q.Sources) < 0 {
+			continue
+		}
+		valid = append(valid, r)
+	}
+	if len(valid) == 0 {
+		return nil, -1
+	}
+
+	queryDurSec := float64(q.Duration) / 1000.0
+
+	// If query duration or album is provided, score candidates using similarity engine
+	if queryDurSec > 0 || q.Album != "" {
+		candidates := make([]similarity.SongCandidate, len(valid))
+		for i, r := range valid {
+			album := ""
+			durMs := r.DurationMS
+			if r.Filename != "" {
+				pf := storage.ParseFilename(r.Filename)
+				if pf.Album != "" {
+					album = pf.Album
+				}
+				if durMs <= 0 && pf.DurationMS > 0 {
+					durMs = pf.DurationMS
+				}
+			}
+			candidates[i] = similarity.SongCandidate{
+				Title:      r.Title,
+				Artist:     r.Artist,
+				Album:      album,
+				DurationMs: durMs,
+				ISRC:       r.ISRC,
+				PlatformID: r.PlatformID,
+				Data:       r,
+			}
+		}
+
+		best := similarity.FindBestSongMatch(candidates, q.Title, q.Artist, q.Album, queryDurSec, q.ISRC, q.PlatformID)
+		if best != nil {
+			row := best.Candidate.Data.(*storage.Row)
+			prio := sourcePriority(rowSource(row), q.Sources)
+			return row, prio
+		}
+
+		// If duration was specified and strictly failed threshold (e.g. severe duration mismatch),
+		// reject to allow live provider race for the correct track version.
+		if queryDurSec > 0 {
+			return nil, -1
+		}
+	}
+
+	// If no duration/album was specified, pick best source priority
+	var best *storage.Row
+	bestPrio := -1
+	for _, r := range valid {
+		src := rowSource(r)
+		prio := sourcePriority(src, q.Sources)
+		if prio >= 0 && (bestPrio == -1 || prio < bestPrio) {
+			best = r
+			bestPrio = prio
+			if bestPrio == 0 {
+				break
+			}
+		}
+	}
+	return best, bestPrio
 }

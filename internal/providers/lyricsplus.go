@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -18,6 +19,7 @@ import (
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/proxy"
+	"lyricsplus/backend/internal/similarity"
 	"lyricsplus/backend/internal/storage"
 )
 
@@ -87,13 +89,13 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		}
 		if row == nil && (q.Title != "" && q.Artist != "") {
 			if rows, ok := st.GetByTitleArtist(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
-				row = rows[0]
+				row = matchBestRow(rows, q)
 			}
 		}
 		if row == nil && (q.Title != "" && q.Artist != "") {
 			keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
 			if rows, ok := st.GetExisting(ctx, keywords); ok && len(rows) > 0 {
-				row = rows[0]
+				row = matchBestRow(rows, q)
 			}
 		}
 
@@ -325,4 +327,56 @@ func jwtSecretFromEnv() string {
 		return s
 	}
 	return "lyricsplus-submit-opensource-yes-yes-yes"
+}
+
+func matchBestRow(rows []*storage.Row, q domain.SearchQuery) *storage.Row {
+	if len(rows) == 0 {
+		return nil
+	}
+	if len(rows) == 1 {
+		r := rows[0]
+		if q.Duration > 0 && r.DurationMS > 0 {
+			diff := math.Abs(float64(q.Duration-r.DurationMS)) / 1000.0
+			if diff > 15.0 {
+				return nil
+			}
+		}
+		return r
+	}
+
+	durationSec := float64(q.Duration) / 1000.0
+	if durationSec > 0 || q.Album != "" {
+		candidates := make([]similarity.SongCandidate, len(rows))
+		for i, r := range rows {
+			album := ""
+			durMs := r.DurationMS
+			if r.Filename != "" {
+				pf := storage.ParseFilename(r.Filename)
+				if pf.Album != "" {
+					album = pf.Album
+				}
+				if durMs <= 0 && pf.DurationMS > 0 {
+					durMs = pf.DurationMS
+				}
+			}
+			candidates[i] = similarity.SongCandidate{
+				Title:      r.Title,
+				Artist:     r.Artist,
+				Album:      album,
+				DurationMs: durMs,
+				ISRC:       r.ISRC,
+				PlatformID: r.PlatformID,
+				Data:       r,
+			}
+		}
+
+		best := similarity.FindBestSongMatch(candidates, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
+		if best != nil {
+			return best.Candidate.Data.(*storage.Row)
+		}
+		if durationSec > 0 {
+			return nil
+		}
+	}
+	return rows[0]
 }

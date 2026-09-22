@@ -246,3 +246,105 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 		t.Errorf("expected winner Apple, got %q", resp.Metadata.Source)
 	}
 }
+
+func TestFromStoreDuplicateTitleArtistDisambiguationByDurationAndAlbum(t *testing.T) {
+	st, err := storage.NewStore(config.Storage{DBPath: filepath.Join(t.TempDir(), "dup_cache.db"), LRUSize: 64})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	ctx := context.Background()
+
+	// Version 1: Original Studio version (3m00s = 180000ms, Album: "Asylum")
+	respStudio := &domain.LyricsResponse{
+		Type: domain.SyncTypeLine,
+		Metadata: domain.LyricsMetadata{
+			Source: "apple",
+			Title:  "Warrior",
+			Artist: "Disturbed",
+			Album:  "Asylum",
+		},
+		Lyrics: []domain.Line{{Text: "Studio Warrior"}},
+	}
+	rawStudio, _ := json.Marshal(respStudio)
+	rowStudio := &storage.Row{
+		Filename:    storage.CanonicalFilename("Disturbed", "Warrior", "Asylum", 180000, "", "", "json"),
+		ContentJSON: rawStudio,
+		Source:      "apple",
+		Title:       "Warrior",
+		Artist:      "Disturbed",
+		DurationMS:  180000,
+	}
+	if err := st.SaveLyrics(ctx, rowStudio); err != nil {
+		t.Fatalf("save studio: %v", err)
+	}
+
+	// Version 2: Live Extended version (5m10s = 310000ms, Album: "Live in London")
+	respLive := &domain.LyricsResponse{
+		Type: domain.SyncTypeLine,
+		Metadata: domain.LyricsMetadata{
+			Source: "apple",
+			Title:  "Warrior",
+			Artist: "Disturbed",
+			Album:  "Live in London",
+		},
+		Lyrics: []domain.Line{{Text: "Live Warrior"}},
+	}
+	rawLive, _ := json.Marshal(respLive)
+	rowLive := &storage.Row{
+		Filename:    storage.CanonicalFilename("Disturbed", "Warrior", "Live in London", 310000, "", "", "json"),
+		ContentJSON: rawLive,
+		Source:      "apple",
+		Title:       "Warrior",
+		Artist:      "Disturbed",
+		DurationMS:  310000,
+	}
+	if err := st.SaveLyrics(ctx, rowLive); err != nil {
+		t.Fatalf("save live: %v", err)
+	}
+
+	s := &Service{Store: st}
+
+	// 1. Query targeting Studio version by duration (~180s) and Album ("Asylum")
+	qStudio := domain.SearchQuery{
+		Title:    "Warrior",
+		Artist:   "Disturbed",
+		Album:    "Asylum",
+		Duration: 181000, // 181s (~1s difference)
+	}
+	hitStudio, ok := s.fromStore(ctx, qStudio)
+	if !ok || hitStudio == nil {
+		t.Fatalf("expected hit for studio version")
+	}
+	if len(hitStudio.Lyrics) == 0 || hitStudio.Lyrics[0].Text != "Studio Warrior" {
+		t.Fatalf("expected 'Studio Warrior', got %v", hitStudio.Lyrics)
+	}
+
+	// 2. Query targeting Live version by duration (~310s) and Album ("Live in London")
+	qLive := domain.SearchQuery{
+		Title:    "Warrior",
+		Artist:   "Disturbed",
+		Album:    "Live in London",
+		Duration: 309000, // 309s (~1s difference)
+	}
+	hitLive, ok := s.fromStore(ctx, qLive)
+	if !ok || hitLive == nil {
+		t.Fatalf("expected hit for live version")
+	}
+	if len(hitLive.Lyrics) == 0 || hitLive.Lyrics[0].Text != "Live Warrior" {
+		t.Fatalf("expected 'Live Warrior', got %v", hitLive.Lyrics)
+	}
+
+	// 3. Query with wild duration mismatch (e.g. 10 minutes = 600000ms)
+	// Must NOT falsely return an out-of-sync studio or live version
+	qMismatch := domain.SearchQuery{
+		Title:    "Warrior",
+		Artist:   "Disturbed",
+		Duration: 600000,
+	}
+	_, okMismatch := s.fromStore(ctx, qMismatch)
+	if okMismatch {
+		t.Fatalf("expected rejection on severe duration mismatch, but got hit")
+	}
+}
