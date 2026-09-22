@@ -107,14 +107,15 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 
 	merged.Metadata.Source = fmt.Sprintf("Lyrics+ (via %s with QQ)", lineRes.source)
 	merged.Cached = domain.CacheNone
+	winner := "qaple"
+	if merged.ProcessingTime == nil {
+		merged.ProcessingTime = &domain.ProcessTiming{}
+	}
+	merged.ProcessingTime.WinnerSource = &winner
 	if lineRes.resp != nil && lineRes.resp.ProcessingTime != nil && lineRes.resp.ProcessingTime.SelectedSongMetadata != nil {
-		merged.ProcessingTime = &domain.ProcessTiming{
-			SelectedSongMetadata: lineRes.resp.ProcessingTime.SelectedSongMetadata,
-		}
+		merged.ProcessingTime.SelectedSongMetadata = lineRes.resp.ProcessingTime.SelectedSongMetadata
 	} else if qqRes.resp != nil && qqRes.resp.ProcessingTime != nil && qqRes.resp.ProcessingTime.SelectedSongMetadata != nil {
-		merged.ProcessingTime = &domain.ProcessTiming{
-			SelectedSongMetadata: qqRes.resp.ProcessingTime.SelectedSongMetadata,
-		}
+		merged.ProcessingTime.SelectedSongMetadata = qqRes.resp.ProcessingTime.SelectedSongMetadata
 	}
 	return merged, nil
 }

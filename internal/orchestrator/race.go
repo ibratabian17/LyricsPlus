@@ -4,6 +4,7 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -73,7 +74,12 @@ func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery)
 	res := &Result{Source: name, Resp: resp, Err: err, Elapsed: elapsed}
 	switch {
 	case err == nil && resp != nil && len(resp.Lyrics) > 0:
-		res.Priority = Grade(resp, name)
+		if resp.ProcessingTime != nil && resp.ProcessingTime.WinnerSource != nil && *resp.ProcessingTime.WinnerSource != "" {
+			res.Source = *resp.ProcessingTime.WinnerSource
+		} else if strings.Contains(resp.Metadata.Source, "with QQ") {
+			res.Source = "qaple"
+		}
+		res.Priority = Grade(resp, res.Source)
 		res.Status = "OK"
 	case err == context.DeadlineExceeded || err == context.Canceled:
 		res.Status = "RTO"

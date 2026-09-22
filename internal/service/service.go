@@ -137,7 +137,8 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 	}
 
 	// Fire-and-forget persistence: never block the HTTP response.
-	if s.Store != nil && resp.RawData != "" {
+	// Qaple results are synthesized on-the-fly from live sources and are never saved to the SQLite store.
+	if s.Store != nil && resp.RawData != "" && res.Source != "qaple" && !strings.Contains(resp.Metadata.Source, "with QQ") {
 		winner := res.Source
 		go func() {
 			ctx2, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -589,7 +590,8 @@ func buildProcessTiming(res *orchestrator.Result, q domain.SearchQuery, lastProc
 }
 
 func providerDisplayName(source string) string {
-	switch strings.ToLower(source) {
+	s := strings.ToLower(strings.TrimSpace(source))
+	switch s {
 	case "spotify":
 		return "Spotify"
 	case "apple", "apple music":
@@ -598,9 +600,18 @@ func providerDisplayName(source string) string {
 		return "QQ Music"
 	case "musixmatch":
 		return "Musixmatch"
+	case "musixmatch-word":
+		return "Musixmatch (Word)"
 	case "deezer":
 		return "Deezer"
+	case "qaple":
+		return "Qaple"
+	case "lyrics+", "lyricsplus":
+		return "Lyrics+"
 	default:
+		if strings.Contains(s, "qaple") || strings.Contains(s, "with qq") {
+			return "Qaple"
+		}
 		return "Lyrics+"
 	}
 }
@@ -608,7 +619,8 @@ func providerDisplayName(source string) string {
 // providerNameForSource maps a metadata source label back to the racer's
 // provider name, so cache hits can report a winner.
 func providerNameForSource(source string) string {
-	switch strings.ToLower(strings.TrimSpace(source)) {
+	s := strings.ToLower(strings.TrimSpace(source))
+	switch s {
 	case "spotify":
 		return "spotify"
 	case "apple", "apple music":
@@ -621,7 +633,14 @@ func providerNameForSource(source string) string {
 		return "musixmatch-word"
 	case "deezer":
 		return "deezer"
+	case "qaple":
+		return "qaple"
+	case "lyrics+", "lyricsplus":
+		return "lyricsplus"
 	default:
+		if strings.Contains(s, "qaple") || strings.Contains(s, "with qq") {
+			return "qaple"
+		}
 		return "lyricsplus"
 	}
 }
@@ -727,8 +746,8 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 
 	queryDurSec := float64(q.Duration) / 1000.0
 
-	// If query duration or album is provided, score candidates using similarity engine
-	if queryDurSec > 0 || q.Album != "" {
+	// Rank title queries by song similarity
+	if q.Title != "" {
 		candidates := make([]similarity.SongCandidate, len(valid))
 		for i, r := range valid {
 			album := ""
@@ -759,15 +778,10 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 			prio := sourcePriority(rowSource(row), q.Sources)
 			return row, prio
 		}
-
-		// If duration was specified and strictly failed threshold (e.g. severe duration mismatch),
-		// reject to allow live provider race for the correct track version.
-		if queryDurSec > 0 {
-			return nil, -1
-		}
+		return nil, -1
 	}
 
-	// If no duration/album was specified, pick best source priority
+	// Artist-only queries fall back to best source priority.
 	var best *storage.Row
 	bestPrio := -1
 	for _, r := range valid {

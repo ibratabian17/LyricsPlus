@@ -102,18 +102,20 @@ func (h *Lyrics) parseParams(r *http.Request) (*lyricsParams, error) {
 		}
 	}
 
+	forceReload := v.Get("forceReload") == "true"
 	return &lyricsParams{
 		query: domain.SearchQuery{
-			Title:      title,
-			Artist:     artist,
-			Album:      album,
-			Duration:   durMS,
-			ISRC:       isrc,
-			PlatformID: platformID,
-			Sources:    sources,
+			Title:       title,
+			Artist:      artist,
+			Album:       album,
+			Duration:    durMS,
+			ISRC:        isrc,
+			PlatformID:  platformID,
+			Sources:     sources,
+			ForceReload: forceReload,
 		},
 		sources:     sources,
-		forceReload: v.Get("forceReload") == "true",
+		forceReload: forceReload,
 	}, nil
 }
 

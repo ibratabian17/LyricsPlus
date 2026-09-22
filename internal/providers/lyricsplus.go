@@ -80,26 +80,26 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 
 	var lpResult *domain.LyricsResponse
 
-	if st != nil {
+	if !q.ForceReload && st != nil {
 		var row *storage.Row
 		if q.ISRC != "" || q.PlatformID != "" {
-			if r, ok := st.GetExact(ctx, q.ISRC, q.PlatformID); ok && r != nil {
+			if r, ok := st.GetExactUser(ctx, q.ISRC, q.PlatformID); ok && r != nil {
 				row = r
 			}
 		}
 		if row == nil && (q.Title != "" && q.Artist != "") {
 			if rows, ok := st.GetByTitleArtist(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
-				row = matchBestRow(rows, q)
+				row = matchBestUserRow(rows, q)
 			}
 		}
 		if row == nil && (q.Title != "" && q.Artist != "") {
 			keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
 			if rows, ok := st.GetExisting(ctx, keywords); ok && len(rows) > 0 {
-				row = matchBestRow(rows, q)
+				row = matchBestUserRow(rows, q)
 			}
 		}
 
-		if row != nil {
+		if row != nil && row.Source == "lyricsplus" {
 			if len(row.ContentJSON) == 0 {
 				content, err := st.GetContent(ctx, row.ID)
 				if err == nil {
@@ -123,7 +123,7 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	}
 
 	// Check Google Drive USERTML_JSON if not found or word sync needed
-	if (lpResult == nil || !hasWordSync(lpResult)) && gd != nil && gd.IsConfigured() {
+	if !q.ForceReload && (lpResult == nil || !hasWordSync(lpResult)) && gd != nil && gd.IsConfigured() {
 		folders := gd.Config().FolderUserTML
 		var gfile *storage.FileItem
 		if q.ISRC != "" || q.PlatformID != "" {
@@ -327,6 +327,19 @@ func jwtSecretFromEnv() string {
 		return s
 	}
 	return "lyricsplus-submit-opensource-yes-yes-yes"
+}
+
+func matchBestUserRow(rows []*storage.Row, q domain.SearchQuery) *storage.Row {
+	var userRows []*storage.Row
+	for _, r := range rows {
+		if r != nil && r.Source == "lyricsplus" {
+			userRows = append(userRows, r)
+		}
+	}
+	if len(userRows) == 0 {
+		return nil
+	}
+	return matchBestRow(userRows, q)
 }
 
 func matchBestRow(rows []*storage.Row, q domain.SearchQuery) *storage.Row {

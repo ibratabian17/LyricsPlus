@@ -23,13 +23,14 @@ type SongCatalogItem struct {
 
 // SearchQuery is the normalized, deduplicated key used for caching and racing.
 type SearchQuery struct {
-	Title      string
-	Artist     string
-	Album      string
-	Duration   int
-	ISRC       string
-	PlatformID string
-	Sources    []string
+	Title       string
+	Artist      string
+	Album       string
+	Duration    int
+	ISRC        string
+	PlatformID  string
+	Sources     []string
+	ForceReload bool
 }
 
 // IDOnly reports whether the query carries only identifiers (isrc/platformId).

@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/orchestrator"
+	"lyricsplus/backend/internal/providers"
 	"lyricsplus/backend/internal/storage"
 )
 
@@ -64,15 +67,18 @@ func TestFromStoreLyricsPlusSourceOverride(t *testing.T) {
 
 func TestProviderNameForSource(t *testing.T) {
 	cases := map[string]string{
-		"Spotify":     "spotify",
-		"Apple Music": "apple",
-		"Apple":       "apple",
-		"QQ Music":    "qq",
-		"QQ":          "qq",
-		"Musixmatch":  "musixmatch",
-		"Deezer":      "deezer",
-		"Lyrics+":     "lyricsplus",
-		"":            "lyricsplus",
+		"Spotify":                     "spotify",
+		"Apple Music":                 "apple",
+		"Apple":                       "apple",
+		"QQ Music":                    "qq",
+		"QQ":                          "qq",
+		"Musixmatch":                  "musixmatch",
+		"Deezer":                      "deezer",
+		"Qaple":                       "qaple",
+		"qaple":                       "qaple",
+		"Lyrics+ (via Apple with QQ)": "qaple",
+		"Lyrics+":                     "lyricsplus",
+		"":                            "lyricsplus",
 	}
 	for in, want := range cases {
 		if got := providerNameForSource(in); got != want {
@@ -346,5 +352,147 @@ func TestFromStoreDuplicateTitleArtistDisambiguationByDurationAndAlbum(t *testin
 	_, okMismatch := s.fromStore(ctx, qMismatch)
 	if okMismatch {
 		t.Fatalf("expected rejection on severe duration mismatch, but got hit")
+	}
+}
+
+func TestLyricsPlusProviderIgnoresCachedNonLyricsPlusRows(t *testing.T) {
+	st, err := storage.NewStore(config.Storage{DBPath: filepath.Join(t.TempDir(), "cache.db"), LRUSize: 64})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	ctx := context.Background()
+
+	// 1. Insert an Apple Music row into the cache
+	stored := &domain.LyricsResponse{
+		Type: domain.SyncTypeLine,
+		Metadata: domain.LyricsMetadata{
+			Source: "Apple",
+			Title:  "Anti-Hero",
+			Artist: "Taylor Swift",
+		},
+		Lyrics: []domain.Line{
+			{Time: 1000, Duration: 2000, Text: "It's me, hi"},
+		},
+	}
+	raw, _ := json.Marshal(stored)
+	appleRow := &storage.Row{
+		Filename:    "Taylor Swift - Anti-Hero.ttml",
+		ContentJSON: raw,
+		Source:      "apple",
+		Title:       "Anti-Hero",
+		Artist:      "Taylor Swift",
+		ISRC:        "USUG12204998",
+	}
+	if err := st.SaveLyrics(ctx, appleRow); err != nil {
+		t.Fatalf("save apple row: %v", err)
+	}
+
+	lp := providers.NewLyricsPlus(nil)
+	lp.SetStore(st)
+
+	// 2. Query LyricsPlusProvider for the same song
+	// It MUST NOT return the apple row or overwrite its source to Lyrics+
+	q := domain.SearchQuery{
+		Title:  "Anti-Hero",
+		Artist: "Taylor Swift",
+		ISRC:   "USUG12204998",
+	}
+	resp, err := lp.FetchLyrics(ctx, q)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp != nil {
+		t.Fatalf("expected nil from LyricsPlusProvider for apple cached row, got %+v", resp)
+	}
+
+	// 3. Now save a genuine user submission
+	userResp := &domain.LyricsResponse{
+		Type: domain.SyncTypeLine,
+		Metadata: domain.LyricsMetadata{
+			Source: "Lyrics+",
+			Title:  "Anti-Hero",
+			Artist: "Taylor Swift",
+		},
+		Lyrics: []domain.Line{
+			{Time: 1000, Duration: 2000, Text: "User synced line"},
+		},
+	}
+	userRaw, _ := json.Marshal(userResp)
+	if err := st.SaveUserLyrics(ctx, q, userRaw); err != nil {
+		t.Fatalf("save user lyrics: %v", err)
+	}
+
+	// 4. LyricsPlusProvider should now find the genuine user submission
+	respUser, err := lp.FetchLyrics(ctx, q)
+	if err != nil {
+		t.Fatalf("unexpected error on user query: %v", err)
+	}
+	if respUser == nil {
+		t.Fatal("expected hit for genuine user submission")
+	}
+	if respUser.Metadata.Source != "Lyrics+" {
+		t.Fatalf("expected Source Lyrics+, got %q", respUser.Metadata.Source)
+	}
+	if respUser.Lyrics[0].Text != "User synced line" {
+		t.Fatalf("expected user text, got %q", respUser.Lyrics[0].Text)
+	}
+}
+
+type fakeQapleSource struct{}
+
+func (f *fakeQapleSource) Name() string { return "lyricsplus" }
+func (f *fakeQapleSource) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
+	winner := "qaple"
+	return &domain.LyricsResponse{
+		Type:    domain.SyncTypeWord,
+		RawData: "test-raw",
+		Metadata: domain.LyricsMetadata{
+			Source: "Lyrics+ (via Apple with QQ)",
+			Title:  q.Title,
+			Artist: q.Artist,
+		},
+		Lyrics: []domain.Line{
+			{Time: 1000, Duration: 2000, Text: "word sync", Syllabus: []domain.Syllable{{Text: "word", Time: 1000, Duration: 1000}}},
+		},
+		ProcessingTime: &domain.ProcessTiming{
+			WinnerSource: &winner,
+		},
+	}, nil
+}
+
+func TestQapleResultNotSavedToStore(t *testing.T) {
+	st, err := storage.NewStore(config.Storage{DBPath: filepath.Join(t.TempDir(), "cache.db"), LRUSize: 64})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	racer := orchestrator.NewRacer([]orchestrator.Source{&fakeQapleSource{}}, 5*time.Second)
+	dedup := orchestrator.NewDedup(racer)
+	s := &Service{
+		Dedup: dedup,
+		Store: st,
+	}
+
+	q := domain.SearchQuery{Title: "Qaple Song", Artist: "Qaple Artist"}
+	resp, err := s.FetchLyrics(context.Background(), q, nil, false)
+	if err != nil {
+		t.Fatalf("FetchLyrics failed: %v", err)
+	}
+	if resp == nil {
+		t.Fatal("expected response")
+	}
+	if resp.ProcessingTime.WinnerSource == nil || *resp.ProcessingTime.WinnerSource != "qaple" {
+		t.Fatalf("expected winnerSource qaple, got %+v", resp.ProcessingTime.WinnerSource)
+	}
+
+	// Wait briefly for any background routine to run
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify nothing was saved to SQLite Store
+	if rows, ok := st.GetByTitleArtist(context.Background(), "Qaple Song", "Qaple Artist"); ok && len(rows) > 0 {
+		t.Fatalf("expected Qaple results NOT to be saved to Store, but found %d rows: %+v", len(rows), rows)
 	}
 }

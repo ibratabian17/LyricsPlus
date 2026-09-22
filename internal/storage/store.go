@@ -187,6 +187,48 @@ ORDER BY created_at DESC LIMIT 1`
 	return row, nil
 }
 
+// GetExactUser returns the most recent row matching an ISRC or platform ID with source = 'lyricsplus'.
+func (s *Store) GetExactUser(ctx context.Context, isrc, platformID string) (*Row, bool) {
+	if isrc == "" && platformID == "" {
+		return nil, false
+	}
+	key := "exact_user::" + strings.ToLower(isrc) + "::" + strings.ToLower(platformID)
+	if v, ok := s.exact.Get(key); ok {
+		return v, v != nil
+	}
+	row, err := s.queryExactUser(ctx, isrc, platformID)
+	if err != nil {
+		return nil, false
+	}
+	if row != nil {
+		s.exact.Add(key, row)
+	}
+	return row, row != nil
+}
+
+func (s *Store) queryExactUser(ctx context.Context, isrc, platformID string) (*Row, error) {
+	const q = `SELECT ` + storeRowColumns + `
+FROM lyrics
+WHERE ((isrc = ? AND isrc <> '') OR (platform_id = ? AND platform_id <> ''))
+  AND source = 'lyricsplus'
+ORDER BY created_at DESC LIMIT 1`
+	row := &Row{}
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, q, isrc, platformID).Scan(
+		&row.ID, &row.Filename, &row.ContentJSON, &row.ISRC, &row.PlatformID,
+		&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	row.CreatedAt = time.UnixMilli(createdAt)
+	row.ContentJSON = DecompressContent(row.ContentJSON)
+	return row, nil
+}
+
 // GetByTitleArtist returns rows matching title and artist using idx_lyrics_title_artist index.
 func (s *Store) GetByTitleArtist(ctx context.Context, title, artist string) ([]*Row, bool) {
 	title = strings.TrimSpace(title)
@@ -265,7 +307,7 @@ func (s *Store) queryExisting(ctx context.Context, keywords []string) ([]*Row, e
 		args = append(args, pat, pat)
 	}
 	q := `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE ` + strings.Join(conds, " AND ") +
-		` ORDER BY created_at DESC LIMIT 5`
+		` LIMIT 100`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -334,6 +376,7 @@ ON CONFLICT(filename, source) DO UPDATE SET
 		return err
 	}
 	s.exact.Remove("exact::" + strings.ToLower(row.ISRC) + "::" + strings.ToLower(row.PlatformID))
+	s.exact.Remove("exact_user::" + strings.ToLower(row.ISRC) + "::" + strings.ToLower(row.PlatformID))
 	s.exactTitle.Remove("ta::" + strings.ToLower(row.Title) + "::" + strings.ToLower(row.Artist))
 	return nil
 }
