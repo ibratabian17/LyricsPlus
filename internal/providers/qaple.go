@@ -57,6 +57,9 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 		return nil, nil
 	}
 
+	qapleCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	type fetchResult struct {
 		resp   *domain.LyricsResponse
 		source string
@@ -67,21 +70,21 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 	lineCh := make(chan fetchResult, 1)
 
 	go func() {
-		resp, err := s.qqSource.FetchLyrics(ctx, q)
+		resp, err := s.qqSource.FetchLyrics(qapleCtx, q)
 		qqCh <- fetchResult{resp: resp, source: "QQ", err: err}
 	}()
 
 	// Fetch Line sync (Apple, fallback to Musixmatch)
 	go func() {
 		if s.apple != nil {
-			resp, err := s.apple.FetchLyrics(ctx, q)
+			resp, err := s.apple.FetchLyrics(qapleCtx, q)
 			if err == nil && resp != nil && len(resp.Lyrics) > 0 {
 				lineCh <- fetchResult{resp: resp, source: "Apple", err: nil}
 				return
 			}
 		}
 		if s.mxm != nil {
-			resp, err := s.mxm.FetchLyrics(ctx, q)
+			resp, err := s.mxm.FetchLyrics(qapleCtx, q)
 			if err == nil && resp != nil && len(resp.Lyrics) > 0 {
 				lineCh <- fetchResult{resp: resp, source: "Musixmatch", err: nil}
 				return

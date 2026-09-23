@@ -89,8 +89,7 @@ func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery)
 		return &Result{Source: name, Status: "SKIP"}
 	}
 	start := time.Now()
-	deadline := r.timeout
-	reqCtx, cancel := context.WithTimeout(ctx, deadline)
+	reqCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Immediately record as BAD in case context cancels before return, matching JS trackedFetch
@@ -168,6 +167,9 @@ func (r *Racer) has(name string) bool {
 func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources []string) *Result {
 	r.Reset()
 	r.raceStart = time.Now()
+	raceCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
+
 	order := SourceOrder(q, preferredSources)
 	phase1 := order
 	if len(phase1) > 2 {
@@ -181,13 +183,13 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 	r.debugf("race title=%q artist=%q phase1=%v remaining=%v", q.Title, q.Artist, phase1, remaining)
 
 	// Phase 1: first two sources, blocking semantics, P3 early exit.
-	p1 := r.runPhase(ctx, q, phase1)
+	p1 := r.runPhase(raceCtx, q, phase1)
 
 	if p1 != nil && p1.Priority >= PriorityWord {
 		return r.finalize(p1)
 	}
 
-	if len(remaining) == 0 {
+	if len(remaining) == 0 || raceCtx.Err() != nil {
 		return r.finalize(p1)
 	}
 
@@ -200,7 +202,7 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 			}
 		}
 		if len(p3Sources) > 0 {
-			p3 := r.raceForPriority(ctx, q, p3Sources, PriorityWord)
+			p3 := r.raceForPriority(raceCtx, q, p3Sources, PriorityWord)
 			if p3 != nil {
 				return r.finalize(p3)
 			}
@@ -209,7 +211,7 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 	}
 
 	// Otherwise race all remaining concurrently and pick the highest priority result.
-	p2 := r.runPhase(ctx, q, remaining)
+	p2 := r.runPhase(raceCtx, q, remaining)
 	if p2 != nil {
 		if p1 == nil || p2.Priority > p1.Priority {
 			return r.finalize(p2)
@@ -239,7 +241,7 @@ func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []stri
 	if len(names) == 0 {
 		return nil
 	}
-	phaseCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	phaseCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	results := make([]*Result, len(names))
@@ -305,7 +307,7 @@ func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []stri
 
 // raceForPriority runs remaining sources looking for an exact priority match.
 func (r *Racer) raceForPriority(ctx context.Context, q domain.SearchQuery, names []string, want int) *Result {
-	phaseCtx, cancel := context.WithTimeout(ctx, r.timeout)
+	phaseCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	ch := make(chan *Result, len(names))
