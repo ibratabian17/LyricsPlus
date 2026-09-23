@@ -20,6 +20,7 @@ import (
 
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/proxy"
 	"lyricsplus/backend/internal/similarity"
@@ -63,6 +64,7 @@ func BestSecret() []int {
 type SpotifyProvider struct {
 	client *proxy.Client
 	mgm    *AccountManager[config.SpotifyAccount]
+	logger *logger.Logger
 
 	webTokMu sync.Mutex
 	webTok   map[int]*spotifyCachedToken
@@ -105,6 +107,16 @@ func NewSpotifyWithConfig(client *proxy.Client, cfg config.Provider) *SpotifyPro
 	}
 }
 
+// SetLogger attaches a logger for debug output.
+func (p *SpotifyProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
+
+func (p *SpotifyProvider) debugf(format string, args ...any) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Debugf("spotify: "+format, args...)
+}
+
 func normalizeCookie(cookie string) string {
 	cookie = strings.TrimSpace(cookie)
 	if cookie == "" {
@@ -144,19 +156,25 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 			var err error
 			tracks, err = p.SearchTrack(ctx, "isrc:"+q.ISRC)
 			if err != nil || len(tracks) == 0 {
+				p.debugf("no ISRC match for isrc:%s (err=%v)", q.ISRC, err)
 				tracks = nil
+			} else {
+				p.debugf("ISRC search isrc:%s returned %d tracks", q.ISRC, len(tracks))
 			}
 		}
 		if len(tracks) == 0 {
 			if q.IDOnly() {
+				p.debugf("id-only query, no track resolved")
 				return nil, nil
 			}
 			searchQ := q.Title + " artist:" + q.Artist
 			var err error
 			tracks, err = p.SearchTrack(ctx, searchQ)
 			if err != nil || len(tracks) == 0 {
+				p.debugf("search %q returned no tracks (err=%v)", searchQ, err)
 				return nil, nil
 			}
+			p.debugf("search %q returned %d tracks", searchQ, len(tracks))
 		}
 
 		candidates := make([]similarity.SongCandidate, len(tracks))
@@ -179,8 +197,10 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 		durationSec := float64(q.Duration) / 1000.0
 		best := similarity.FindBestSongMatch(candidates, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
 		if best == nil {
+			p.debugf("no similarity match among %d candidates for %q / %q", len(candidates), q.Title, q.Artist)
 			return nil, nil
 		}
+		p.debugf("matched track %q id=%s (score match)", best.Candidate.Title, best.Candidate.PlatformID)
 		trackID = best.Candidate.PlatformID
 		if best.Candidate.Title != "" {
 			songTitle = best.Candidate.Title
@@ -202,13 +222,16 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 
 	lyricsJSON, err := p.fetchColorLyrics(ctx, trackID)
 	if err != nil || lyricsJSON == nil {
+		p.debugf("color lyrics fetch failed for track %s (err=%v)", trackID, err)
 		return nil, err
 	}
 
 	converted, err := parsers.ConvertSpotifyToJSON(lyricsJSON)
 	if err != nil || converted == nil || len(converted.Lyrics) == 0 {
+		p.debugf("no parseable lyrics for track %s (err=%v)", trackID, err)
 		return nil, nil
 	}
+	p.debugf("lyrics parsed lines=%d track=%s", len(converted.Lyrics), trackID)
 
 	if songWriters, werr := p.fetchSpotifySongwriters(ctx, trackID); werr == nil {
 		converted.Metadata.SongWriters = songWriters

@@ -19,6 +19,7 @@ import (
 
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/proxy"
 	"lyricsplus/backend/internal/similarity"
@@ -44,6 +45,7 @@ type MusixmatchProvider struct {
 	name   string
 	word   bool
 	mgm    *AccountManager[config.MusixmatchAccount]
+	logger *logger.Logger
 
 	webMu     sync.RWMutex
 	webTok    map[int]cachedWebToken
@@ -93,6 +95,16 @@ func NewMusixmatchWithConfig(client *proxy.Client, cfg config.Provider, pname st
 		android: map[int]*mxmAndroidState{},
 	}
 	return p
+}
+
+// SetLogger attaches a logger for debug output.
+func (p *MusixmatchProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
+
+func (p *MusixmatchProvider) debugf(format string, args ...any) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Debugf(p.name+": "+format, args...)
 }
 
 func extractTokenFromCookie(cookie string) string {
@@ -151,23 +163,32 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 		tr, err := p.searchMatcher(ctx, url.Values{"q_track_isrc": {q.ISRC}}, accountIdx)
 		if err == nil && tr != nil && tr.TrackID != 0 {
 			matchedTrack = tr
+			p.debugf("ISRC search isrc:%s matched track %d", q.ISRC, tr.TrackID)
+		} else if err != nil {
+			p.debugf("ISRC search isrc:%s failed (err=%v)", q.ISRC, err)
 		}
 	}
 
 	if matchedTrack == nil {
 		if q.IDOnly() {
+			p.debugf("id-only query, no track resolved")
 			return nil, nil
 		}
 		durationSec := float64(q.Duration) / 1000.0
 		matchedTrack, _ = p.searchBestMatch(ctx, q.Title, q.Artist, q.Album, durationSec, q.ISRC, accountIdx)
+		if matchedTrack != nil {
+			p.debugf("best match track %q id=%d", matchedTrack.TrackName, matchedTrack.TrackID)
+		}
 	}
 
 	if matchedTrack == nil {
+		p.debugf("no track matched for %q / %q", q.Title, q.Artist)
 		return nil, nil
 	}
 
 	lyricsEnv, err := p.fetchLyricsFromAPI(ctx, matchedTrack.TrackID, p.word, accountIdx)
 	if err != nil || lyricsEnv == nil {
+		p.debugf("lyrics fetch failed for track %d (err=%v)", matchedTrack.TrackID, err)
 		return nil, err
 	}
 
@@ -182,12 +203,15 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 
 	converted, err := parsers.ConvertMusixmatchToJSON(envelopeJSON, p.word)
 	if err != nil || converted == nil || len(converted.Lyrics) == 0 {
+		p.debugf("no parseable lyrics for track %d (err=%v)", matchedTrack.TrackID, err)
 		return nil, nil
 	}
 
 	if p.word && converted.Type != domain.SyncTypeWord {
+		p.debugf("word-sync requested but track %d returned type %q", matchedTrack.TrackID, converted.Type)
 		return nil, nil
 	}
+	p.debugf("lyrics parsed lines=%d word=%t track=%d", len(converted.Lyrics), p.word, matchedTrack.TrackID)
 
 	converted.Metadata.Source = "Musixmatch"
 	converted.Cached = domain.CacheNone

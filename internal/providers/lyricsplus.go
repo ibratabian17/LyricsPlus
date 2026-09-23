@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/proxy"
 	"lyricsplus/backend/internal/similarity"
@@ -38,6 +39,7 @@ type LyricsPlusProvider struct {
 	store      *storage.Store
 	gdrive     *storage.GDriveClient
 	qaple      qapleEngine
+	logger     *logger.Logger
 	mu         sync.RWMutex
 }
 
@@ -48,6 +50,16 @@ func NewLyricsPlus(client *proxy.Client) *LyricsPlusProvider {
 		difficulty: 5,
 		ttl:        10 * time.Minute,
 	}
+}
+
+// SetLogger attaches a logger for debug output.
+func (p *LyricsPlusProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
+
+func (p *LyricsPlusProvider) debugf(format string, args ...any) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Debugf("lyricsplus: "+format, args...)
 }
 
 func (p *LyricsPlusProvider) Name() string     { return lyricsplusName }
@@ -114,6 +126,7 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 					norm.Cached = domain.CacheUserJSON
 					norm.RawData = string(row.ContentJSON)
 					lpResult = norm
+					p.debugf("hit user store row=%d lines=%d word=%t", row.ID, len(norm.Lyrics), hasWordSync(norm))
 					if hasWordSync(norm) {
 						return norm, nil
 					}
@@ -160,12 +173,21 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	if qp != nil {
 		qapleResult, err := qp.FetchLyrics(ctx, q)
 		if err == nil && qapleResult != nil && len(qapleResult.Lyrics) > 0 {
+			p.debugf("qaple result lines=%d priority=%d", len(qapleResult.Lyrics), getSyncPriority(qapleResult))
 			if lpResult == nil || getSyncPriority(qapleResult) > getSyncPriority(lpResult) {
 				return qapleResult, nil
 			}
+		} else if err != nil {
+			p.debugf("qaple failed (err=%v)", err)
 		}
 	}
 
+	p.debugf("returning lpResult lines=%d", func() int {
+		if lpResult == nil {
+			return 0
+		}
+		return len(lpResult.Lyrics)
+	}())
 	return lpResult, nil
 }
 

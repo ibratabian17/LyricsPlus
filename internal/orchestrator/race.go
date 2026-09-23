@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/logger"
 )
 
 var errUnavailable = errors.New("provider unavailable")
@@ -46,14 +47,34 @@ type Racer struct {
 	mu        sync.Mutex
 	status    map[string]SourceOutcome
 	raceStart time.Time
+	logger    *logger.Logger
 }
 
-func NewRacer(sources []Source, timeout time.Duration) *Racer {
+// RacerOption configures a Racer.
+type RacerOption func(*Racer)
+
+// WithLogger attaches a logger for per-source debug output.
+func WithLogger(lg *logger.Logger) RacerOption {
+	return func(r *Racer) { r.logger = lg }
+}
+
+func NewRacer(sources []Source, timeout time.Duration, opts ...RacerOption) *Racer {
 	m := make(map[string]Source, len(sources))
 	for _, s := range sources {
 		m[s.Name()] = s
 	}
-	return &Racer{sources: m, timeout: timeout, status: map[string]SourceOutcome{}}
+	r := &Racer{sources: m, timeout: timeout, status: map[string]SourceOutcome{}}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
+}
+
+func (r *Racer) debugf(format string, args ...any) {
+	if r.logger == nil {
+		return
+	}
+	r.logger.Debugf(format, args...)
 }
 
 // TryFetch runs a single provider with its own timeout already applied.
@@ -93,6 +114,20 @@ func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery)
 		res.Status = "BAD"
 	}
 	r.record(name, res.Status, elapsed.Milliseconds())
+	switch res.Status {
+	case "OK":
+		r.debugf("source %s OK priority=%d lines=%d took=%s", name, res.Priority, len(resp.Lyrics), elapsed.Round(time.Millisecond))
+	case "RTO":
+		r.debugf("source %s RTO took=%s", name, elapsed.Round(time.Millisecond))
+	case "BAD":
+		if err != nil {
+			r.debugf("source %s BAD took=%s err=%v", name, elapsed.Round(time.Millisecond), err)
+		} else {
+			r.debugf("source %s BAD took=%s (no lyrics)", name, elapsed.Round(time.Millisecond))
+		}
+	default:
+		r.debugf("source %s %s", name, res.Status)
+	}
 	return res
 }
 
@@ -143,6 +178,8 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 		remaining = remaining[2:]
 	}
 
+	r.debugf("race title=%q artist=%q phase1=%v remaining=%v", q.Title, q.Artist, phase1, remaining)
+
 	// Phase 1: first two sources, blocking semantics, P3 early exit.
 	p1 := r.runPhase(ctx, q, phase1)
 
@@ -188,6 +225,11 @@ func (r *Racer) finalize(res *Result) *Result {
 	}
 	res.SourcesStatus = snap
 	res.Pipeline = time.Since(r.raceStart)
+	if res.Status == "OK" || (res.Resp != nil && len(res.Resp.Lyrics) > 0) {
+		r.debugf("race winner source=%s priority=%d pipeline=%s", res.Source, res.Priority, res.Pipeline.Round(time.Millisecond))
+	} else {
+		r.debugf("race no winner pipeline=%s statuses=%v", res.Pipeline.Round(time.Millisecond), snap)
+	}
 	return res
 }
 

@@ -14,12 +14,17 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "Path to configuration file (.json or .env)")
+	verbose := flag.Bool("verbose", false, "Enable debug-level logging")
 	flag.Parse()
 
 	cfg := config.Load(*configPath)
+	level := cfg.Logger.Level
+	if *verbose {
+		level = "debug"
+	}
 	logger := logger.New(logger.Config{
 		Enabled: cfg.Logger.Enabled,
-		Level:   cfg.Logger.Level,
+		Level:   level,
 		Format:  cfg.Logger.Format,
 	})
 

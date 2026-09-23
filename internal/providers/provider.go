@@ -3,6 +3,7 @@ package providers
 import (
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/orchestrator"
 	"lyricsplus/backend/internal/proxy"
 	"lyricsplus/backend/internal/storage"
@@ -27,6 +28,7 @@ type Factory struct {
 	Store  *storage.Store
 	GDrive *storage.GDriveClient
 	Config *config.Config
+	Logger *logger.Logger
 }
 
 // Set holds typed references to each configured provider and the ordered source slice.
@@ -42,7 +44,7 @@ type Set struct {
 
 // BuildSet returns all providers as a typed Set.
 func (f *Factory) BuildSet() (*Set, error) {
-	return buildAll(f.Client, f.Store, f.GDrive, f.Config)
+	return buildAll(f.Client, f.Store, f.GDrive, f.Config, f.Logger)
 }
 
 // Build returns all provider sources.
@@ -54,7 +56,7 @@ func (f *Factory) Build() ([]Source, error) {
 	return set.Sources, nil
 }
 
-func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDriveClient, cfg *config.Config) (*Set, error) {
+func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDriveClient, cfg *config.Config, lg *logger.Logger) (*Set, error) {
 	var pcfg config.Provider
 	if cfg != nil {
 		pcfg = cfg.Provider
@@ -69,6 +71,14 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 	dz := NewDeezerWithConfig(client, pcfg)
 	sp := NewSpotifyWithConfig(client, pcfg)
 
+	if lg != nil {
+		for _, s := range []Source{apple, qq, mxm, mxmWord, dz, sp} {
+			if l, ok := s.(interface{ SetLogger(*logger.Logger) }); ok {
+				l.SetLogger(lg)
+			}
+		}
+	}
+
 	qapleSvc := NewQapleService(qq, apple, mxm)
 	lp := NewLyricsPlus(client)
 	lp.SetQaple(qapleSvc)
@@ -77,6 +87,9 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 	}
 	if gdrive != nil {
 		lp.SetGDrive(gdrive)
+	}
+	if lg != nil {
+		lp.SetLogger(lg)
 	}
 
 	sources := []Source{

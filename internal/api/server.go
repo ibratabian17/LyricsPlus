@@ -49,13 +49,13 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 
 	proxyClient := proxy.New(cfg.Server)
 	gdrive := storage.NewGDriveClient(cfg.GDrive, nil)
-	factory := &providers.Factory{Client: proxyClient, Store: store, GDrive: gdrive, Config: &cfg}
+	factory := &providers.Factory{Client: proxyClient, Store: store, GDrive: gdrive, Config: &cfg, Logger: lg}
 	providerSet, err := factory.BuildSet()
 	if err != nil {
 		return nil, err
 	}
 
-	racer := orchestrator.NewRacer(toOrchestratorSources(providerSet.Sources), cfg.Provider.Timeout)
+	racer := orchestrator.NewRacer(toOrchestratorSources(providerSet.Sources), cfg.Provider.Timeout, orchestrator.WithLogger(lg))
 	dedup := orchestrator.NewDedup(racer)
 
 	svc := &service.Service{

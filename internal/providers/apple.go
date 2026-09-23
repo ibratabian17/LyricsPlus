@@ -17,6 +17,7 @@ import (
 
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/proxy"
 	"lyricsplus/backend/internal/similarity"
@@ -50,6 +51,7 @@ const (
 type AppleMusicProvider struct {
 	client *proxy.Client
 	mgm    *AccountManager[config.AppleAccount]
+	logger *logger.Logger
 
 	tokenMu          sync.Mutex
 	storefrontMu     sync.Mutex
@@ -95,6 +97,16 @@ func NewAppleMusicWithConfig(client *proxy.Client, cfg config.Provider) *AppleMu
 	}
 }
 
+// SetLogger attaches a logger for debug output.
+func (p *AppleMusicProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
+
+func (p *AppleMusicProvider) debugf(format string, args ...any) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Debugf("apple: "+format, args...)
+}
+
 func (p *AppleMusicProvider) Name() string { return appleName }
 func (p *AppleMusicProvider) Configured() bool {
 	for i := 0; i < p.mgm.Count(); i++ {
@@ -116,22 +128,31 @@ func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		song, err := p.SearchByISRC(ctx, q.ISRC, storefront)
 		if err == nil && song != nil {
 			bestMatch = song
+			p.debugf("ISRC search isrc:%s matched song %q", q.ISRC, song.Attributes.Name)
+		} else if err != nil {
+			p.debugf("ISRC search isrc:%s failed (err=%v)", q.ISRC, err)
 		}
 	}
 
 	if bestMatch == nil {
 		if q.IDOnly() {
+			p.debugf("id-only query, no song resolved")
 			return nil, nil
 		}
 		durationSec := float64(q.Duration) / 1000.0
 		bestMatch, _ = p.SearchBestMatch(ctx, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
+		if bestMatch != nil {
+			p.debugf("best match song %q id=%s", bestMatch.Attributes.Name, bestMatch.ID)
+		}
 	}
 
 	if bestMatch == nil {
+		p.debugf("no song matched for %q / %q", q.Title, q.Artist)
 		return nil, nil
 	}
 
 	if bestMatch.Attributes.HasLyrics != nil && !*bestMatch.Attributes.HasLyrics {
+		p.debugf("song %q has no lyrics (hasLyrics=false)", bestMatch.Attributes.Name)
 		return nil, nil
 	}
 
@@ -141,8 +162,10 @@ func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	resp, err := p.makeAppleMusicRequest(ctx, lyricURL, nil, 0, 0, 0)
 	if err != nil {
 		if isAppleStatus(err, http.StatusNotFound) {
+			p.debugf("lyrics 404 for song %q", bestMatch.Attributes.Name)
 			return nil, nil
 		}
+		p.debugf("lyrics request failed for song %q (err=%v)", bestMatch.Attributes.Name, err)
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()

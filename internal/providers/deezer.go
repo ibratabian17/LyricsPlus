@@ -15,6 +15,7 @@ import (
 
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/proxy"
 	"lyricsplus/backend/internal/similarity"
@@ -44,6 +45,7 @@ type deezerAccountCredentials struct {
 type DeezerProvider struct {
 	client     *proxy.Client
 	mgm        *AccountManager[config.DeezerAccount]
+	logger     *logger.Logger
 	authURL    string
 	graphqlURL string
 	searchURL  string
@@ -87,6 +89,16 @@ func NewDeezerWithConfig(client *proxy.Client, cfg config.Provider) *DeezerProvi
 		searchURL:  searchURL,
 		jwts:       map[int]*deezerAccountCredentials{},
 	}
+}
+
+// SetLogger attaches a logger for debug output.
+func (p *DeezerProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
+
+func (p *DeezerProvider) debugf(format string, args ...any) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Debugf("deezer: "+format, args...)
 }
 
 func (p *DeezerProvider) Name() string { return deezerName }
@@ -133,10 +145,13 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 	songISRC := q.ISRC
 
 	if trackID == "" {
-		tracks, err := p.SearchTrack(ctx, strings.TrimSpace(q.Title+" "+q.Artist), 10)
+		query := strings.TrimSpace(q.Title + " " + q.Artist)
+		tracks, err := p.SearchTrack(ctx, query, 10)
 		if err != nil || len(tracks) == 0 {
+			p.debugf("search %q returned no tracks (err=%v)", query, err)
 			return nil, nil
 		}
+		p.debugf("search %q returned %d tracks", query, len(tracks))
 
 		candidates := make([]similarity.SongCandidate, len(tracks))
 		for i, t := range tracks {
@@ -154,8 +169,10 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 		durationSec := float64(q.Duration) / 1000.0
 		best := similarity.FindBestSongMatch(candidates, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
 		if best == nil {
+			p.debugf("no similarity match among %d candidates for %q / %q", len(candidates), q.Title, q.Artist)
 			return nil, nil
 		}
+		p.debugf("matched track %q id=%s", best.Candidate.Title, best.Candidate.PlatformID)
 		trackID = best.Candidate.PlatformID
 		if best.Candidate.Title != "" {
 			songTitle = best.Candidate.Title
@@ -177,13 +194,16 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 
 	lyricsJSON, err := p.getLyrics(ctx, trackID, 0)
 	if err != nil || lyricsJSON == nil {
+		p.debugf("lyrics fetch failed for track %s (err=%v)", trackID, err)
 		return nil, err
 	}
 
 	converted, err := parsers.NormalizeDeezerLyrics(lyricsJSON)
 	if err != nil || converted == nil || len(converted.Lyrics) == 0 {
+		p.debugf("no parseable lyrics for track %s (err=%v)", trackID, err)
 		return nil, nil
 	}
+	p.debugf("lyrics parsed lines=%d track=%s", len(converted.Lyrics), trackID)
 
 	converted.Metadata.Source = "Deezer"
 	converted.Cached = domain.CacheNone

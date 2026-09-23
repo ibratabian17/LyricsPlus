@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/proxy"
 	"lyricsplus/backend/internal/similarity"
@@ -28,10 +29,21 @@ const qqAPIEndpoint = "https://u.y.qq.com/cgi-bin/musics.fcg"
 type QQMusicProvider struct {
 	client *proxy.Client
 	cookie string
+	logger *logger.Logger
 }
 
 func NewQQMusic(client *proxy.Client, cookie string) *QQMusicProvider {
 	return &QQMusicProvider{client: client, cookie: cookie}
+}
+
+// SetLogger attaches a logger for debug output.
+func (p *QQMusicProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
+
+func (p *QQMusicProvider) debugf(format string, args ...any) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Debugf("qqmusic: "+format, args...)
 }
 
 func (p *QQMusicProvider) Name() string     { return qqmusicName }
@@ -49,6 +61,7 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 
 	if songMid == "" {
 		if q.IDOnly() {
+			p.debugf("id-only query, no song resolved")
 			return nil, nil
 		}
 
@@ -59,8 +72,10 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 
 		songs, err := p.search(ctx, query)
 		if err != nil || len(songs) == 0 {
+			p.debugf("search %q returned no songs (err=%v)", query, err)
 			return nil, nil
 		}
+		p.debugf("search %q returned %d songs", query, len(songs))
 
 		candidates := make([]similarity.SongCandidate, len(songs))
 		for i, s := range songs {
@@ -81,8 +96,10 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 		durationSec := float64(q.Duration) / 1000.0
 		best := similarity.FindBestSongMatch(candidates, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
 		if best == nil {
+			p.debugf("no similarity match among %d candidates for %q / %q", len(candidates), q.Title, q.Artist)
 			return nil, nil
 		}
+		p.debugf("matched song %q mid=%s", best.Candidate.Title, best.Candidate.PlatformID)
 
 		matchedSong := best.Candidate.Data.(songItem)
 		songMid = matchedSong.Mid
@@ -106,6 +123,7 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 
 	qrcContent, err := p.fetchQRC(ctx, songMid)
 	if err != nil || qrcContent == "" {
+		p.debugf("QRC fetch failed for mid=%s (err=%v)", songMid, err)
 		return nil, err
 	}
 
@@ -119,8 +137,10 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 
 	resp := parsers.ParseQQQRC(qrcContent, exactMeta)
 	if resp == nil || len(resp.Lyrics) == 0 {
+		p.debugf("no parseable lyrics for mid=%s", songMid)
 		return nil, nil
 	}
+	p.debugf("lyrics parsed lines=%d mid=%s", len(resp.Lyrics), songMid)
 
 	resp.Metadata.Source = "QQ Music"
 	if songTitle != "" {
