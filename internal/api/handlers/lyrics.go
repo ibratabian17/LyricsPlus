@@ -80,7 +80,16 @@ func (h *Lyrics) parseParams(r *http.Request) (*lyricsParams, error) {
 	artist := strings.TrimSpace(v.Get("artist"))
 	album := strings.TrimSpace(v.Get("album"))
 	isrc := strings.TrimSpace(v.Get("isrc"))
+	if isrc == "" {
+		isrc = strings.TrimSpace(v.Get("ISRC"))
+	}
 	platformID := strings.TrimSpace(v.Get("platformId"))
+	if platformID == "" {
+		platformID = strings.TrimSpace(v.Get("platform_id"))
+	}
+	if platformID == "" {
+		platformID = strings.TrimSpace(v.Get("platformID"))
+	}
 
 	if (title == "" || artist == "") && isrc == "" && platformID == "" {
 		return nil, errMissingRequired
@@ -88,8 +97,12 @@ func (h *Lyrics) parseParams(r *http.Request) (*lyricsParams, error) {
 
 	var durMS int
 	if ds := strings.TrimSpace(v.Get("duration")); ds != "" {
-		if sec, err := strconv.ParseFloat(ds, 64); err == nil {
-			durMS = int(sec * 1000)
+		if val, err := strconv.ParseFloat(ds, 64); err == nil && val > 0 {
+			if val > 10000 {
+				durMS = int(val)
+			} else {
+				durMS = int(val * 1000)
+			}
 		}
 	}
 

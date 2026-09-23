@@ -583,6 +583,7 @@ components:
         title: { type: string }
         artist: { type: string }
         album: { type: string }
+        duration: { type: number }
         songISRC: { type: string }
         songPlatformId: { type: string }
     ProcessTiming:

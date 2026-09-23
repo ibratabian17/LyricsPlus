@@ -159,12 +159,22 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	}
 	resp.Cached = domain.CacheNone
 	resp.RawData = qrcContent
+	var durSec *float64
+	if songDuration > 0 {
+		s := float64(songDuration) / 1000.0
+		durSec = &s
+	} else if q.Duration > 0 {
+		s := float64(q.Duration) / 1000.0
+		durSec = &s
+	}
+
 	resp.ProcessingTime = &domain.ProcessTiming{
 		SelectedSongMetadata: &domain.PickedSongMetadata{
 			Source:         "QQ Music",
 			Title:          songTitle,
 			Artist:         songArtist,
 			Album:          songAlbum,
+			Duration:       durSec,
 			SongISRC:       q.ISRC,
 			SongPlatformID: songMid,
 		},

@@ -235,12 +235,22 @@ func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		songPlatformID = q.PlatformID
 	}
 
+	var durSec *float64
+	if bestMatch.Attributes.DurationInMillis > 0 {
+		s := float64(bestMatch.Attributes.DurationInMillis) / 1000.0
+		durSec = &s
+	} else if q.Duration > 0 {
+		s := float64(q.Duration) / 1000.0
+		durSec = &s
+	}
+
 	parsed.ProcessingTime = &domain.ProcessTiming{
 		SelectedSongMetadata: &domain.PickedSongMetadata{
 			Source:         "Apple",
 			Title:          songTitle,
 			Artist:         songArtist,
 			Album:          songAlbum,
+			Duration:       durSec,
 			SongISRC:       songISRC,
 			SongPlatformID: songPlatformID,
 		},

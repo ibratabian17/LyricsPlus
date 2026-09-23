@@ -277,11 +277,17 @@ func (s *Service) fromMemory(ctx context.Context, q domain.SearchQuery) (*domain
 		resp.ProcessingTime.WinnerSource = &winner
 	}
 	if resp.ProcessingTime.SelectedSongMetadata == nil {
+		var durSec *float64
+		if q.Duration > 0 {
+			s := float64(q.Duration) / 1000.0
+			durSec = &s
+		}
 		resp.ProcessingTime.SelectedSongMetadata = &domain.PickedSongMetadata{
 			Source:         providerDisplayName(*resp.ProcessingTime.WinnerSource),
 			Title:          q.Title,
 			Artist:         q.Artist,
 			Album:          q.Album,
+			Duration:       durSec,
 			SongISRC:       q.ISRC,
 			SongPlatformID: q.PlatformID,
 		}
@@ -294,6 +300,10 @@ func (s *Service) fromMemory(ctx context.Context, q domain.SearchQuery) (*domain
 		}
 		if resp.ProcessingTime.SelectedSongMetadata.Album == "" {
 			resp.ProcessingTime.SelectedSongMetadata.Album = q.Album
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.Duration == nil && q.Duration > 0 {
+			s := float64(q.Duration) / 1000.0
+			resp.ProcessingTime.SelectedSongMetadata.Duration = &s
 		}
 		if resp.ProcessingTime.SelectedSongMetadata.SongISRC == "" {
 			resp.ProcessingTime.SelectedSongMetadata.SongISRC = q.ISRC
@@ -442,29 +452,68 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	if resp.ProcessingTime.WinnerSource == nil {
 		resp.ProcessingTime.WinnerSource = &winner
 	}
+	var pf storage.ParsedFilename
+	if row.Filename != "" {
+		pf = storage.ParseFilename(row.Filename)
+	}
+
 	title := row.Title
+	if title == "" && pf.Title != "" {
+		title = pf.Title
+	}
 	if title == "" {
 		title = q.Title
 	}
+
 	artist := row.Artist
+	if artist == "" && pf.Artist != "" {
+		artist = pf.Artist
+	}
 	if artist == "" {
 		artist = q.Artist
 	}
-	album := q.Album
+
+	album := pf.Album
+	if album == "" {
+		album = q.Album
+	}
+
 	isrc := row.ISRC
+	if isrc == "" && pf.ISRC != "" {
+		isrc = pf.ISRC
+	}
 	if isrc == "" {
 		isrc = q.ISRC
 	}
+
 	platID := row.PlatformID
+	if platID == "" && pf.PlatformID != "" {
+		platID = pf.PlatformID
+	}
 	if platID == "" {
 		platID = q.PlatformID
 	}
+
+	var durSec *float64
+	durMs := row.DurationMS
+	if durMs <= 0 && pf.DurationMS > 0 {
+		durMs = pf.DurationMS
+	}
+	if durMs <= 0 && q.Duration > 0 {
+		durMs = q.Duration
+	}
+	if durMs > 0 {
+		s := float64(durMs) / 1000.0
+		durSec = &s
+	}
+
 	if resp.ProcessingTime.SelectedSongMetadata == nil {
 		resp.ProcessingTime.SelectedSongMetadata = &domain.PickedSongMetadata{
 			Source:         providerDisplayName(*resp.ProcessingTime.WinnerSource),
 			Title:          title,
 			Artist:         artist,
 			Album:          album,
+			Duration:       durSec,
 			SongISRC:       isrc,
 			SongPlatformID: platID,
 		}
@@ -477,6 +526,9 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		}
 		if resp.ProcessingTime.SelectedSongMetadata.Album == "" {
 			resp.ProcessingTime.SelectedSongMetadata.Album = album
+		}
+		if resp.ProcessingTime.SelectedSongMetadata.Duration == nil && durSec != nil {
+			resp.ProcessingTime.SelectedSongMetadata.Duration = durSec
 		}
 		if resp.ProcessingTime.SelectedSongMetadata.SongISRC == "" {
 			resp.ProcessingTime.SelectedSongMetadata.SongISRC = isrc
@@ -650,9 +702,24 @@ func buildProcessTiming(res *orchestrator.Result, q domain.SearchQuery, lastProc
 	winner := res.Source
 	prio := res.Priority
 
+	var durSec *float64
+	if q.Duration > 0 {
+		s := float64(q.Duration) / 1000.0
+		durSec = &s
+	}
+
 	var selMeta *domain.PickedSongMetadata
 	if res.Resp != nil && res.Resp.ProcessingTime != nil && res.Resp.ProcessingTime.SelectedSongMetadata != nil {
 		selMeta = res.Resp.ProcessingTime.SelectedSongMetadata
+		if selMeta.Duration == nil && durSec != nil {
+			selMeta.Duration = durSec
+		}
+		if selMeta.SongISRC == "" && q.ISRC != "" {
+			selMeta.SongISRC = q.ISRC
+		}
+		if selMeta.SongPlatformID == "" && q.PlatformID != "" {
+			selMeta.SongPlatformID = q.PlatformID
+		}
 	} else {
 		sourceName := providerDisplayName(winner)
 		selMeta = &domain.PickedSongMetadata{
@@ -660,6 +727,7 @@ func buildProcessTiming(res *orchestrator.Result, q domain.SearchQuery, lastProc
 			Title:          q.Title,
 			Artist:         q.Artist,
 			Album:          q.Album,
+			Duration:       durSec,
 			SongISRC:       q.ISRC,
 			SongPlatformID: q.PlatformID,
 		}

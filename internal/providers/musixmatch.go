@@ -215,13 +215,22 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 
 	converted.Metadata.Source = "Musixmatch"
 	converted.Cached = domain.CacheNone
-	converted.RawData = string(envelopeJSON)
+	var durSec *float64
+	if matchedTrack.TrackLength > 0 {
+		s := float64(matchedTrack.TrackLength)
+		durSec = &s
+	} else if q.Duration > 0 {
+		s := float64(q.Duration) / 1000.0
+		durSec = &s
+	}
+
 	converted.ProcessingTime = &domain.ProcessTiming{
 		SelectedSongMetadata: &domain.PickedSongMetadata{
 			Source:         "Musixmatch",
 			Title:          matchedTrack.TrackName,
 			Artist:         matchedTrack.ArtistName,
 			Album:          matchedTrack.AlbumName,
+			Duration:       durSec,
 			SongISRC:       matchedTrack.TrackISRC,
 			SongPlatformID: strconv.FormatInt(matchedTrack.TrackID, 10),
 		},

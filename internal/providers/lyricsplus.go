@@ -125,6 +125,67 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 					norm.Metadata.Source = "Lyrics+"
 					norm.Cached = domain.CacheUserJSON
 					norm.RawData = string(row.ContentJSON)
+
+					var pf storage.ParsedFilename
+					if row.Filename != "" {
+						pf = storage.ParseFilename(row.Filename)
+					}
+					title := row.Title
+					if title == "" && pf.Title != "" {
+						title = pf.Title
+					}
+					if title == "" {
+						title = q.Title
+					}
+					artist := row.Artist
+					if artist == "" && pf.Artist != "" {
+						artist = pf.Artist
+					}
+					if artist == "" {
+						artist = q.Artist
+					}
+					album := pf.Album
+					if album == "" {
+						album = q.Album
+					}
+					isrc := row.ISRC
+					if isrc == "" && pf.ISRC != "" {
+						isrc = pf.ISRC
+					}
+					if isrc == "" {
+						isrc = q.ISRC
+					}
+					platID := row.PlatformID
+					if platID == "" && pf.PlatformID != "" {
+						platID = pf.PlatformID
+					}
+					if platID == "" {
+						platID = q.PlatformID
+					}
+					var durSec *float64
+					durMs := row.DurationMS
+					if durMs <= 0 && pf.DurationMS > 0 {
+						durMs = pf.DurationMS
+					}
+					if durMs <= 0 && q.Duration > 0 {
+						durMs = q.Duration
+					}
+					if durMs > 0 {
+						s := float64(durMs) / 1000.0
+						durSec = &s
+					}
+					norm.ProcessingTime = &domain.ProcessTiming{
+						SelectedSongMetadata: &domain.PickedSongMetadata{
+							Source:         "Lyrics+",
+							Title:          title,
+							Artist:         artist,
+							Album:          album,
+							Duration:       durSec,
+							SongISRC:       isrc,
+							SongPlatformID: platID,
+						},
+					}
+
 					lpResult = norm
 					p.debugf("hit user store row=%d lines=%d word=%t", row.ID, len(norm.Lyrics), hasWordSync(norm))
 					if hasWordSync(norm) {
@@ -155,6 +216,52 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 					norm.Metadata.Source = "Lyrics+"
 					norm.Cached = domain.CacheGDrive
 					norm.RawData = string(content)
+
+					var pf storage.ParsedFilename
+					if gfile.Name != "" {
+						pf = storage.ParseFilename(gfile.Name)
+					}
+					title := pf.Title
+					if title == "" {
+						title = q.Title
+					}
+					artist := pf.Artist
+					if artist == "" {
+						artist = q.Artist
+					}
+					album := pf.Album
+					if album == "" {
+						album = q.Album
+					}
+					isrc := pf.ISRC
+					if isrc == "" {
+						isrc = q.ISRC
+					}
+					platID := pf.PlatformID
+					if platID == "" {
+						platID = q.PlatformID
+					}
+					var durSec *float64
+					durMs := pf.DurationMS
+					if durMs <= 0 && q.Duration > 0 {
+						durMs = q.Duration
+					}
+					if durMs > 0 {
+						s := float64(durMs) / 1000.0
+						durSec = &s
+					}
+					norm.ProcessingTime = &domain.ProcessTiming{
+						SelectedSongMetadata: &domain.PickedSongMetadata{
+							Source:         "Lyrics+",
+							Title:          title,
+							Artist:         artist,
+							Album:          album,
+							Duration:       durSec,
+							SongISRC:       isrc,
+							SongPlatformID: platID,
+						},
+					}
+
 					lpResult = norm
 					if st != nil {
 						go func(c []byte, query domain.SearchQuery) {
