@@ -278,7 +278,7 @@ func Load(customPaths ...string) Config {
 			AllowSubmissions: envBool("ALLOW_SUBMISSIONS", true),
 		},
 		RateLimit: RateLimit{
-			Requests: envInt("RATE_LIMIT_REQUESTS", 20),
+			Requests: envInt("RATE_LIMIT_REQUESTS", 3),
 			Window:   time.Duration(envInt("RATE_LIMIT_WINDOW_MS", 10000)) * time.Millisecond,
 		},
 		Storage: Storage{
@@ -586,6 +586,24 @@ func loadJSONConfig(path string) error {
 					setEnvIfUnset("DEEZER_ARL", valStr)
 				case "deezer_refresh_token":
 					setEnvIfUnset("DEEZER_REFRESH_TOKEN", valStr)
+				}
+			}
+		}
+	}
+
+	// 5. Check for structured "rate_limit" object
+	for _, rlKey := range []string{"rate_limit", "ratelimit"} {
+		if raw, ok := rawMap[rlKey]; ok {
+			var rl struct {
+				Requests *int `json:"requests"`
+				WindowMS *int `json:"window_ms"`
+			}
+			if err := json.Unmarshal(raw, &rl); err == nil {
+				if rl.Requests != nil {
+					setEnvIfUnset("RATE_LIMIT_REQUESTS", strconv.Itoa(*rl.Requests))
+				}
+				if rl.WindowMS != nil {
+					setEnvIfUnset("RATE_LIMIT_WINDOW_MS", strconv.Itoa(*rl.WindowMS))
 				}
 			}
 		}
