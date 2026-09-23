@@ -98,13 +98,19 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		return nil, fmt.Errorf("storage: mkdir: %w", err)
 	}
 
-	db, err := sql.Open("sqlite", path)
+	dsn := fmt.Sprintf(
+		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-4000)&_pragma=mmap_size(2147483648)&_pragma=temp_store(MEMORY)",
+		path,
+	)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("storage: open sqlite: %w", err)
 	}
 	// In WAL mode, concurrent readers do not block each other or writers.
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	db.SetMaxOpenConns(200)
+	db.SetMaxIdleConns(50)
+	db.SetConnMaxLifetime(time.Hour)
+	db.SetConnMaxIdleTime(10 * time.Minute)
 
 	if err := initStoreSchema(db); err != nil {
 		_ = db.Close()
@@ -113,7 +119,7 @@ func NewStore(cfg config.Storage) (*Store, error) {
 
 	size := cfg.LRUSize
 	if size <= 0 {
-		size = 4096
+		size = 16384
 	}
 	exact, _ := lru.New[string, *Row](size)
 	exactTitle, _ := lru.New[string, []*Row](size)
@@ -154,8 +160,11 @@ func initStoreSchema(db *sql.DB) error {
 	if _, err := db.Exec(lyricsCreateTable); err != nil {
 		return err
 	}
-	_, err := db.Exec(lyricsFTS5Setup)
-	return err
+	if _, err := db.Exec(lyricsFTS5Setup); err != nil {
+		return err
+	}
+	_, _ = db.Exec("PRAGMA optimize=0x10002;")
+	return nil
 }
 
 // GetExact returns the most recent row matching an ISRC or platform ID.

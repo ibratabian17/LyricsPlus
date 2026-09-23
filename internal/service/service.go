@@ -309,7 +309,7 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	if s.Store == nil {
 		return nil, false
 	}
-	dbCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	dbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
 	var row *storage.Row
