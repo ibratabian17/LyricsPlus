@@ -19,16 +19,33 @@
     "spotify_cookie": "",
     "spotify_client_id": "",
     "spotify_client_secret": "",
+    "spotify_accounts": [
+      { "NAMEID": "spotify1", "CLIENT_ID": "", "CLIENT_SECRET": "", "COOKIE": "" }
+    ],
     "musixmatch_cookie": "",
     "musixmatch_user_agent": "",
     "musixmatch_android_email": "",
     "musixmatch_android_password": "",
+    "musixmatch_accounts": [
+      { "NAMEID": "mxm-web-1", "AUTH_TYPE": "web", "USER_AGENT": "", "COOKIE": "" },
+      { "NAMEID": "mxm-android-1", "AUTH_TYPE": "android", "EMAIL": "", "PASSWORD": "" }
+    ],
     "apple_music_android_auth_token": "",
     "apple_music_android_dsid": "",
     "apple_music_android_user_agent": "",
     "apple_music_android_cookie": "",
     "apple_music_storefront": "in",
-    "apple_music_auth_token": ""
+    "apple_music_auth_token": "",
+    "apple_music_accounts": [
+      { "NAMEID": "apple-android", "AUTH_TYPE": "android", "ANDROID_AUTH_TOKEN": "", "ANDROID_DSID": "", "ANDROID_USER_AGENT": "", "ANDROID_COOKIE": "", "STOREFRONT": "in" },
+      { "NAMEID": "apple-web", "AUTH_TYPE": "web", "MUSIC_AUTH_TOKEN": "" }
+    ],
+    "deezer_arl": "",
+    "deezer_refresh_token": "",
+    "deezer_accounts": [
+      { "NAMEID": "deezer-1", "REFRESH_TOKEN": "" }
+    ]
   },
+  "server_proxy_urls": "https://proxy-lyplus.prjktla.workers.dev/?url=",
   "jwt_secret": "your-secure-jwt-secret"
 }

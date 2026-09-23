@@ -4,13 +4,16 @@ package providers
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
@@ -19,6 +22,21 @@ import (
 	"lyricsplus/backend/internal/similarity"
 )
 
+// appleAPIError carries the HTTP status of a failed Apple Music request so
+// callers can distinguish a 404 (no lyrics) from other failures.
+type appleAPIError struct {
+	StatusCode int
+	Msg        string
+}
+
+func (e *appleAPIError) Error() string { return e.Msg }
+
+// isNotFound reports whether err is an Apple Music 404.
+func isAppleStatus(err error, status int) bool {
+	var apiErr *appleAPIError
+	return errors.As(err, &apiErr) && apiErr.StatusCode == status
+}
+
 const appleName = "apple"
 
 const (
@@ -26,16 +44,12 @@ const (
 	appleSuggestionsBaseURL = "https://amp-api-edge.music.apple.com/v1"
 )
 
-// AppleMusicProvider fetches TTML or syllable lyrics from Apple Music.
+// AppleMusicProvider fetches TTML or syllable lyrics from Apple Music,
+// rotating through a list of android/web accounts on 401/429 (503 rate-limits
+// reuse the same account).
 type AppleMusicProvider struct {
-	client         *proxy.Client
-	androidToken   string
-	androidDsid    string
-	androidUA      string
-	androidCookie  string
-	storefront     string
-	webToken       string
-	mediaUserToken string
+	client *proxy.Client
+	mgm    *AccountManager[config.AppleAccount]
 
 	tokenMu          sync.Mutex
 	storefrontMu     sync.Mutex
@@ -48,44 +62,53 @@ func NewAppleMusic(client *proxy.Client) *AppleMusicProvider {
 }
 
 func NewAppleMusicWithConfig(client *proxy.Client, cfg config.Provider) *AppleMusicProvider {
-	androidToken := cfg.AppleAndroidToken
-	androidDsid := cfg.AppleAndroidDsid
-	androidUA := cfg.AppleAndroidUserAgent
-	if androidUA == "" {
-		androidUA = "Music/6.1 Android/16 model/RealmeGT2Pro build/1472 (dt:66)"
+	accounts := cfg.AppleAccounts
+	if len(accounts) == 0 {
+		accounts = []config.AppleAccount{
+			{
+				NAMEID:             "AppleAndroid",
+				AUTH_TYPE:          "android",
+				ANDROID_AUTH_TOKEN: cfg.AppleAndroidToken,
+				ANDROID_DSID:       cfg.AppleAndroidDsid,
+				ANDROID_USER_AGENT: cfg.AppleAndroidUserAgent,
+				ANDROID_COOKIE:     cfg.AppleAndroidCookie,
+				STOREFRONT:         cfg.AppleStorefront,
+			},
+			{
+				NAMEID:           "AppleWeb",
+				AUTH_TYPE:        "web",
+				MUSIC_AUTH_TOKEN: cfg.AppleMediaUserToken,
+			},
+		}
 	}
-	androidCookie := cfg.AppleAndroidCookie
-	storefront := cfg.AppleStorefront
-	if storefront == "" {
-		storefront = "in"
+	for i := range accounts {
+		if accounts[i].ANDROID_USER_AGENT == "" {
+			accounts[i].ANDROID_USER_AGENT = "Music/6.1 Android/16 model/RealmeGT2Pro build/1472 (dt:66)"
+		}
+		if accounts[i].STOREFRONT == "" {
+			accounts[i].STOREFRONT = "in"
+		}
 	}
-	webToken := cfg.AppleMediaUserToken
-	mediaToken := cfg.AppleMediaUserToken
-
 	return &AppleMusicProvider{
-		client:         client,
-		androidToken:   androidToken,
-		androidDsid:    androidDsid,
-		androidUA:      androidUA,
-		androidCookie:  androidCookie,
-		storefront:     storefront,
-		webToken:       webToken,
-		mediaUserToken: mediaToken,
+		client: client,
+		mgm:    newAccountManager(accounts),
 	}
 }
 
 func (p *AppleMusicProvider) Name() string { return appleName }
 func (p *AppleMusicProvider) Configured() bool {
-	return p.androidToken != "" || p.webToken != "" || p.mediaUserToken != ""
+	for i := 0; i < p.mgm.Count(); i++ {
+		if acc, ok := p.mgm.At(i); ok && acc.IsConfigured() {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
 	storefront, err := p.GetStorefront(ctx)
 	if err != nil {
-		storefront = p.storefront
-		if storefront == "" {
-			storefront = "us"
-		}
+		storefront = "in"
 	}
 
 	var bestMatch *appleSong
@@ -115,20 +138,15 @@ func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	lyricURL := fmt.Sprintf("%s/catalog/%s/songs/%s/syllable-lyrics?l%%5Blyrics%%5D=en-US&extend=ttmlLocalizations&l%%5Bscript%%5D=en-Latn",
 		appleBaseURL, storefront, bestMatch.ID)
 
-	headers, err := p.getAuthHeaders(ctx)
+	resp, err := p.makeAppleMusicRequest(ctx, lyricURL, nil, 0, 0, 0)
 	if err != nil {
-		return nil, err
-	}
-
-	resp, err := p.client.Get(ctx, lyricURL, headers)
-	if err != nil {
+		if isAppleStatus(err, http.StatusNotFound) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusNotFound {
-		return nil, nil
-	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("apple music lyrics returned status %d", resp.StatusCode)
 	}
@@ -248,13 +266,24 @@ func (s *appleSong) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (p *AppleMusicProvider) getAuthHeaders(ctx context.Context) (http.Header, error) {
+func (p *AppleMusicProvider) getAuthHeaders(ctx context.Context, accountIdx int) (http.Header, error) {
+	acc, ok := p.mgm.At(accountIdx)
+	if !ok {
+		return nil, fmt.Errorf("apple music: no account available")
+	}
+
 	h := make(http.Header)
-	if p.androidToken != "" {
-		h.Set("Authorization", "Bearer "+p.androidToken)
-		h.Set("x-dsid", p.androidDsid)
-		h.Set("User-Agent", p.androidUA)
-		h.Set("Cookie", p.androidCookie)
+	if strings.EqualFold(acc.AUTH_TYPE, "android") || acc.AUTH_TYPE == "" {
+		h.Set("Authorization", "Bearer "+acc.ANDROID_AUTH_TOKEN)
+		h.Set("x-dsid", acc.ANDROID_DSID)
+		ua := acc.ANDROID_USER_AGENT
+		if ua == "" {
+			ua = "Music/6.1 Android/16 model/RealmeGT2Pro build/1472 (dt:66)"
+		}
+		h.Set("User-Agent", ua)
+		if acc.ANDROID_COOKIE != "" {
+			h.Set("Cookie", acc.ANDROID_COOKIE)
+		}
 		return h, nil
 	}
 
@@ -266,10 +295,73 @@ func (p *AppleMusicProvider) getAuthHeaders(ctx context.Context) (http.Header, e
 	h.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 	h.Set("Origin", "https://music.apple.com")
 	h.Set("Referer", "https://music.apple.com")
-	if p.mediaUserToken != "" {
-		h.Set("media-user-token", p.mediaUserToken)
+	if acc.MUSIC_AUTH_TOKEN != "" {
+		h.Set("media-user-token", acc.MUSIC_AUTH_TOKEN)
 	}
 	return h, nil
+}
+
+// resetCaches clears cached auth state on account rotation so the next attempt
+// re-fetches the web token and storefront.
+func (p *AppleMusicProvider) resetCaches() {
+	p.tokenMu.Lock()
+	p.cachedWebToken = ""
+	p.tokenMu.Unlock()
+	p.storefrontMu.Lock()
+	p.cachedStorefront = ""
+	p.storefrontMu.Unlock()
+}
+
+// makeAppleMusicRequest:
+// - 503 (rate limit): retry the SAME account after 500–2000ms jitter.
+// - 401/429 (auth): rotate to the NEXT account, resetting cached auth state.
+// Both retries are bounded by maxAccountRetries.
+func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr string, extra http.Header, retries, rateLimitRetries, accountIdx int) (*http.Response, error) {
+	headers, err := p.getAuthHeaders(ctx, accountIdx)
+	if err != nil {
+		return nil, err
+	}
+	for k, vv := range extra {
+		for _, v := range vv {
+			headers.Add(k, v)
+		}
+	}
+
+	resp, err := p.client.Get(ctx, urlstr, headers)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusServiceUnavailable && rateLimitRetries < maxAccountRetries {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		_ = body
+		select {
+		case <-time.After(time.Duration(500+rand.Intn(1501)) * time.Millisecond):
+			return p.makeAppleMusicRequest(ctx, urlstr, extra, retries, rateLimitRetries+1, accountIdx)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests) && retries < maxAccountRetries {
+		_ = resp.Body.Close()
+		if next, hasNext := p.mgm.Next(accountIdx); hasNext {
+			p.resetCaches()
+			return p.makeAppleMusicRequest(ctx, urlstr, extra, retries+1, 0, next)
+		}
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
+			return nil, &appleAPIError{StatusCode: resp.StatusCode, Msg: fmt.Sprintf("Apple Music API returned status %d: %s", resp.StatusCode, string(body))}
+		}
+		return nil, &appleAPIError{StatusCode: resp.StatusCode, Msg: fmt.Sprintf("Apple Music API returned status %d: %s", resp.StatusCode, string(body))}
+	}
+
+	return resp, nil
 }
 
 var (
@@ -281,10 +373,6 @@ func (p *AppleMusicProvider) getWebToken(ctx context.Context) (string, error) {
 	p.tokenMu.Lock()
 	defer p.tokenMu.Unlock()
 	if p.cachedWebToken != "" {
-		return p.cachedWebToken, nil
-	}
-	if p.webToken != "" {
-		p.cachedWebToken = p.webToken
 		return p.cachedWebToken, nil
 	}
 
@@ -351,12 +439,15 @@ func (p *AppleMusicProvider) GetStorefront(ctx context.Context) (string, error) 
 		return p.cachedStorefront, nil
 	}
 
-	if p.androidToken != "" && p.storefront != "" {
-		p.cachedStorefront = p.storefront
+	// An android account's STOREFRONT is used directly; otherwise it's
+	// fetched from the /me/storefront endpoint.
+	current, ok := p.mgm.First()
+	if ok && (strings.EqualFold(current.AUTH_TYPE, "android") || current.AUTH_TYPE == "") && current.STOREFRONT != "" {
+		p.cachedStorefront = current.STOREFRONT
 		return p.cachedStorefront, nil
 	}
 
-	headers, err := p.getAuthHeaders(ctx)
+	headers, err := p.getAuthHeaders(ctx, 0)
 	if err == nil {
 		resp, err := p.client.Get(ctx, "https://api.music.apple.com/v1/me/storefront", headers)
 		if err == nil {
@@ -375,22 +466,14 @@ func (p *AppleMusicProvider) GetStorefront(ctx context.Context) (string, error) 
 		}
 	}
 
-	if p.storefront != "" {
-		p.cachedStorefront = p.storefront
-	} else {
-		p.cachedStorefront = "us"
-	}
+	p.cachedStorefront = "us"
 	return p.cachedStorefront, nil
 }
 
 func (p *AppleMusicProvider) SearchByISRC(ctx context.Context, isrc, storefront string) (*appleSong, error) {
 	searchURL := fmt.Sprintf("%s/catalog/%s/songs?filter[isrc]=%s", appleBaseURL, storefront, url.QueryEscape(isrc))
-	headers, err := p.getAuthHeaders(ctx)
-	if err != nil {
-		return nil, err
-	}
 
-	resp, err := p.client.Get(ctx, searchURL, headers)
+	resp, err := p.makeAppleMusicRequest(ctx, searchURL, nil, 0, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -431,12 +514,8 @@ func (p *AppleMusicProvider) SearchSongBySuggestions(ctx context.Context, query,
 	vals.Set("with", "naturalLanguage")
 
 	sugURL := fmt.Sprintf("%s/catalog/%s/search/suggestions?%s", appleSuggestionsBaseURL, storefront, vals.Encode())
-	headers, err := p.getAuthHeaders(ctx)
-	if err != nil {
-		return nil, err
-	}
 
-	resp, err := p.client.Get(ctx, sugURL, headers)
+	resp, err := p.makeAppleMusicRequest(ctx, sugURL, nil, 0, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -481,12 +560,8 @@ func (p *AppleMusicProvider) SearchSong(ctx context.Context, query, storefront s
 		return nil, nil
 	}
 	searchURL := fmt.Sprintf("%s/catalog/%s/search?types=songs&term=%s", appleBaseURL, storefront, url.QueryEscape(query))
-	headers, err := p.getAuthHeaders(ctx)
-	if err != nil {
-		return nil, err
-	}
 
-	resp, err := p.client.Get(ctx, searchURL, headers)
+	resp, err := p.makeAppleMusicRequest(ctx, searchURL, nil, 0, 0, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -518,23 +593,46 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 	queries := buildSearchQueries(title, artist, album)
 	var candidates []appleSong
 
-	// Try direct catalog search first with top targeted queries (single roundtrip match for 95%+ of tracks)
+	// 1. Suggestion queries in parallel (reversed: simplest first)
+	reversed := make([]string, len(queries))
+	for i, q := range queries {
+		reversed[len(queries)-1-i] = q
+	}
+
+	type sugResult struct {
+		songs []appleSong
+	}
+	sugCh := make(chan sugResult, len(reversed))
+	var wg sync.WaitGroup
+	for _, q := range reversed {
+		wg.Add(1)
+		go func(query string) {
+			defer wg.Done()
+			sugSongs, err := p.SearchSongBySuggestions(ctx, query, storefront)
+			if err == nil && len(sugSongs) > 0 {
+				sugCh <- sugResult{songs: sugSongs}
+			}
+		}(q)
+	}
+	wg.Wait()
+	close(sugCh)
+
+	for sr := range sugCh {
+		candidates = append(candidates, sr.songs...)
+	}
+
+	if len(candidates) > 0 {
+		if best := matchAppleSongs(candidates, title, artist, album, durationSec); best != nil {
+			return best, nil
+		}
+	}
+
+	// 2. Fallback to standard catalog search sequentially
 	for _, q := range queries {
 		songs, err := p.SearchSong(ctx, q, storefront)
 		if err == nil && len(songs) > 0 {
 			candidates = append(candidates, songs...)
-			if best := matchAppleSongs(candidates, title, artist, album, durationSec, songISRC, songPlatformID); best != nil {
-				return best, nil
-			}
-		}
-	}
-
-	// Fallback to suggestions search only if catalog search yielded no match
-	for _, q := range queries {
-		sugSongs, err := p.SearchSongBySuggestions(ctx, q, storefront)
-		if err == nil && len(sugSongs) > 0 {
-			candidates = append(candidates, sugSongs...)
-			if best := matchAppleSongs(candidates, title, artist, album, durationSec, songISRC, songPlatformID); best != nil {
+			if best := matchAppleSongs(candidates, title, artist, album, durationSec); best != nil {
 				return best, nil
 			}
 		}
@@ -543,7 +641,7 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 	return nil, nil
 }
 
-func matchAppleSongs(songs []appleSong, title, artist, album string, durationSec float64, songISRC, songPlatformID string) *appleSong {
+func matchAppleSongs(songs []appleSong, title, artist, album string, durationSec float64) *appleSong {
 	simCandidates := make([]similarity.SongCandidate, len(songs))
 	for i, s := range songs {
 		simCandidates[i] = similarity.SongCandidate{
@@ -551,13 +649,11 @@ func matchAppleSongs(songs []appleSong, title, artist, album string, durationSec
 			Artist:     s.Attributes.ArtistName,
 			Album:      s.Attributes.AlbumName,
 			DurationMs: s.Attributes.DurationInMillis,
-			ISRC:       s.Attributes.ISRC,
-			PlatformID: s.ID,
 			Data:       i,
 		}
 	}
 
-	best := similarity.FindBestSongMatch(simCandidates, title, artist, album, durationSec, songISRC, songPlatformID)
+	best := similarity.FindBestSongMatch(simCandidates, title, artist, album, durationSec, "", "")
 	if best == nil {
 		return nil
 	}
@@ -580,18 +676,41 @@ func buildSearchQueries(title, artist, album string) []string {
 	a := strings.TrimSpace(artist)
 	al := strings.TrimSpace(album)
 
-	// Primary targeted queries: artist + title (most accurate)
+	// Query variants, most specific first: [title, artist, album],
+	// [title, artist], artist + ' ' + title, title.
+	var full []string
+	if t != "" {
+		full = append(full, t)
+	}
+	if a != "" {
+		full = append(full, a)
+	}
+	if al != "" {
+		full = append(full, al)
+	}
+	if len(full) > 0 {
+		add(strings.Join(full, " "))
+	}
+
+	var ta []string
+	if t != "" {
+		ta = append(ta, t)
+	}
+	if a != "" {
+		ta = append(ta, a)
+	}
+	if len(ta) > 0 {
+		add(strings.Join(ta, " "))
+	}
+
 	if a != "" && t != "" {
 		add(a + " " + t)
-		add(t + " " + a)
 	}
-	// With album for disambiguation (remixes, live, deluxe)
-	if a != "" && t != "" && al != "" {
-		add(a + " " + t + " " + al)
-	}
-	if t != "" && a == "" {
+
+	if t != "" {
 		add(t)
 	}
+
 	return queries
 }
 
@@ -667,7 +786,7 @@ func (p *AppleMusicProvider) GetMetadata(ctx context.Context, title, artist, alb
 			continue
 		}
 		candidates = append(candidates, songs...)
-		if best := matchAppleSongs(candidates, title, artist, album, durationSec, "", ""); best != nil {
+		if best := matchAppleSongs(candidates, title, artist, album, durationSec); best != nil {
 			meta := make(map[string]interface{}, len(best.RawAttributes))
 			for k, v := range best.RawAttributes {
 				meta[k] = v

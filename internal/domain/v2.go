@@ -46,6 +46,8 @@ type LyricsMetadata struct {
 	TotalDuration  string           `json:"totalDuration,omitempty"`
 	Curator        string           `json:"curator,omitempty"`
 	Audio          []AudioMetadata  `json:"audio,omitempty"`
+	Copyright      string           `json:"copyright,omitempty"`
+	Licence        string           `json:"licence,omitempty"`
 }
 
 // Agent models a credited performer or group used as a voice identity.

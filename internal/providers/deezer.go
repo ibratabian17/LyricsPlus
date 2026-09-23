@@ -11,7 +11,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/proxy"
@@ -26,23 +28,44 @@ const (
 	deezerDefaultSearchURL  = "https://api.deezer.com/search/track"
 )
 
-// DeezerProvider fetches word-by-word or synchronized lyrics from Deezer GraphQL.
-type DeezerProvider struct {
-	client       *proxy.Client
-	arl          string
-	refreshToken string
-	authURL      string
-	graphqlURL   string
-	searchURL    string
+const deezerDefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
-	mu          sync.RWMutex
-	cachedJWT   string
-	cachedToken string
+// deezerAccountCredentials holds the per-account token cache: the JWT plus the
+// refresh token returned by the auth API.
+type deezerAccountCredentials struct {
+	jwt      string
+	refToken string
+	expires  time.Time
+}
+
+// DeezerProvider fetches word-by-word or synchronized lyrics from Deezer
+// GraphQL. Authentication uses the current account and a failure rotates to
+// the next account, each account keeping its own JWT.
+type DeezerProvider struct {
+	client     *proxy.Client
+	mgm        *AccountManager[config.DeezerAccount]
+	authURL    string
+	graphqlURL string
+	searchURL  string
+
+	mu   sync.RWMutex
+	jwts map[int]*deezerAccountCredentials
 }
 
 func NewDeezer(client *proxy.Client) *DeezerProvider {
-	arl := os.Getenv("DEEZER_ARL")
-	refToken := os.Getenv("DEEZER_REFRESH_TOKEN")
+	return NewDeezerWithConfig(client, config.Load().Provider)
+}
+
+func NewDeezerWithConfig(client *proxy.Client, cfg config.Provider) *DeezerProvider {
+	accounts := cfg.DeezerAccounts
+	if len(accounts) == 0 {
+		accounts = []config.DeezerAccount{{
+			NAMEID:        "DeezerDefault",
+			REFRESH_TOKEN: cfg.DeezerRefreshToken,
+			ARL:           cfg.DeezerARL,
+		}}
+	}
+
 	authURL := os.Getenv("DEEZER_AUTH_URL")
 	if authURL == "" {
 		authURL = deezerDefaultAuthURL
@@ -57,19 +80,45 @@ func NewDeezer(client *proxy.Client) *DeezerProvider {
 	}
 
 	return &DeezerProvider{
-		client:       client,
-		arl:          arl,
-		refreshToken: refToken,
-		authURL:      authURL,
-		graphqlURL:   graphqlURL,
-		searchURL:    searchURL,
+		client:     client,
+		mgm:        newAccountManager(accounts),
+		authURL:    authURL,
+		graphqlURL: graphqlURL,
+		searchURL:  searchURL,
+		jwts:       map[int]*deezerAccountCredentials{},
 	}
 }
 
 func (p *DeezerProvider) Name() string { return deezerName }
 
 func (p *DeezerProvider) Configured() bool {
-	return p.arl != "" || p.refreshToken != ""
+	for i := 0; i < p.mgm.Count(); i++ {
+		if acc, ok := p.mgm.At(i); ok && acc.IsConfigured() {
+			return true
+		}
+	}
+	return false
+}
+
+// credentials returns the cached JWT for the given account index, or nil if
+// none is cached yet.
+func (p *DeezerProvider) cachedCredentials(accountIdx int) (*deezerAccountCredentials, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	creds, ok := p.jwts[accountIdx]
+	return creds, ok
+}
+
+func (p *DeezerProvider) setCredentials(accountIdx int, creds *deezerAccountCredentials) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.jwts[accountIdx] = creds
+}
+
+func (p *DeezerProvider) clearCredentials(accountIdx int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.jwts, accountIdx)
 }
 
 func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
@@ -201,22 +250,24 @@ func (p *DeezerProvider) SearchTrack(ctx context.Context, query string, limit in
 	return res.Data, nil
 }
 
-func (p *DeezerProvider) authenticate(ctx context.Context) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if p.cachedJWT != "" {
-		return p.cachedJWT, nil
+// authenticate obtains a JWT for the given account index via the Deezer auth
+// API. Refresh-token is preferred; an ARL is sent as an arl=<token> cookie, and
+// the response's refresh_token rotation is cached. A failed auth (empty JWT)
+// returns an error which the caller uses to rotate to the next account.
+func (p *DeezerProvider) authenticate(ctx context.Context, accountIdx int) (string, error) {
+	acc, ok := p.mgm.At(accountIdx)
+	if !ok {
+		return "", fmt.Errorf("deezer: account %d unavailable", accountIdx)
 	}
 
-	rawToken := p.refreshToken
+	rawToken := acc.REFRESH_TOKEN
 	isARL := false
 	if rawToken == "" {
-		rawToken = p.arl
+		rawToken = acc.ARL
 		isARL = true
 	}
 	if rawToken == "" {
-		return "", fmt.Errorf("no deezer credentials available")
+		return "", fmt.Errorf("deezer: account %q has no credentials", acc.NAMEID)
 	}
 
 	cleanToken := strings.TrimSpace(rawToken)
@@ -230,7 +281,7 @@ func (p *DeezerProvider) authenticate(ctx context.Context) (string, error) {
 	}
 
 	headers := make(http.Header)
-	headers.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36")
+	headers.Set("User-Agent", deezerDefaultUserAgent)
 	headers.Set("Content-Type", "application/json")
 	headers.Set("Accept", "*/*")
 	headers.Set("Cookie", cookieString)
@@ -246,6 +297,10 @@ func (p *DeezerProvider) authenticate(ctx context.Context) (string, error) {
 		return "", err
 	}
 
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("deezer auth returned status %d: %s", resp.StatusCode, string(body))
+	}
+
 	var authResp struct {
 		JWT          string `json:"jwt"`
 		RefreshToken string `json:"refresh_token"`
@@ -255,14 +310,29 @@ func (p *DeezerProvider) authenticate(ctx context.Context) (string, error) {
 	}
 
 	if authResp.JWT == "" {
-		return "", fmt.Errorf("deezer auth returned empty jwt: %s", string(body))
+		return "", fmt.Errorf("deezer auth returned empty jwt for account %q", acc.NAMEID)
 	}
 
-	p.cachedJWT = authResp.JWT
-	if authResp.RefreshToken != "" {
-		p.cachedToken = authResp.RefreshToken
+	newRefToken := authResp.RefreshToken
+	for _, cookie := range resp.Header["Set-Cookie"] {
+		if rest, ok := strings.CutPrefix(cookie, "refresh-token="); ok {
+			if semicolon := strings.Index(rest, ";"); semicolon >= 0 {
+				rest = rest[:semicolon]
+			}
+			newRefToken = rest
+			break
+		}
 	}
-	return p.cachedJWT, nil
+	if newRefToken == "" {
+		newRefToken = rawToken
+	}
+
+	p.setCredentials(accountIdx, &deezerAccountCredentials{
+		jwt:      authResp.JWT,
+		refToken: newRefToken,
+		expires:  time.Now().Add(50 * time.Minute),
+	})
+	return authResp.JWT, nil
 }
 
 const graphqlQuery = `query GetLyrics($trackId: String!) {
@@ -311,19 +381,50 @@ fragment SynchronizedLines on Lyrics {
   __typename
 }`
 
+// getLyrics fetches lyrics with a valid JWT. retryCount tracks retries across
+// accounts: on an auth error (GraphQL token error or a bad JWT) the current
+// account's credentials are cleared and the next account is tried (up to
+// maxAccountRetries).
 func (p *DeezerProvider) getLyrics(ctx context.Context, trackID string, retryCount int) ([]byte, error) {
-	p.mu.RLock()
-	jwtToken := p.cachedJWT
-	p.mu.RUnlock()
+	accountIdx := 0
+	return p.getLyricsWithAccount(ctx, trackID, accountIdx, retryCount)
+}
 
-	if jwtToken == "" {
+func (p *DeezerProvider) getLyricsWithAccount(ctx context.Context, trackID string, accountIdx, retryCount int) ([]byte, error) {
+	jwtToken := ""
+	if creds, ok := p.cachedCredentials(accountIdx); ok && creds.jwt != "" && time.Now().Before(creds.expires) {
+		jwtToken = creds.jwt
+	} else {
 		var err error
-		jwtToken, err = p.authenticate(ctx)
+		jwtToken, err = p.authenticate(ctx, accountIdx)
 		if err != nil {
+			if next, ok := p.mgm.Next(accountIdx); ok && retryCount < maxAccountRetries {
+				return p.getLyricsWithAccount(ctx, trackID, next, retryCount+1)
+			}
 			return nil, err
 		}
 	}
 
+	data, err := p.graphQLLyrics(ctx, trackID, jwtToken)
+	if err != nil {
+		if isDeezerAuthError(err.Error()) {
+			p.clearCredentials(accountIdx)
+			if next, ok := p.mgm.Next(accountIdx); ok && retryCount < maxAccountRetries {
+				return p.getLyricsWithAccount(ctx, trackID, next, retryCount+1)
+			}
+			return nil, err
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+func isDeezerAuthError(msg string) bool {
+	lower := strings.ToLower(msg)
+	return strings.Contains(lower, "token") || strings.Contains(lower, "unauthorized")
+}
+
+func (p *DeezerProvider) graphQLLyrics(ctx context.Context, trackID, jwtToken string) ([]byte, error) {
 	payload := map[string]interface{}{
 		"operationName": "GetLyrics",
 		"variables":     map[string]string{"trackId": trackID},
@@ -357,13 +458,15 @@ func (p *DeezerProvider) getLyrics(ctx context.Context, trackID string, retryCou
 		} `json:"errors"`
 	}
 	if err := json.Unmarshal(respBody, &parsed); err == nil && len(parsed.Errors) > 0 {
-		if retryCount == 0 {
-			p.mu.Lock()
-			p.cachedJWT = ""
-			p.mu.Unlock()
-			return p.getLyrics(ctx, trackID, retryCount+1)
+		msg := parsed.Errors[0].Message
+		if strings.Contains(strings.ToLower(msg), "token") || strings.Contains(strings.ToLower(msg), "unauthorized") {
+			return nil, fmt.Errorf("deezer graphql auth error: %s", msg)
 		}
-		return nil, fmt.Errorf("deezer graphql error: %s", parsed.Errors[0].Message)
+		return nil, fmt.Errorf("deezer graphql error: %s", msg)
+	}
+
+	if len(parsed.Data) == 0 || string(parsed.Data) == "null" {
+		return nil, nil
 	}
 
 	return parsed.Data, nil

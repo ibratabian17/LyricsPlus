@@ -56,11 +56,13 @@ func ConvertLRCLIBtoJSON(syncedLyrics string, durationSec float64) *domain.Lyric
 		if l.text == "" {
 			continue
 		}
+		lineEnding := 1
 		lyrics = append(lyrics, domain.Line{
-			Time:     l.time,
-			Duration: l.duration,
-			Text:     l.text,
-			Syllabus: []domain.Syllable{},
+			Time:         l.time,
+			Duration:     l.duration,
+			Text:         l.text,
+			IsLineEnding: &lineEnding,
+			Syllabus:     []domain.Syllable{},
 			Element: domain.LineElement{
 				Key:      l.key,
 				SongPart: "",

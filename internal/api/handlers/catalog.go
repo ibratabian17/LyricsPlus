@@ -4,8 +4,10 @@ package handlers
 import (
 	"context"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"lyricsplus/backend/internal/domain"
@@ -46,17 +48,108 @@ func (h *Catalog) Search(w http.ResponseWriter, r *http.Request) {
 		results = append(results, items...)
 	}
 
-	agg(h.AppleMusic.SearchCatalog(ctx, q))
-	agg(h.Spotify.SearchCatalog(ctx, q))
-	agg(h.Musixmatch.SearchCatalog(ctx, q))
+	type searchFn struct {
+		name string
+		call func() ([]domain.SongCatalogItem, error)
+	}
+	fns := []searchFn{
+		{"apple", func() ([]domain.SongCatalogItem, error) { return h.AppleMusic.SearchCatalog(ctx, q) }},
+		{"spotify", func() ([]domain.SongCatalogItem, error) { return h.Spotify.SearchCatalog(ctx, q) }},
+		{"musixmatch", func() ([]domain.SongCatalogItem, error) { return h.Musixmatch.SearchCatalog(ctx, q) }},
+	}
+	var wg sync.WaitGroup
+	for _, fn := range fns {
+		wg.Add(1)
+		go func(name string, call func() ([]domain.SongCatalogItem, error)) {
+			defer wg.Done()
+			agg(call())
+		}(fn.name, fn.call)
+	}
+	wg.Wait()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"results": results,
+		"results": mergeCatalogResults(results),
 		"processingTime": map[string]int64{
 			"timeElapsed":   time.Since(start).Milliseconds(),
 			"lastProcessed": time.Now().UnixMilli(),
 		},
 	})
+}
+
+// mergeCatalogResults deduplicates catalog items the same way the JS
+// songCatalog.service merges: sort by preferred source order (Apple, Spotify,
+// Musixmatch), then key on ISRC (falling back to title/artist/album) and union
+// the secondary fields into the first occurrence.
+func mergeCatalogResults(results []domain.SongCatalogItem) []domain.SongCatalogItem {
+	sourceOrder := map[string]int{"Apple Music": 1, "Spotify": 2, "Musixmatch": 3}
+	rank := func(item domain.SongCatalogItem) int {
+		if len(item.Availability) == 0 {
+			return 99
+		}
+		if r, ok := sourceOrder[item.Availability[0]]; ok {
+			return r
+		}
+		return 99
+	}
+
+	sorted := make([]domain.SongCatalogItem, len(results))
+	copy(sorted, results)
+	sort.SliceStable(sorted, func(i, j int) bool { return rank(sorted[i]) < rank(sorted[j]) })
+
+	seen := make(map[string]int)
+	merged := make([]domain.SongCatalogItem, 0, len(sorted))
+	for _, song := range sorted {
+		key := ""
+		if song.ISRC != nil && *song.ISRC != "" {
+			key = *song.ISRC
+		} else {
+			key = song.Title + "-" + song.Artist + "-" + song.Album
+		}
+
+		if idx, ok := seen[key]; ok {
+			existing := &merged[idx]
+			if existing.ID == nil {
+				existing.ID = map[string]string{}
+			}
+			for k, v := range song.ID {
+				existing.ID[k] = v
+			}
+			if existing.ExternalURLs == nil {
+				existing.ExternalURLs = map[string]string{}
+			}
+			for k, v := range song.ExternalURLs {
+				existing.ExternalURLs[k] = v
+			}
+			existing.Songwriters = unionStrings(existing.Songwriters, song.Songwriters)
+			existing.Availability = unionStrings(existing.Availability, song.Availability)
+			if existing.AlbumArtURL == nil && song.AlbumArtURL != nil {
+				existing.AlbumArtURL = song.AlbumArtURL
+			}
+			if existing.DurationMs == 0 && song.DurationMs != 0 {
+				existing.DurationMs = song.DurationMs
+			}
+		} else {
+			seen[key] = len(merged)
+			merged = append(merged, song)
+		}
+	}
+	return merged
+}
+
+func unionStrings(a, b []string) []string {
+	seen := make(map[string]bool, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	add := func(items []string) {
+		for _, s := range items {
+			if !seen[s] {
+				seen[s] = true
+				out = append(out, s)
+			}
+		}
+	}
+	add(a)
+	add(b)
+	return out
 }
 
 // Metadata returns detailed Apple Music metadata for a track.

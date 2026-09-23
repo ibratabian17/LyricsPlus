@@ -66,7 +66,7 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 	qq := NewQQMusic(client, pcfg.QQCookie)
 	mxm := NewMusixmatchWithConfig(client, pcfg, "musixmatch", false)
 	mxmWord := NewMusixmatchWithConfig(client, pcfg, "musixmatch-word", true)
-	dz := NewDeezer(client)
+	dz := NewDeezerWithConfig(client, pcfg)
 	sp := NewSpotifyWithConfig(client, pcfg)
 
 	qapleSvc := NewQapleService(qq, apple, mxm)

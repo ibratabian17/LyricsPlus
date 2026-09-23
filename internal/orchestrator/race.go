@@ -60,15 +60,21 @@ func NewRacer(sources []Source, timeout time.Duration) *Racer {
 func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery) *Result {
 	src, ok := r.sources[name]
 	if !ok {
+		r.record(name, "SKIP", 0)
 		return &Result{Source: name, Status: "SKIP", Err: errUnavailable}
 	}
 	if c, ok := src.(interface{ Configured() bool }); ok && !c.Configured() {
+		r.record(name, "SKIP", 0)
 		return &Result{Source: name, Status: "SKIP"}
 	}
 	start := time.Now()
 	deadline := r.timeout
 	reqCtx, cancel := context.WithTimeout(ctx, deadline)
 	defer cancel()
+
+	// Immediately record as BAD in case context cancels before return, matching JS trackedFetch
+	r.record(name, "BAD", 0)
+
 	resp, err := src.FetchLyrics(reqCtx, q)
 	elapsed := time.Since(start)
 	res := &Result{Source: name, Resp: resp, Err: err, Elapsed: elapsed}
@@ -81,7 +87,7 @@ func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery)
 		}
 		res.Priority = Grade(resp, res.Source)
 		res.Status = "OK"
-	case err == context.DeadlineExceeded || err == context.Canceled:
+	case err == context.DeadlineExceeded || err == context.Canceled || reqCtx.Err() != nil:
 		res.Status = "RTO"
 	default:
 		res.Status = "BAD"
@@ -150,9 +156,17 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 
 	// Phase 2: P3-upgrade search if Phase 1 delivered line sync.
 	if p1 != nil && p1.Priority == PriorityLine {
-		p3 := r.raceForPriority(ctx, q, remaining, PriorityWord)
-		if p3 != nil {
-			return r.finalize(p3)
+		p3Sources := make([]string, 0, len(remaining))
+		for _, s := range remaining {
+			if s != "musixmatch" && s != "spotify" {
+				p3Sources = append(p3Sources, s)
+			}
+		}
+		if len(p3Sources) > 0 {
+			p3 := r.raceForPriority(ctx, q, p3Sources, PriorityWord)
+			if p3 != nil {
+				return r.finalize(p3)
+			}
 		}
 		return r.finalize(p1)
 	}
@@ -237,9 +251,11 @@ func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []stri
 			return pickWinner(results, names)
 		case <-phaseCtx.Done():
 			cancel()
+			<-done
 			return pickWinner(results, names)
 		case <-ctx.Done():
 			cancel()
+			<-done
 			return pickWinner(results, names)
 		}
 	}

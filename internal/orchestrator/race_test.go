@@ -47,12 +47,11 @@ func TestGrade(t *testing.T) {
 	if Grade(lineResp("deezer"), "deezer") != PriorityLine {
 		t.Error("line should be priority 2")
 	}
-	// Apple word-typed without syllables downgrades.
-	apple := wordResp("apple")
-	apple.Lyrics[0].Syllabus = []domain.Syllable{}
-	apple.Type = domain.SyncTypeWord
-	if Grade(apple, "apple") != PriorityLine {
-		t.Error("apple unsynced should downgrade to line")
+	// A line-typed payload with actual syllable content grades as word sync.
+	apple := lineResp("apple")
+	apple.Lyrics[0].Syllabus = []domain.Syllable{{Time: 0, Duration: 500, Text: "x "}}
+	if Grade(apple, "apple") != PriorityWord {
+		t.Error("apple with syllabus should be priority 3")
 	}
 	if Grade(nil, "x") != PriorityFailed {
 		t.Error("nil should be priority 0")

@@ -47,7 +47,7 @@ func NormalizeDeezerLyrics(data []byte) (*domain.LyricsResponse, error) {
 	}
 	lyricsData := p.Track.Lyrics
 
-	songWriters := []string(nil)
+	songWriters := []string{}
 	if lyricsData.Writers != "" {
 		songWriters = strings.Split(lyricsData.Writers, ", ")
 	}
@@ -57,6 +57,8 @@ func NormalizeDeezerLyrics(data []byte) (*domain.LyricsResponse, error) {
 		Metadata: domain.LyricsMetadata{
 			Source:      "Deezer",
 			SongWriters: songWriters,
+			Copyright:   lyricsData.Copyright,
+			Licence:     lyricsData.Licence,
 		},
 		Lyrics: []domain.Line{},
 	}

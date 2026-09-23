@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -24,6 +25,10 @@ var hopByHopHeaders = []string{
 }
 
 var errSSRFBlocked = errors.New("ssrf: request blocked")
+
+// defaultRequestTimeout is applied to any outbound request that does not
+// already carry a context deadline.
+const defaultRequestTimeout = 15 * time.Second
 
 // Client wraps the shared HTTP transport plus optional forward-proxy rewrite.
 type Client struct {
@@ -83,43 +88,56 @@ func (c *Client) Post(ctx context.Context, urlstr string, header http.Header, bo
 }
 
 // Do validates URL safety and performs the request, optionally routing
-// through the configured forward proxy.
+// through the configured forward proxy (picking randomly from the URL list).
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	u := req.URL
 	if err := c.validate(u); err != nil {
 		return nil, err
 	}
 
-	if c.cfg.Enabled && c.cfg.URL != "" {
-		internal := req.Clone(req.Context())
-		for _, h := range hopByHopHeaders {
-			internal.Header.Del(h)
-		}
-		targetStr := u.String()
-		var fullURL string
-		if strings.Contains(c.cfg.URL, "?") {
-			fullURL = c.cfg.URL + url.QueryEscape(targetStr)
-		} else {
-			fullURL = strings.TrimSuffix(c.cfg.URL, "/") + "/" + url.QueryEscape(targetStr)
-		}
-		newU, err := url.Parse(fullURL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid proxy url: %w", err)
-		}
-		internal.URL = newU
-		internal.Host = newU.Host
-		if c.cfg.Token != "" {
-			tokenHeader := c.cfg.TokenHeader
-			if tokenHeader == "" {
-				tokenHeader = "x-proxy-token"
+	req = withDefaultDeadline(req)
+
+	if c.cfg.Enabled {
+		if proxyURL := c.pickProxyURL(); proxyURL != "" && shouldProxy(u) {
+			internal := req.Clone(req.Context())
+			for _, h := range hopByHopHeaders {
+				internal.Header.Del(h)
 			}
-			internal.Header.Set(tokenHeader, c.cfg.Token)
+			targetStr := u.String()
+			var fullURL string
+			if strings.Contains(proxyURL, "?") {
+				fullURL = proxyURL + url.QueryEscape(targetStr)
+			} else {
+				fullURL = strings.TrimSuffix(proxyURL, "/") + "/" + url.QueryEscape(targetStr)
+			}
+			newU, err := url.Parse(fullURL)
+			if err != nil {
+				return nil, fmt.Errorf("invalid proxy url: %w", err)
+			}
+			internal.URL = newU
+			internal.Host = newU.Host
+			if c.cfg.Token != "" {
+				tokenHeader := c.cfg.TokenHeader
+				if tokenHeader == "" {
+					tokenHeader = "x-proxy-token"
+				}
+				internal.Header.Set(tokenHeader, c.cfg.Token)
+			}
+			// Advertise Connection: keep-alive to the proxy so the upstream
+			// TCP socket is reused across worker requests.
+			if internal.Header.Get("Connection") == "" || internal.Header.Get("Connection") == "close" {
+				internal.Header.Set("Connection", "keep-alive")
+			}
+			resp, err := c.http.Do(internal)
+			if err != nil {
+				return nil, dedupeErr(err)
+			}
+			return decompressIfNeeded(resp), nil
 		}
-		resp, err := c.http.Do(internal)
-		if err != nil {
-			return nil, dedupeErr(err)
-		}
-		return decompressIfNeeded(resp), nil
+	}
+
+	if req.Header.Get("Connection") == "" || req.Header.Get("Connection") == "close" {
+		req.Header.Set("Connection", "keep-alive")
 	}
 
 	resp, err := c.http.Do(req)
@@ -127,6 +145,44 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		return nil, dedupeErr(err)
 	}
 	return decompressIfNeeded(resp), nil
+}
+
+// pickProxyURL returns a randomly selected proxy URL from the configured list.
+// Falls back to the legacy single SERVER_PROXY_URL value.
+func (c *Client) pickProxyURL() string {
+	raw := c.cfg.URLs
+	if len(raw) == 0 && c.cfg.URL != "" {
+		raw = []string{c.cfg.URL}
+	}
+	if len(raw) == 0 {
+		return ""
+	}
+	return raw[rand.Intn(len(raw))]
+}
+
+// shouldProxy never routes localhost / loopback / mDNS (.local) hosts through
+// the forward proxy.
+func shouldProxy(u *url.URL) bool {
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" || host == "127.0.0.1" || strings.HasSuffix(host, ".local") ||
+		host == "::1" || host == "0.0.0.0" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsUnspecified()) {
+		return false
+	}
+	return true
+}
+
+// withDefaultDeadline applies the JS-equivalent 15s per-request timeout when
+// the caller did not provide a context deadline of its own.
+func withDefaultDeadline(req *http.Request) *http.Request {
+	if _, ok := req.Context().Deadline(); ok {
+		return req
+	}
+	ctx, cancel := context.WithTimeout(req.Context(), defaultRequestTimeout)
+	_ = cancel // timer is bounded by defaultRequestTimeout; released on firing
+	return req.WithContext(ctx)
 }
 
 type gzipReadCloser struct {

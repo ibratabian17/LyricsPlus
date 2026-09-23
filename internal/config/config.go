@@ -28,8 +28,72 @@ type Server struct {
 type Proxy struct {
 	Enabled     bool
 	URL         string
+	URLs        []string
 	TokenHeader string
 	Token       string
+}
+
+// SpotifyAccount holds a single Spotify credential pair. Configure multiple
+// via the SPOTIFY_ACCOUNTS env var (JSON array), otherwise the single scalar
+// env vars are used.
+type SpotifyAccount struct {
+	NAMEID        string `json:"NAMEID"`
+	CLIENT_ID     string `json:"CLIENT_ID"`
+	CLIENT_SECRET string `json:"CLIENT_SECRET"`
+	COOKIE        string `json:"COOKIE"`
+}
+
+// AppleAccount holds a single Apple Music credential (android or web auth).
+type AppleAccount struct {
+	NAMEID             string `json:"NAMEID"`
+	AUTH_TYPE          string `json:"AUTH_TYPE"`
+	ANDROID_AUTH_TOKEN string `json:"ANDROID_AUTH_TOKEN"`
+	ANDROID_DSID       string `json:"ANDROID_DSID"`
+	ANDROID_USER_AGENT string `json:"ANDROID_USER_AGENT"`
+	ANDROID_COOKIE     string `json:"ANDROID_COOKIE"`
+	STOREFRONT         string `json:"STOREFRONT"`
+	MUSIC_AUTH_TOKEN   string `json:"MUSIC_AUTH_TOKEN"`
+}
+
+// MusixmatchAccount holds a single Musixmatch credential (web or android auth).
+type MusixmatchAccount struct {
+	NAMEID     string `json:"NAMEID"`
+	AUTH_TYPE  string `json:"AUTH_TYPE"`
+	USER_AGENT string `json:"USER_AGENT"`
+	COOKIE     string `json:"COOKIE"`
+	EMAIL      string `json:"EMAIL"`
+	PASSWORD   string `json:"PASSWORD"`
+}
+
+// DeezerAccount holds a single Deezer credential.
+type DeezerAccount struct {
+	NAMEID        string `json:"NAMEID"`
+	AUTH_TYPE     string `json:"AUTH_TYPE"`
+	REFRESH_TOKEN string `json:"REFRESH_TOKEN"`
+	ARL           string `json:"ARL"`
+}
+
+// IsConfigured reports whether the account carries any usable credential.
+func (a SpotifyAccount) IsConfigured() bool {
+	return a.COOKIE != "" || (a.CLIENT_ID != "" && a.CLIENT_SECRET != "")
+}
+
+// IsConfigured reports whether the account carries any usable credential.
+func (a AppleAccount) IsConfigured() bool {
+	if strings.EqualFold(a.AUTH_TYPE, "android") || a.AUTH_TYPE == "" {
+		return a.ANDROID_AUTH_TOKEN != ""
+	}
+	return a.MUSIC_AUTH_TOKEN != ""
+}
+
+// IsConfigured reports whether the account carries any usable credential.
+func (a MusixmatchAccount) IsConfigured() bool {
+	return a.COOKIE != "" || a.USER_AGENT != "" || (a.EMAIL != "" && a.PASSWORD != "")
+}
+
+// IsConfigured reports whether the account carries any usable credential.
+func (a DeezerAccount) IsConfigured() bool {
+	return a.REFRESH_TOKEN != "" || a.ARL != ""
 }
 
 // Provider mirrors credentials and tuning knobs for each provider.
@@ -41,11 +105,13 @@ type Provider struct {
 	SpotifyClientID          string
 	SpotifyClientSecret      string
 	SpotifyFallbackSecrets   [][]int
+	SpotifyAccounts          []SpotifyAccount
 	// Musixmatch
 	MusixmatchCookie          string
 	MusixmatchUserAgent       string
 	MusixmatchAndroidEmail    string
 	MusixmatchAndroidPassword string
+	MusixmatchAccounts        []MusixmatchAccount
 	// Apple
 	AppleAndroidToken     string
 	AppleAndroidDsid      string
@@ -53,11 +119,13 @@ type Provider struct {
 	AppleAndroidCookie    string
 	AppleStorefront       string
 	AppleMediaUserToken   string
+	AppleAccounts         []AppleAccount
 	// QQ Music
 	QQCookie string
 	// Deezer
 	DeezerARL          string
 	DeezerRefreshToken string
+	DeezerAccounts     []DeezerAccount
 }
 
 // LyricsPlus holds UGC PoW configuration.
@@ -166,6 +234,7 @@ func Load(customPaths ...string) Config {
 			Proxy: Proxy{
 				Enabled:     envBool("SERVER_PROXY_ENABLED", false),
 				URL:         env("SERVER_PROXY_URL", "https://proxy-lyplus.prjktla.workers.dev/?url="),
+				URLs:        parseProxyURLs(),
 				TokenHeader: env("SERVER_PROXY_TOKEN_HEADER", "x-proxy-token"),
 				Token:       os.Getenv("SERVER_PROXY_TOKEN"),
 			},
@@ -182,22 +251,26 @@ func Load(customPaths ...string) Config {
 				{59, 92, 64, 70, 99, 78, 117, 75, 99, 103, 116, 67, 103, 51, 87, 63, 93, 59, 70, 45, 32},
 				{107, 81, 49, 57, 67, 93, 87, 81, 69, 67, 40, 93, 48, 50, 46, 91, 94, 113, 41, 108, 77, 107, 34},
 			},
+			SpotifyAccounts:           loadSpotifyAccounts(),
 			MusixmatchCookie:          env("MUSIXMATCH_COOKIE", ""),
 			MusixmatchUserAgent:       env("MUSIXMATCH_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"),
 			MusixmatchAndroidEmail:    env("MUSIXMATCH_ANDROID_EMAIL", ""),
 			MusixmatchAndroidPassword: env("MUSIXMATCH_ANDROID_PASSWORD", ""),
+			MusixmatchAccounts:        loadMusixmatchAccounts(),
 			AppleAndroidToken:         env("APPLE_MUSIC_ANDROID_AUTH_TOKEN", ""),
 			AppleAndroidDsid:          env("APPLE_MUSIC_ANDROID_DSID", ""),
-			AppleAndroidUserAgent:     env("APPLE_MUSIC_ANDROID_USER_AGENT", "Music/6.1 Android/16 model/RealmeGT2Pro build/1472 (dt:66)"),
+			AppleAndroidUserAgent:     env("APPLE_MUSIC_ANDROID_USER_AGENT", "Music/6.1 Android/15 model/XiaomiPOCOF1 build/1451 (dt:66)"),
 			AppleAndroidCookie:        env("APPLE_MUSIC_ANDROID_COOKIE", ""),
 			AppleStorefront:           env("APPLE_MUSIC_STOREFRONT", "in"),
 			AppleMediaUserToken:       env("APPLE_MUSIC_AUTH_TOKEN", ""),
+			AppleAccounts:             loadAppleAccounts(),
 			QQCookie:                  os.Getenv("QQ_COOKIE"),
 			DeezerARL:                 os.Getenv("DEEZER_ARL"),
 			DeezerRefreshToken:        os.Getenv("DEEZER_REFRESH_TOKEN"),
+			DeezerAccounts:            loadDeezerAccounts(),
 		},
 		LyricsPlus: LyricsPlus{
-			JWTSecret:        env("JWT_SECRET", "lyricsplus-submit-api-key-water-fallin-7979-#123"),
+			JWTSecret:        env("JWT_SECRET", "lyricsplus-submit-opensource-yes-yes-yes"),
 			ChallengeTTL:     time.Duration(envInt("LYRICSPLUS_CHALLENGE_TTL_MS", 600000)) * time.Millisecond,
 			PoWDifficulty:    envInt("LYRICSPLUS_POW_DIFFICULTY", 5),
 			MaxBodyBytes:     envInt64("MAX_BODY_BYTES", 1<<20),
@@ -210,7 +283,7 @@ func Load(customPaths ...string) Config {
 		},
 		Storage: Storage{
 			DBPath:                  env("SQLITE_PATH", env("CACHE_DB_PATH", "database/lyrics_cache.db")),
-			LRUSize:                 envInt("LRU_SIZE", 4096),
+			LRUSize:                 envInt("LRU_SIZE", 20000),
 			ContentCacheBytes:       envInt64("CONTENT_CACHE_BYTES", 48<<20),
 			ExactTTL:                time.Duration(envInt("EXACT_TTL_MS", 900000)) * time.Millisecond,
 			ExistingTTL:             time.Duration(envInt("EXISTING_TTL_MS", 900000)) * time.Millisecond,
@@ -227,7 +300,7 @@ func Load(customPaths ...string) Config {
 		GDrive: GDrive{
 			Enabled:           envBool("GDRIVE_ENABLED", true),
 			Accounts:          loadGDriveAccounts(),
-			FolderUserTML:     parseFolderIDs(os.Getenv("GDRIVE_USERTML_JSON"), ""),
+			FolderUserTML:     parseFolderIDs(os.Getenv("GDRIVE_USERTML_JSON"), "1RFoNsI5wAsRjQSVDOMaotDmMZNIQOWnW"),
 			FolderTTML:        parseFolderIDs(os.Getenv("GDRIVE_CACHED_TTML"), ""),
 			FolderSpotify:     parseFolderIDs(os.Getenv("GDRIVE_CACHED_SPOTIFY"), ""),
 			FolderMusixmatch:  parseFolderIDs(os.Getenv("GDRIVE_CACHED_MUSIXMATCH"), ""),
@@ -461,6 +534,22 @@ func loadJSONConfig(path string) error {
 		var prov map[string]any
 		if err := json.Unmarshal(raw, &prov); err == nil {
 			for pk, pv := range prov {
+				// Account arrays are stored as JSON arrays: SPOTIFY_ACCOUNTS,
+				// APPLE_MUSIC_ACCOUNTS, MUSIXMATCH_ACCOUNTS, DEEZER_ACCOUNTS.
+				switch strings.ToLower(pk) {
+				case "spotify_accounts":
+					setEnvIfUnset("SPOTIFY_ACCOUNTS", marshalJSONValue(pv))
+					continue
+				case "apple_accounts", "apple_music_accounts":
+					setEnvIfUnset("APPLE_MUSIC_ACCOUNTS", marshalJSONValue(pv))
+					continue
+				case "musixmatch_accounts":
+					setEnvIfUnset("MUSIXMATCH_ACCOUNTS", marshalJSONValue(pv))
+					continue
+				case "deezer_accounts":
+					setEnvIfUnset("DEEZER_ACCOUNTS", marshalJSONValue(pv))
+					continue
+				}
 				valStr := fmt.Sprintf("%v", pv)
 				switch strings.ToLower(pk) {
 				case "spotify_cookie", "spotify_dc_cookie":
@@ -503,6 +592,14 @@ func loadJSONConfig(path string) error {
 	}
 
 	return nil
+}
+
+func marshalJSONValue(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 func parseFolderIDs(envVal, defVal string) []string {
@@ -576,6 +673,123 @@ func env(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// parseProxyURLs reads the proxy endpoint list. Prefer the comma-separated
+// SERVER_PROXY_URLS list; fall back to the single SERVER_PROXY_URL value.
+func parseProxyURLs() []string {
+	raw := os.Getenv("SERVER_PROXY_URLS")
+	if raw == "" {
+		raw = os.Getenv("SERVER_PROXY_URL")
+	}
+	parts := strings.Split(raw, ",")
+	var urls []string
+	for _, p := range parts {
+		if u := strings.TrimSpace(p); u != "" {
+			urls = append(urls, u)
+		}
+	}
+	return urls
+}
+
+// parseAccountList unmarshals a JSON array of accounts, normalizing object
+// keys to UPPERCASE so both JS-style ("CLIENT_ID") and lowercase configs work.
+func parseAccountList[T any](raw string) ([]T, error) {
+	if strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("empty account list")
+	}
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &entries); err != nil {
+		return nil, err
+	}
+	out := make([]T, 0, len(entries))
+	for _, e := range entries {
+		norm := make(map[string]json.RawMessage, len(e))
+		for k, v := range e {
+			norm[strings.ToUpper(k)] = v
+		}
+		b, err := json.Marshal(norm)
+		if err != nil {
+			continue
+		}
+		var item T
+		if err := json.Unmarshal(b, &item); err != nil {
+			continue
+		}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid provider accounts in %q", raw)
+	}
+	return out, nil
+}
+
+func loadSpotifyAccounts() []SpotifyAccount {
+	if raw := os.Getenv("SPOTIFY_ACCOUNTS"); raw != "" {
+		if accounts, err := parseAccountList[SpotifyAccount](raw); err == nil {
+			return accounts
+		}
+	}
+	return []SpotifyAccount{{
+		NAMEID:        "SpotifyDefault",
+		CLIENT_ID:     env("SPOTIFY_CLIENT_ID", ""),
+		CLIENT_SECRET: env("SPOTIFY_CLIENT_SECRET", ""),
+		COOKIE:        env("SPOTIFY_COOKIE", ""),
+	}}
+}
+
+func loadAppleAccounts() []AppleAccount {
+	if raw := os.Getenv("APPLE_MUSIC_ACCOUNTS"); raw != "" {
+		if accounts, err := parseAccountList[AppleAccount](raw); err == nil {
+			return accounts
+		}
+	}
+	return []AppleAccount{
+		{
+			NAMEID:             "AppleAndroid",
+			AUTH_TYPE:          "android",
+			ANDROID_AUTH_TOKEN: env("APPLE_MUSIC_ANDROID_AUTH_TOKEN", ""),
+			ANDROID_DSID:       env("APPLE_MUSIC_ANDROID_DSID", ""),
+			ANDROID_USER_AGENT: env("APPLE_MUSIC_ANDROID_USER_AGENT", "Music/6.1 Android/15 model/XiaomiPOCOF1 build/1451 (dt:66)"),
+			ANDROID_COOKIE:     env("APPLE_MUSIC_ANDROID_COOKIE", ""),
+			STOREFRONT:         env("APPLE_MUSIC_STOREFRONT", "in"),
+		},
+		{
+			NAMEID:           "AppleWeb",
+			AUTH_TYPE:        "web",
+			MUSIC_AUTH_TOKEN: env("APPLE_MUSIC_AUTH_TOKEN", ""),
+		},
+	}
+}
+
+func loadMusixmatchAccounts() []MusixmatchAccount {
+	if raw := os.Getenv("MUSIXMATCH_ACCOUNTS"); raw != "" {
+		if accounts, err := parseAccountList[MusixmatchAccount](raw); err == nil {
+			return accounts
+		}
+	}
+	return []MusixmatchAccount{{
+		NAMEID:     "Musixmatch-Guest",
+		AUTH_TYPE:  "web",
+		USER_AGENT: env("MUSIXMATCH_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"),
+		COOKIE:     env("MUSIXMATCH_COOKIE", "AWSELB=55578B011601B1EF8BC274C33F9043CA947F99DCFF0A80541772015CA2B39C35C0F9E1C932D31725A7310BCAEB0C37431E024E2B45320B7F2C84490C2C97351FDE34690157"),
+		EMAIL:      env("MUSIXMATCH_ANDROID_EMAIL", ""),
+		PASSWORD:   env("MUSIXMATCH_ANDROID_PASSWORD", ""),
+	}}
+}
+
+func loadDeezerAccounts() []DeezerAccount {
+	if raw := os.Getenv("DEEZER_ACCOUNTS"); raw != "" {
+		if accounts, err := parseAccountList[DeezerAccount](raw); err == nil {
+			return accounts
+		}
+	}
+	return []DeezerAccount{{
+		NAMEID:        "DeezerDefault",
+		AUTH_TYPE:     "refresh-token",
+		REFRESH_TOKEN: os.Getenv("DEEZER_REFRESH_TOKEN"),
+		ARL:           os.Getenv("DEEZER_ARL"),
+	}}
 }
 
 func envInt(key string, def int) int {

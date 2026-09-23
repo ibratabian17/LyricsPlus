@@ -1,6 +1,8 @@
 package orchestrator
 
 import (
+	"strings"
+
 	"lyricsplus/backend/internal/domain"
 )
 
@@ -12,25 +14,21 @@ const (
 	PriorityWord   = 3
 )
 
-// HasSyllableSync reports whether the payload contains verified syllable
-// timestamps (>=80% of lines carry one or more timestamped syllabus tokens).
+// HasSyllableSync reports whether the payload carries word/syllable sync.
 func HasSyllableSync(resp *domain.LyricsResponse) bool {
-	if resp == nil || len(resp.Lyrics) == 0 {
+	if resp == nil {
 		return false
 	}
-	total := 0
-	withSyl := 0
+	switch resp.Type {
+	case domain.SyncTypeWord, domain.SyncTypeSyllable:
+		return true
+	}
 	for _, l := range resp.Lyrics {
-		total++
 		if len(l.Syllabus) > 0 {
-			withSyl++
+			return true
 		}
 	}
-	if total == 0 {
-		return false
-	}
-	ratio := float64(withSyl) / float64(total)
-	return ratio >= 0.8
+	return false
 }
 
 // Grade evaluates a payload and returns its sync priority (0-3).
@@ -38,19 +36,20 @@ func Grade(resp *domain.LyricsResponse, source string) int {
 	if resp == nil || len(resp.Lyrics) == 0 {
 		return PriorityFailed
 	}
+
+	contains := func(s, sub string) bool { return strings.Contains(s, sub) }
+	contentTrusted := false
+	if s := strings.ToLower(source); s != "" {
+		contentTrusted = contains(s, "apple") || contains(s, "lyricsplus") || contains(s, "qaple")
+	}
+
 	switch resp.Type {
 	case domain.SyncTypeWord, domain.SyncTypeSyllable:
-		switch source {
-		case "apple", "lyricsplus", "qaple", "musixmatch":
-			if HasSyllableSync(resp) {
-				return PriorityWord
-			}
-			// Word-typed but unverified syllable data downgrades to line.
-			return PriorityLine
-		default:
+		return PriorityWord
+	case domain.SyncTypeLine:
+		if contentTrusted && HasSyllableSync(resp) {
 			return PriorityWord
 		}
-	case domain.SyncTypeLine:
 		return PriorityLine
 	case domain.SyncTypeNone, "":
 		return PriorityUnsync
