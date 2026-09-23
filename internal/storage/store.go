@@ -51,6 +51,30 @@ CREATE INDEX IF NOT EXISTS idx_lyrics_platform ON lyrics(platform_id);
 CREATE INDEX IF NOT EXISTS idx_lyrics_title_artist ON lyrics(title, artist);
 `
 
+const lyricsFTS5Setup = `
+CREATE VIRTUAL TABLE IF NOT EXISTS lyrics_fts USING fts5(
+  title,
+  artist,
+  content='lyrics',
+  content_rowid='id',
+  tokenize='unicode61 remove_diacritics 1'
+);
+
+-- Keep FTS index in sync with the main table.
+CREATE TRIGGER IF NOT EXISTS lyrics_fts_insert AFTER INSERT ON lyrics BEGIN
+  INSERT INTO lyrics_fts(rowid, title, artist) VALUES (new.id, new.title, new.artist);
+END;
+
+CREATE TRIGGER IF NOT EXISTS lyrics_fts_delete AFTER DELETE ON lyrics BEGIN
+  INSERT INTO lyrics_fts(lyrics_fts, rowid, title, artist) VALUES ('delete', old.id, old.title, old.artist);
+END;
+
+CREATE TRIGGER IF NOT EXISTS lyrics_fts_update AFTER UPDATE ON lyrics BEGIN
+  INSERT INTO lyrics_fts(lyrics_fts, rowid, title, artist) VALUES ('delete', old.id, old.title, old.artist);
+  INSERT INTO lyrics_fts(rowid, title, artist) VALUES (new.id, new.title, new.artist);
+END;
+`
+
 const storeRowColumns = "id, filename, content, isrc, platform_id, source, title, artist, duration_ms, created_at"
 const storeLightRowColumns = "id, filename, isrc, platform_id, source, title, artist, duration_ms, created_at"
 
@@ -96,14 +120,24 @@ func NewStore(cfg config.Storage) (*Store, error) {
 	exist, _ := lru.New[string, []*Row](size)
 	content, _ := lru.New[int64, []byte](size)
 
-	return &Store{
+	st := &Store{
 		cfg:        cfg,
 		db:         db,
 		exact:      exact,
 		exactTitle: exactTitle,
 		exist:      exist,
 		content:    content,
-	}, nil
+	}
+	go st.backfillFTS5()
+	return st, nil
+}
+
+func (s *Store) backfillFTS5() {
+	var count int64
+	if err := s.db.QueryRow(`SELECT count(*) FROM lyrics_fts`).Scan(&count); err == nil && count > 0 {
+		return
+	}
+	_, _ = s.db.Exec(`INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild')`)
 }
 
 func initStoreSchema(db *sql.DB) error {
@@ -117,7 +151,10 @@ func initStoreSchema(db *sql.DB) error {
 			return err
 		}
 	}
-	_, err := db.Exec(lyricsCreateTable)
+	if _, err := db.Exec(lyricsCreateTable); err != nil {
+		return err
+	}
+	_, err := db.Exec(lyricsFTS5Setup)
 	return err
 }
 
@@ -141,6 +178,7 @@ func (s *Store) GetExact(ctx context.Context, isrc, platformID string) (*Row, bo
 }
 
 // GetExisting returns rows matching the extracted keywords (title/artist LIKE).
+// Prefer GetByFTS5 for performance; this is kept as a legacy fallback.
 func (s *Store) GetExisting(ctx context.Context, keywords []string) ([]*Row, bool) {
 	var clean []string
 	for _, k := range keywords {
@@ -163,6 +201,97 @@ func (s *Store) GetExisting(ctx context.Context, keywords []string) ([]*Row, boo
 		s.exist.Add(key, rows)
 	}
 	return rows, len(rows) > 0
+}
+
+func (s *Store) GetByFTS5(ctx context.Context, title, artist string) ([]*Row, bool) {
+	title = strings.TrimSpace(title)
+	artist = strings.TrimSpace(artist)
+	if title == "" && artist == "" {
+		return nil, false
+	}
+
+	tokens := buildFTSQuery(title, artist)
+	if tokens == "" {
+		return nil, false
+	}
+
+	key := "fts5::" + tokens
+	if v, ok := s.exist.Get(key); ok {
+		return v, len(v) > 0
+	}
+
+	rows, err := s.queryFTS5(ctx, tokens)
+	if err != nil {
+		return nil, false
+	}
+	if len(rows) > 0 {
+		s.exist.Add(key, rows)
+	}
+	return rows, len(rows) > 0
+}
+
+// buildFTSQuery builds a FTS5 match expression from title and artist.
+// Each word becomes a term; all are OR-combined for broad recall.
+// The title is required (prefix on first token) and artist is optional.
+func buildFTSQuery(title, artist string) string {
+	var terms []string
+	for _, word := range strings.Fields(title) {
+		if w := sanitizeFTSToken(word); w != "" {
+			terms = append(terms, w)
+		}
+	}
+	for _, word := range strings.Fields(artist) {
+		if w := sanitizeFTSToken(word); w != "" {
+			terms = append(terms, w)
+		}
+	}
+	if len(terms) == 0 {
+		return ""
+	}
+	return strings.Join(terms, " OR ")
+}
+
+// sanitizeFTSToken removes characters that would break an FTS5 query.
+func sanitizeFTSToken(word string) string {
+	var b strings.Builder
+	for _, r := range word {
+		// Keep letters, digits, apostrophes; strip FTS5 special chars.
+		if r == '"' || r == '(' || r == ')' || r == '^' || r == '*' || r == ':' {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func (s *Store) queryFTS5(ctx context.Context, matchExpr string) ([]*Row, error) {
+	// Join FTS5 virtual table with main table via rowid to get metadata.
+	const q = `SELECT l.id, l.filename, l.isrc, l.platform_id, l.source, l.title, l.artist, l.duration_ms, l.created_at
+FROM lyrics_fts
+JOIN lyrics l ON lyrics_fts.rowid = l.id
+WHERE lyrics_fts MATCH ?
+ORDER BY rank
+LIMIT 50`
+	rows, err := s.db.QueryContext(ctx, q, matchExpr)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []*Row
+	for rows.Next() {
+		row := &Row{}
+		var createdAt int64
+		if err := rows.Scan(
+			&row.ID, &row.Filename, &row.ISRC, &row.PlatformID,
+			&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
+		); err != nil {
+			return nil, err
+		}
+		row.CreatedAt = time.UnixMilli(createdAt)
+		out = append(out, row)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) queryExact(ctx context.Context, isrc, platformID string) (*Row, error) {

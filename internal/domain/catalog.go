@@ -60,3 +60,14 @@ func (q SearchQuery) NormalizeKey() string {
 		sources,
 	}, "::")
 }
+
+func (q SearchQuery) ContentKey() string {
+	return strings.Join([]string{
+		strings.ToLower(q.Title),
+		strings.ToLower(q.Artist),
+		strings.ToLower(q.Album),
+		strconv.Itoa(q.Duration),
+		strings.ToLower(q.ISRC),
+		strings.ToLower(q.PlatformID),
+	}, "::")
+}

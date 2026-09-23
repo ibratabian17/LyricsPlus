@@ -105,3 +105,53 @@ func TestStoreConnectionPoolSettings(t *testing.T) {
 		}
 	}
 }
+
+func TestFTS5Search(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "fts5_test.db")
+	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 64})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+	ctx := context.Background()
+
+	q := domain.SearchQuery{
+		Title:  "Jadi Diri Sendiri (Kun Anta) [Bahasa/Malay Version]",
+		Artist: "Humood Alkhudher",
+	}
+	if err := st.SaveUserLyrics(ctx, q, []byte(`{"type":"line"}`)); err != nil {
+		t.Fatalf("SaveUserLyrics: %v", err)
+	}
+
+	rows, ok := st.GetByFTS5(ctx, "Jadi diri sendiri", "Humood AlKhuder")
+	if !ok || len(rows) == 0 {
+		t.Fatalf("GetByFTS5: expected hit, got ok=%v len=%d", ok, len(rows))
+	}
+	if rows[0].Artist != "Humood Alkhudher" {
+		t.Errorf("unexpected artist: %q", rows[0].Artist)
+	}
+}
+
+func TestBuildFTSQuery(t *testing.T) {
+	cases := []struct {
+		title, artist string
+		wantEmpty     bool
+	}{
+		{"Jadi diri sendiri", "Humood", false},
+		{"", "Humood", false},
+		{"", "", true},
+		// Only special FTS5 chars — no letters → empty after sanitization.
+		{`"^*(::)`, `^*"`, true},
+		// Mixed: letters survive, special chars stripped — result non-empty.
+		{`"(bad)"`, `^*`, false},
+	}
+	for _, c := range cases {
+		q := buildFTSQuery(c.title, c.artist)
+		if c.wantEmpty && q != "" {
+			t.Errorf("buildFTSQuery(%q,%q) = %q, want empty", c.title, c.artist, q)
+		}
+		if !c.wantEmpty && q == "" {
+			t.Errorf("buildFTSQuery(%q,%q) = empty, want non-empty", c.title, c.artist)
+		}
+	}
+}

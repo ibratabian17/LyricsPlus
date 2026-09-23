@@ -106,8 +106,8 @@ type rawCacheEntry struct {
 	Raw    string `json:"raw"`
 }
 
-func lyricsCacheKey(q domain.SearchQuery) string { return "lyrics::" + q.NormalizeKey() }
-func rawCacheKey(q domain.SearchQuery) string    { return "raw::" + q.NormalizeKey() }
+func lyricsCacheKey(q domain.SearchQuery) string { return "lyrics::" + q.ContentKey() }
+func rawCacheKey(q domain.SearchQuery) string    { return "raw::" + q.ContentKey() }
 
 // FetchLyrics resolves lyrics for a query, consulting the memory cache and
 // SQLite store before racing providers. Cache writes are never blocking.
@@ -309,7 +309,7 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	if s.Store == nil {
 		return nil, false
 	}
-	dbCtx, cancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	dbCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
 
 	var row *storage.Row
@@ -343,15 +343,26 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		}
 	}
 
-	// 3. Fallback: bounded keyword search if still not found
+	// 3. FTS5 full-text search (sub-ms inverted index), Go-side fuzzy scoring.
+	// Falls back to LIKE keyword scan only if FTS5 fails (e.g. table not yet populated).
 	if (row == nil || bestPrio > 0) && (q.Title != "" || q.Artist != "") {
-		keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
-		if rows, ok2 := s.Store.GetExisting(dbCtx, keywords); ok2 && len(rows) > 0 {
+		if rows, ok := s.Store.GetByFTS5(dbCtx, q.Title, q.Artist); ok && len(rows) > 0 {
 			candidates = append(candidates, rows...)
 			if matched, p := pickBestRow(rows, q); matched != nil {
 				if bestPrio == -1 || p < bestPrio {
 					row = matched
 					bestPrio = p
+				}
+			}
+		} else {
+			keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
+			if rows, ok2 := s.Store.GetExisting(dbCtx, keywords); ok2 && len(rows) > 0 {
+				candidates = append(candidates, rows...)
+				if matched, p := pickBestRow(rows, q); matched != nil {
+					if bestPrio == -1 || p < bestPrio {
+						row = matched
+						bestPrio = p
+					}
 				}
 			}
 		}
