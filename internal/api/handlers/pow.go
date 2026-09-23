@@ -181,11 +181,13 @@ func (h *Pow) isVandalism(ctx context.Context, payload submitPayload, next *doma
 		}
 	}
 	if prev == nil && strings.TrimSpace(payload.SongTitle) != "" && strings.TrimSpace(payload.SongArtist) != "" {
-		keywords := append(storage.ExtractKeywords(payload.SongTitle), storage.ExtractKeywords(payload.SongArtist)...)
-		if rows, ok := h.Store.GetExisting(ctx, keywords); ok && len(rows) > 0 {
-			var pr domain.LyricsResponse
-			if json.Unmarshal(rows[0].ContentJSON, &pr) == nil {
-				prev = &pr
+		if rows, ok := h.Store.GetByTitleArtist(ctx, payload.SongTitle, payload.SongArtist); ok && len(rows) > 0 {
+			content, err := h.Store.GetContent(ctx, rows[0].ID)
+			if err == nil && len(content) > 0 {
+				var pr domain.LyricsResponse
+				if json.Unmarshal(content, &pr) == nil {
+					prev = &pr
+				}
 			}
 		}
 	}

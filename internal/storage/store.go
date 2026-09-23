@@ -107,8 +107,8 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		return nil, fmt.Errorf("storage: open sqlite: %w", err)
 	}
 	// In WAL mode, concurrent readers do not block each other or writers.
-	db.SetMaxOpenConns(200)
-	db.SetMaxIdleConns(50)
+	db.SetMaxOpenConns(25)
+	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(time.Hour)
 	db.SetConnMaxIdleTime(10 * time.Minute)
 
@@ -134,11 +134,10 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		exist:      exist,
 		content:    content,
 	}
-	go st.backfillFTS5()
 	return st, nil
 }
 
-func (s *Store) backfillFTS5() {
+func (s *Store) BackfillFTS5() {
 	var count int64
 	if err := s.db.QueryRow(`SELECT count(*) FROM lyrics_fts`).Scan(&count); err == nil && count > 0 {
 		return
@@ -303,14 +302,10 @@ LIMIT 50`
 	return out, rows.Err()
 }
 
-func (s *Store) queryExact(ctx context.Context, isrc, platformID string) (*Row, error) {
-	const q = `SELECT ` + storeRowColumns + `
-FROM lyrics
-WHERE (isrc = ? AND isrc <> '') OR (platform_id = ? AND platform_id <> '')
-ORDER BY created_at DESC LIMIT 1`
+func (s *Store) scanSingleRow(ctx context.Context, query string, args ...any) (*Row, error) {
 	row := &Row{}
 	var createdAt int64
-	err := s.db.QueryRowContext(ctx, q, isrc, platformID).Scan(
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(
 		&row.ID, &row.Filename, &row.ContentJSON, &row.ISRC, &row.PlatformID,
 		&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
 	)
@@ -323,6 +318,20 @@ ORDER BY created_at DESC LIMIT 1`
 	row.CreatedAt = time.UnixMilli(createdAt)
 	row.ContentJSON = DecompressContent(row.ContentJSON)
 	return row, nil
+}
+
+func (s *Store) queryExact(ctx context.Context, isrc, platformID string) (*Row, error) {
+	if isrc != "" {
+		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE isrc = ? ORDER BY created_at DESC LIMIT 1`
+		if row, err := s.scanSingleRow(ctx, q, isrc); err != nil || row != nil {
+			return row, err
+		}
+	}
+	if platformID != "" {
+		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE platform_id = ? ORDER BY created_at DESC LIMIT 1`
+		return s.scanSingleRow(ctx, q, platformID)
+	}
+	return nil, nil
 }
 
 // GetExactUser returns the most recent row matching an ISRC or platform ID with source = 'lyricsplus'.
@@ -345,26 +354,17 @@ func (s *Store) GetExactUser(ctx context.Context, isrc, platformID string) (*Row
 }
 
 func (s *Store) queryExactUser(ctx context.Context, isrc, platformID string) (*Row, error) {
-	const q = `SELECT ` + storeRowColumns + `
-FROM lyrics
-WHERE ((isrc = ? AND isrc <> '') OR (platform_id = ? AND platform_id <> ''))
-  AND source = 'lyricsplus'
-ORDER BY created_at DESC LIMIT 1`
-	row := &Row{}
-	var createdAt int64
-	err := s.db.QueryRowContext(ctx, q, isrc, platformID).Scan(
-		&row.ID, &row.Filename, &row.ContentJSON, &row.ISRC, &row.PlatformID,
-		&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
+	if isrc != "" {
+		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE isrc = ? AND source = 'lyricsplus' ORDER BY created_at DESC LIMIT 1`
+		if row, err := s.scanSingleRow(ctx, q, isrc); err != nil || row != nil {
+			return row, err
+		}
 	}
-	if err != nil {
-		return nil, err
+	if platformID != "" {
+		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE platform_id = ? AND source = 'lyricsplus' ORDER BY created_at DESC LIMIT 1`
+		return s.scanSingleRow(ctx, q, platformID)
 	}
-	row.CreatedAt = time.UnixMilli(createdAt)
-	row.ContentJSON = DecompressContent(row.ContentJSON)
-	return row, nil
+	return nil, nil
 }
 
 // GetByTitleArtist returns rows matching title and artist using idx_lyrics_title_artist index.

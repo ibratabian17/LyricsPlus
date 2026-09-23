@@ -104,9 +104,8 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 				row = matchBestUserRow(rows, q)
 			}
 		}
-		if row == nil && (q.Title != "" && q.Artist != "") {
-			keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
-			if rows, ok := st.GetExisting(ctx, keywords); ok && len(rows) > 0 {
+		if row == nil && (q.Title != "" || q.Artist != "") {
+			if rows, ok := st.GetByFTS5(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
 				row = matchBestUserRow(rows, q)
 			}
 		}
