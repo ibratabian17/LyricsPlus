@@ -10,6 +10,7 @@ import (
 
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/logger"
+	"lyricsplus/backend/internal/metrics"
 )
 
 var errUnavailable = errors.New("provider unavailable")
@@ -113,6 +114,7 @@ func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery)
 		res.Status = "BAD"
 	}
 	r.record(name, res.Status, elapsed.Milliseconds())
+	metrics.Default.RecordProviderCall(name, res.Status, elapsed.Milliseconds())
 	switch res.Status {
 	case "OK":
 		r.debugf("source %s OK priority=%d lines=%d took=%s", name, res.Priority, len(resp.Lyrics), elapsed.Round(time.Millisecond))

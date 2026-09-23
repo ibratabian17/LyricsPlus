@@ -13,6 +13,7 @@ import (
 	"lyricsplus/backend/internal/api/openapi"
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/logger"
+	"lyricsplus/backend/internal/metrics"
 	"lyricsplus/backend/internal/orchestrator"
 	"lyricsplus/backend/internal/providers"
 	"lyricsplus/backend/internal/providers/lyricsplus"
@@ -53,6 +54,36 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 	providerSet, err := factory.BuildSet()
 	if err != nil {
 		return nil, err
+	}
+
+	// Register platforms for live health and status monitoring
+	if providerSet.AppleMusic != nil {
+		metrics.Default.RegisterPlatform("apple", "Apple Music", providerSet.AppleMusic.Configured, "Apple Music API Availability")
+	}
+	if providerSet.Spotify != nil {
+		metrics.Default.RegisterPlatform("spotify", "Spotify", providerSet.Spotify.Configured, "Spotify Web API Availability")
+	}
+	if providerSet.Musixmatch != nil {
+		metrics.Default.RegisterPlatform("musixmatch", "Musixmatch", providerSet.Musixmatch.Configured, "Musixmatch API Availability")
+	}
+	if providerSet.Deezer != nil {
+		metrics.Default.RegisterPlatform("deezer", "Deezer", providerSet.Deezer.Configured, "Deezer API Availability")
+	}
+	if providerSet.QQMusic != nil {
+		metrics.Default.RegisterPlatform("qq", "QQ Music", providerSet.QQMusic.Configured, "QQ Music QRC API Availability")
+	}
+	if providerSet.LyricsPlus != nil {
+		metrics.Default.RegisterPlatform("lyricsplus", "Lyrics+", providerSet.LyricsPlus.Configured, "LyricsPlus User Store Availability")
+	}
+	if gdrive != nil {
+		metrics.Default.RegisterPlatform("gdrive", "Google Drive", gdrive.IsConfigured, "Google Drive Storage Availability")
+	}
+	if store != nil {
+		metrics.Default.RegisterPlatform("database", "LyricsDB", func() bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			return store.Ping(ctx) == nil
+		}, "Local LyricsPlus UGC + Cache Database Availability")
 	}
 
 	racer := orchestrator.NewRacer(toOrchestratorSources(providerSet.Sources), cfg.Provider.Timeout, orchestrator.WithLogger(lg))

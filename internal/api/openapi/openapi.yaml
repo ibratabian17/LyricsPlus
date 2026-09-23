@@ -461,6 +461,46 @@ components:
         database:
           type: string
           enum: [ok, unavailable, not_configured]
+        requests:
+          type: object
+          properties:
+            total: { type: integer }
+            success: { type: integer }
+            failed: { type: integer }
+            successRatePercent: { type: number }
+            failureRatePercent: { type: number }
+            statusCodes:
+              type: object
+              additionalProperties: { type: integer }
+        lyrics:
+          type: object
+          properties:
+            totalLookups: { type: integer }
+            found: { type: integer }
+            notFound: { type: integer }
+            successRatePercent: { type: number }
+            cacheHits:
+              type: object
+              additionalProperties: { type: integer }
+            winnerDistribution:
+              type: object
+              additionalProperties: { type: integer }
+        platforms:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              name: { type: string }
+              active: { type: boolean }
+              status: { type: string }
+              totalCalls: { type: integer }
+              successCalls: { type: integer }
+              failedCalls: { type: integer }
+              rtoCalls: { type: integer }
+              successRatePercent: { type: number }
+              lastStatus: { type: string }
+              lastSeenAt: { type: string }
+              details: { type: string }
     Agent:
       type: object
       properties:

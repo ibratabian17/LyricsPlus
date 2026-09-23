@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"time"
 
+	"lyricsplus/backend/internal/metrics"
 	"lyricsplus/backend/internal/version"
 )
 
@@ -54,6 +55,8 @@ func (h *Health) write(w http.ResponseWriter, r *http.Request, ready bool) {
 		dbStatus = "not_configured"
 	}
 
+	report := metrics.Default.Snapshot()
+
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, code, map[string]interface{}{
 		"service":       "lyricsplus-backend",
@@ -63,5 +66,8 @@ func (h *Health) write(w http.ResponseWriter, r *http.Request, ready bool) {
 		"buildDate":     version.BuildDate,
 		"uptimeSeconds": int64(time.Since(h.Started).Seconds()),
 		"database":      dbStatus,
+		"requests":      report.Requests,
+		"lyrics":        report.Lyrics,
+		"platforms":     report.Platforms,
 	})
 }

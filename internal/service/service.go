@@ -10,6 +10,7 @@ import (
 
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/logger"
+	"lyricsplus/backend/internal/metrics"
 	"lyricsplus/backend/internal/orchestrator"
 	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/similarity"
@@ -116,19 +117,25 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 	if !forceReload {
 		if resp, ok := s.fromMemory(ctx, q); ok {
 			decorateCacheHit(resp, q, preferredSources, time.Since(start))
+			winner := providerNameForSource(resp.Metadata.Source)
+			metrics.Default.RecordLyricsLookup(winner, "memory", true)
 			return resp, nil
 		}
 		if resp, ok := s.fromStore(ctx, q); ok {
 			decorateCacheHit(resp, q, preferredSources, time.Since(start))
+			winner := providerNameForSource(resp.Metadata.Source)
+			metrics.Default.RecordLyricsLookup(winner, "database", true)
 			return resp, nil
 		}
 	}
 
 	res, err := s.Dedup.Get(ctx, q, preferredSources)
 	if err != nil {
+		metrics.Default.RecordLyricsLookup("", "", false)
 		return nil, err
 	}
 	if res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
+		metrics.Default.RecordLyricsLookup("", "", false)
 		return nil, s.buildNotFound(q, preferredSources, res, time.Since(start))
 	}
 
@@ -203,6 +210,7 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 	}
 
 	s.cacheResponse(ctx, q, resp, res.Source)
+	metrics.Default.RecordLyricsLookup(res.Source, "none", true)
 	return resp, nil
 }
 

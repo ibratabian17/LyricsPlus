@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"lyricsplus/backend/internal/logger"
+	"lyricsplus/backend/internal/metrics"
 )
 
 type ctxKey int
@@ -62,6 +63,7 @@ func Tracing(l *logger.Logger) func(http.Handler) http.Handler {
 			start := time.Now()
 			sw := &statusWriter{ResponseWriter: w, status: 200}
 			next.ServeHTTP(sw, r.WithContext(ctx))
+			metrics.Default.RecordHTTPRequest(sw.status)
 			l.Debug("request",
 				slog.String("id", id),
 				slog.String("method", r.Method),
