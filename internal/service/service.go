@@ -49,6 +49,9 @@ func decorateCacheHit(resp *domain.LyricsResponse, q domain.SearchQuery, preferr
 	if resp == nil {
 		return
 	}
+	if resp.Cached == "" || resp.Cached == domain.CacheNone {
+		resp.Cached = domain.CacheDatabase
+	}
 	if resp.ProcessingTime == nil {
 		resp.ProcessingTime = &domain.ProcessTiming{}
 	}
@@ -150,6 +153,9 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 	resp.ProcessingTime = buildProcessTiming(res, q, now.UnixMilli())
 	if resp.KpoeTools == "" {
 		resp.KpoeTools = "lyricsplus"
+	}
+	if resp.Cached == "" {
+		resp.Cached = domain.CacheNone
 	}
 
 	// Fire-and-forget persistence: never block the HTTP response.

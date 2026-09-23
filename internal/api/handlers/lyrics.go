@@ -252,6 +252,7 @@ func (h *Lyrics) GetTTML(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", cacheControlPublic)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ttml":           string(xmlData),
+		"cached":         resp.Cached,
 		"processingTime": resp.ProcessingTime,
 	})
 }
