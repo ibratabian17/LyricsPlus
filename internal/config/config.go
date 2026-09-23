@@ -307,7 +307,7 @@ func Load(customPaths ...string) Config {
 			FolderQQ:          parseFolderIDs(os.Getenv("GDRIVE_CACHED_QQ"), ""),
 			FolderDeezer:      parseFolderIDs(os.Getenv("GDRIVE_CACHED_DEEZER"), ""),
 			FolderBackup:      parseFolderIDs(os.Getenv("GDRIVE_BACKUP_FOLDER"), ""),
-			DailyDumpEnabled:  envBool("DAILY_DUMP_ENABLED", true),
+			DailyDumpEnabled:  envBool("DAILY_DUMP_ENABLED", false),
 			DailyDumpInterval: time.Duration(envInt("DAILY_DUMP_INTERVAL_HOURS", 24)) * time.Hour,
 			DailyDumpDir:      env("DAILY_DUMP_DIR", "data/dumps"),
 		},

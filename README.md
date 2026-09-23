@@ -65,7 +65,7 @@ All configuration is environment-driven with sensible defaults (see
 | `MAX_BODY_BYTES` | `1048576` | Submit body limit (`413`) |
 | `SQLITE_PATH` | `database/lyrics_cache.db` | Lyric cache DB location |
 | `GDRIVE_ENABLED` | `true` | Google Drive caching/sync on start |
-| `DAILY_DUMP_ENABLED` | `true` | Periodic DB snapshot + GDrive upload |
+| `DAILY_DUMP_ENABLED` | `false` | Periodic DB snapshot + GDrive upload |
 
 Provider credentials (Spotify, Musixmatch, Apple, QQ, Deezer) are read from
 their matching `*_COOKIE` / `_TOKEN` / `_ID` environment variables; leave unset
