@@ -99,7 +99,7 @@ func NewStore(cfg config.Storage) (*Store, error) {
 	}
 
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-4000)&_pragma=mmap_size(2147483648)&_pragma=temp_store(MEMORY)",
+		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-32768)&_pragma=mmap_size(1073741824)&_pragma=temp_store(MEMORY)",
 		path,
 	)
 	db, err := sql.Open("sqlite", dsn)
@@ -107,8 +107,8 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		return nil, fmt.Errorf("storage: open sqlite: %w", err)
 	}
 	// In WAL mode, concurrent readers do not block each other or writers.
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(10)
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(time.Hour)
 	db.SetConnMaxIdleTime(10 * time.Minute)
 
@@ -238,25 +238,34 @@ func (s *Store) GetByFTS5(ctx context.Context, title, artist string) ([]*Row, bo
 	return rows, len(rows) > 0
 }
 
-// buildFTSQuery builds a FTS5 match expression from title and artist.
-// Each word becomes a term; all are OR-combined for broad recall.
-// The title is required (prefix on first token) and artist is optional.
+// buildFTSQuery builds a fast, targeted FTS5 match expression from title and artist.
+// It leverages exact phrase and prefix matching to perform sub-millisecond lookups.
 func buildFTSQuery(title, artist string) string {
-	var terms []string
-	for _, word := range strings.Fields(title) {
-		if w := sanitizeFTSToken(word); w != "" {
-			terms = append(terms, w)
-		}
-	}
-	for _, word := range strings.Fields(artist) {
-		if w := sanitizeFTSToken(word); w != "" {
-			terms = append(terms, w)
-		}
-	}
-	if len(terms) == 0 {
+	cleanTitle := sanitizeFTSToken(title)
+	cleanArtist := sanitizeFTSToken(artist)
+
+	if cleanTitle == "" && cleanArtist == "" {
 		return ""
 	}
-	return strings.Join(terms, " OR ")
+
+	var clauses []string
+
+	// 1. Exact phrase match on title
+	if cleanTitle != "" {
+		clauses = append(clauses, fmt.Sprintf(`title: "%s"`, cleanTitle))
+		if strings.Contains(cleanTitle, " ") {
+			clauses = append(clauses, fmt.Sprintf(`title: "%s"*`, cleanTitle))
+		}
+	}
+
+	// 2. Phrase combination of title + artist
+	if cleanTitle != "" && cleanArtist != "" {
+		clauses = append(clauses, fmt.Sprintf(`(title: "%s" AND artist: "%s")`, cleanTitle, cleanArtist))
+	} else if cleanArtist != "" {
+		clauses = append(clauses, fmt.Sprintf(`artist: "%s"`, cleanArtist))
+	}
+
+	return strings.Join(clauses, " OR ")
 }
 
 // sanitizeFTSToken removes characters that would break an FTS5 query.
@@ -264,7 +273,7 @@ func sanitizeFTSToken(word string) string {
 	var b strings.Builder
 	for _, r := range word {
 		// Keep letters, digits, apostrophes; strip FTS5 special chars.
-		if r == '"' || r == '(' || r == ')' || r == '^' || r == '*' || r == ':' {
+		if r == '"' || r == '(' || r == ')' || r == '^' || r == '*' || r == ':' || r == '{' || r == '}' || r == '[' || r == ']' {
 			continue
 		}
 		b.WriteRune(r)
@@ -278,8 +287,7 @@ func (s *Store) queryFTS5(ctx context.Context, matchExpr string) ([]*Row, error)
 FROM lyrics_fts
 JOIN lyrics l ON lyrics_fts.rowid = l.id
 WHERE lyrics_fts MATCH ?
-ORDER BY rank
-LIMIT 50`
+LIMIT 30`
 	rows, err := s.db.QueryContext(ctx, q, matchExpr)
 	if err != nil {
 		return nil, err
@@ -322,13 +330,13 @@ func (s *Store) scanSingleRow(ctx context.Context, query string, args ...any) (*
 
 func (s *Store) queryExact(ctx context.Context, isrc, platformID string) (*Row, error) {
 	if isrc != "" {
-		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE isrc = ? ORDER BY created_at DESC LIMIT 1`
+		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE isrc = ? LIMIT 1`
 		if row, err := s.scanSingleRow(ctx, q, isrc); err != nil || row != nil {
 			return row, err
 		}
 	}
 	if platformID != "" {
-		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE platform_id = ? ORDER BY created_at DESC LIMIT 1`
+		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE platform_id = ? LIMIT 1`
 		return s.scanSingleRow(ctx, q, platformID)
 	}
 	return nil, nil
@@ -355,13 +363,13 @@ func (s *Store) GetExactUser(ctx context.Context, isrc, platformID string) (*Row
 
 func (s *Store) queryExactUser(ctx context.Context, isrc, platformID string) (*Row, error) {
 	if isrc != "" {
-		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE isrc = ? AND source = 'lyricsplus' ORDER BY created_at DESC LIMIT 1`
+		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE isrc = ? AND source = 'lyricsplus' LIMIT 1`
 		if row, err := s.scanSingleRow(ctx, q, isrc); err != nil || row != nil {
 			return row, err
 		}
 	}
 	if platformID != "" {
-		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE platform_id = ? AND source = 'lyricsplus' ORDER BY created_at DESC LIMIT 1`
+		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE platform_id = ? AND source = 'lyricsplus' LIMIT 1`
 		return s.scanSingleRow(ctx, q, platformID)
 	}
 	return nil, nil
@@ -392,7 +400,7 @@ func (s *Store) queryTitleArtist(ctx context.Context, title, artist string) ([]*
 	const q = `SELECT ` + storeLightRowColumns + `
 FROM lyrics
 WHERE title = ? AND artist = ?
-ORDER BY created_at DESC LIMIT 10`
+LIMIT 10`
 	rows, err := s.db.QueryContext(ctx, q, title, artist)
 	if err != nil {
 		return nil, err

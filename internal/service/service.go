@@ -362,7 +362,6 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	}
 
 	// 3. FTS5 full-text search (sub-ms inverted index), Go-side fuzzy scoring.
-	// Falls back to LIKE keyword scan only if FTS5 fails (e.g. table not yet populated).
 	if (row == nil || bestPrio > 0) && (q.Title != "" || q.Artist != "") {
 		if rows, ok := s.Store.GetByFTS5(dbCtx, q.Title, q.Artist); ok && len(rows) > 0 {
 			candidates = append(candidates, rows...)
@@ -370,17 +369,6 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 				if bestPrio == -1 || p < bestPrio {
 					row = matched
 					bestPrio = p
-				}
-			}
-		} else {
-			keywords := append(storage.ExtractKeywords(q.Title), storage.ExtractKeywords(q.Artist)...)
-			if rows, ok2 := s.Store.GetExisting(dbCtx, keywords); ok2 && len(rows) > 0 {
-				candidates = append(candidates, rows...)
-				if matched, p := pickBestRow(rows, q); matched != nil {
-					if bestPrio == -1 || p < bestPrio {
-						row = matched
-						bestPrio = p
-					}
 				}
 			}
 		}
