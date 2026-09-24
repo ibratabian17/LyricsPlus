@@ -87,9 +87,6 @@ func NewAppleMusicWithConfig(client *proxy.Client, cfg config.Provider) *AppleMu
 		if accounts[i].ANDROID_USER_AGENT == "" {
 			accounts[i].ANDROID_USER_AGENT = "Music/6.1 Android/16 model/RealmeGT2Pro build/1472 (dt:66)"
 		}
-		if accounts[i].STOREFRONT == "" {
-			accounts[i].STOREFRONT = "in"
-		}
 	}
 	return &AppleMusicProvider{
 		client: client,
@@ -472,28 +469,30 @@ func (p *AppleMusicProvider) GetStorefront(ctx context.Context) (string, error) 
 		return p.cachedStorefront, nil
 	}
 
-	// An android account's STOREFRONT is used directly; otherwise it's
-	// fetched from the /me/storefront endpoint.
 	current, ok := p.mgm.First()
-	if ok && (strings.EqualFold(current.AUTH_TYPE, "android") || current.AUTH_TYPE == "") && current.STOREFRONT != "" {
-		p.cachedStorefront = current.STOREFRONT
-		return p.cachedStorefront, nil
-	}
+	if ok {
+		if current.STOREFRONT != "" {
+			p.cachedStorefront = current.STOREFRONT
+			return p.cachedStorefront, nil
+		}
 
-	headers, err := p.getAuthHeaders(ctx, 0)
-	if err == nil {
-		resp, err := p.client.Get(ctx, "https://api.music.apple.com/v1/me/storefront", headers)
-		if err == nil {
-			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode == http.StatusOK {
-				var sfResp struct {
-					Data []struct {
-						ID string `json:"id"`
-					} `json:"data"`
-				}
-				if json.NewDecoder(resp.Body).Decode(&sfResp) == nil && len(sfResp.Data) > 0 {
-					p.cachedStorefront = sfResp.Data[0].ID
-					return p.cachedStorefront, nil
+		if strings.EqualFold(current.AUTH_TYPE, "web") {
+			headers, err := p.getAuthHeaders(ctx, 0)
+			if err == nil {
+				resp, err := p.client.Get(ctx, "https://api.music.apple.com/v1/me/storefront", headers)
+				if err == nil {
+					defer func() { _ = resp.Body.Close() }()
+					if resp.StatusCode == http.StatusOK {
+						var sfResp struct {
+							Data []struct {
+								ID string `json:"id"`
+							} `json:"data"`
+						}
+						if json.NewDecoder(resp.Body).Decode(&sfResp) == nil && len(sfResp.Data) > 0 {
+							p.cachedStorefront = sfResp.Data[0].ID
+							return p.cachedStorefront, nil
+						}
+					}
 				}
 			}
 		}
