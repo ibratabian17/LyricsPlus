@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"lyricsplus/backend/internal/config"
 )
@@ -792,4 +793,198 @@ func mustMarshal(v any) json.RawMessage {
 func mustMarshalJSON(v any) json.RawMessage {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// ConvertEnvToJSON reads configuration from a .env file and writes a structured JSON configuration file.
+func ConvertEnvToJSON(envPath, jsonPath string) error {
+	if envPath == "" {
+		envPath = ".env"
+	}
+	if jsonPath == "" {
+		jsonPath = "config.json"
+	}
+
+	cfg := config.Load(envPath)
+
+	type ServerConfig struct {
+		Port              string   `json:"port"`
+		MaxConcurrency    int      `json:"max_concurrency,omitempty"`
+		MaxURLBytes       int      `json:"max_url_bytes,omitempty"`
+		MaxQueryParams    int      `json:"max_query_params,omitempty"`
+		MaxQueryValueLen  int      `json:"max_query_value_len,omitempty"`
+		ProxyEnabled      bool     `json:"proxy_enabled"`
+		ProxyURL          string   `json:"proxy_url,omitempty"`
+		ProxyURLs         []string `json:"proxy_urls,omitempty"`
+		ProxyTokenHeader  string   `json:"proxy_token_header,omitempty"`
+		ProxyToken        string   `json:"proxy_token,omitempty"`
+		ShutdownTimeoutMS int64    `json:"shutdown_timeout_ms,omitempty"`
+	}
+
+	type GDriveConfig struct {
+		Enabled           bool                   `json:"enabled"`
+		Accounts          []config.GDriveAccount `json:"accounts,omitempty"`
+		Folders           map[string]string      `json:"folders,omitempty"`
+		DailyDumpEnabled  bool                   `json:"daily_dump_enabled,omitempty"`
+		DailyDumpInterval int                    `json:"daily_dump_interval_hours,omitempty"`
+		DailyDumpDir      string                 `json:"daily_dump_dir,omitempty"`
+	}
+
+	type ProviderConfig struct {
+		TimeoutMS          int64                      `json:"timeout_ms,omitempty"`
+		SpotifySecretsURL  string                     `json:"spotify_secrets_url,omitempty"`
+		SpotifyAccounts    []config.SpotifyAccount    `json:"spotify_accounts,omitempty"`
+		AppleAccounts      []config.AppleAccount      `json:"apple_music_accounts,omitempty"`
+		MusixmatchAccounts []config.MusixmatchAccount `json:"musixmatch_accounts,omitempty"`
+		DeezerAccounts     []config.DeezerAccount     `json:"deezer_accounts,omitempty"`
+		QQCookie           string                     `json:"qq_cookie,omitempty"`
+	}
+
+	type LyricsPlusConfig struct {
+		JWTSecret        string `json:"jwt_secret"`
+		ChallengeTTLMS   int64  `json:"challenge_ttl_ms,omitempty"`
+		PoWDifficulty    int    `json:"pow_difficulty,omitempty"`
+		MaxBodyBytes     int64  `json:"max_body_bytes,omitempty"`
+		AcceptVandalism  bool   `json:"accept_vandalism"`
+		AllowSubmissions bool   `json:"allow_submissions"`
+	}
+
+	type RateLimitConfig struct {
+		Requests int   `json:"requests,omitempty"`
+		WindowMS int64 `json:"window_ms,omitempty"`
+	}
+
+	type StorageConfig struct {
+		SQLitePath              string `json:"sqlite_path,omitempty"`
+		LRUSize                 int    `json:"lru_size,omitempty"`
+		ContentCacheBytes       int64  `json:"content_cache_bytes,omitempty"`
+		ExactTTLMS              int64  `json:"exact_ttl_ms,omitempty"`
+		ExistingTTLMS           int64  `json:"existing_ttl_ms,omitempty"`
+		NegativeTTLMS           int64  `json:"negative_ttl_ms,omitempty"`
+		CircuitBreakerThreshold int    `json:"circuit_breaker_threshold,omitempty"`
+		CircuitBreakerCooldown  int64  `json:"circuit_breaker_cooldown_ms,omitempty"`
+	}
+
+	type CacheConfig struct {
+		MaxEntries         int   `json:"max_entries,omitempty"`
+		MaxBytes           int64 `json:"max_bytes,omitempty"`
+		MaxBodyBytes       int64 `json:"max_body_bytes,omitempty"`
+		MemoryWatchdogByte int64 `json:"memory_watchdog_bytes,omitempty"`
+	}
+
+	type LoggerConfig struct {
+		Enabled bool   `json:"enabled"`
+		Level   string `json:"level,omitempty"`
+		Format  string `json:"format,omitempty"`
+	}
+
+	folders := make(map[string]string)
+	if len(cfg.GDrive.FolderUserTML) > 0 {
+		folders["user_tml"] = strings.Join(cfg.GDrive.FolderUserTML, ",")
+	}
+	if len(cfg.GDrive.FolderTTML) > 0 {
+		folders["ttml"] = strings.Join(cfg.GDrive.FolderTTML, ",")
+	}
+	if len(cfg.GDrive.FolderSpotify) > 0 {
+		folders["spotify"] = strings.Join(cfg.GDrive.FolderSpotify, ",")
+	}
+	if len(cfg.GDrive.FolderMusixmatch) > 0 {
+		folders["musixmatch"] = strings.Join(cfg.GDrive.FolderMusixmatch, ",")
+	}
+	if len(cfg.GDrive.FolderQQ) > 0 {
+		folders["qq"] = strings.Join(cfg.GDrive.FolderQQ, ",")
+	}
+	if len(cfg.GDrive.FolderDeezer) > 0 {
+		folders["deezer"] = strings.Join(cfg.GDrive.FolderDeezer, ",")
+	}
+	if len(cfg.GDrive.FolderBackup) > 0 {
+		folders["backup"] = strings.Join(cfg.GDrive.FolderBackup, ",")
+	}
+
+	doc := struct {
+		Server     ServerConfig     `json:"server"`
+		GDrive     GDriveConfig     `json:"gdrive"`
+		Provider   ProviderConfig   `json:"provider"`
+		LyricsPlus LyricsPlusConfig `json:"lyricsplus"`
+		RateLimit  RateLimitConfig  `json:"rate_limit"`
+		Storage    StorageConfig    `json:"storage"`
+		Cache      CacheConfig      `json:"cache"`
+		Logger     LoggerConfig     `json:"logger"`
+	}{
+		Server: ServerConfig{
+			Port:              cfg.Server.Addr,
+			MaxConcurrency:    cfg.Server.MaxConcurrency,
+			MaxURLBytes:       cfg.Server.MaxURLBytes,
+			MaxQueryParams:    cfg.Server.MaxQueryParams,
+			MaxQueryValueLen:  cfg.Server.MaxQueryValueLen,
+			ProxyEnabled:      cfg.Server.Proxy.Enabled,
+			ProxyURL:          cfg.Server.Proxy.URL,
+			ProxyURLs:         cfg.Server.Proxy.URLs,
+			ProxyTokenHeader:  cfg.Server.Proxy.TokenHeader,
+			ProxyToken:        cfg.Server.Proxy.Token,
+			ShutdownTimeoutMS: cfg.Server.ShutdownTimeout.Milliseconds(),
+		},
+		GDrive: GDriveConfig{
+			Enabled:           cfg.GDrive.Enabled,
+			Accounts:          cfg.GDrive.Accounts,
+			Folders:           folders,
+			DailyDumpEnabled:  cfg.GDrive.DailyDumpEnabled,
+			DailyDumpInterval: int(cfg.GDrive.DailyDumpInterval / time.Hour),
+			DailyDumpDir:      cfg.GDrive.DailyDumpDir,
+		},
+		Provider: ProviderConfig{
+			TimeoutMS:          cfg.Provider.Timeout.Milliseconds(),
+			SpotifySecretsURL:  cfg.Provider.SpotifySecretsURL,
+			SpotifyAccounts:    cfg.Provider.SpotifyAccounts,
+			AppleAccounts:      cfg.Provider.AppleAccounts,
+			MusixmatchAccounts: cfg.Provider.MusixmatchAccounts,
+			DeezerAccounts:     cfg.Provider.DeezerAccounts,
+			QQCookie:           cfg.Provider.QQCookie,
+		},
+		LyricsPlus: LyricsPlusConfig{
+			JWTSecret:        cfg.LyricsPlus.JWTSecret,
+			ChallengeTTLMS:   cfg.LyricsPlus.ChallengeTTL.Milliseconds(),
+			PoWDifficulty:    cfg.LyricsPlus.PoWDifficulty,
+			MaxBodyBytes:     cfg.LyricsPlus.MaxBodyBytes,
+			AcceptVandalism:  cfg.LyricsPlus.AcceptVandalism,
+			AllowSubmissions: cfg.LyricsPlus.AllowSubmissions,
+		},
+		RateLimit: RateLimitConfig{
+			Requests: cfg.RateLimit.Requests,
+			WindowMS: cfg.RateLimit.Window.Milliseconds(),
+		},
+		Storage: StorageConfig{
+			SQLitePath:              cfg.Storage.DBPath,
+			LRUSize:                 cfg.Storage.LRUSize,
+			ContentCacheBytes:       cfg.Storage.ContentCacheBytes,
+			ExactTTLMS:              cfg.Storage.ExactTTL.Milliseconds(),
+			ExistingTTLMS:           cfg.Storage.ExistingTTL.Milliseconds(),
+			NegativeTTLMS:           cfg.Storage.NegativeTTL.Milliseconds(),
+			CircuitBreakerThreshold: cfg.Storage.CircuitBreakerThreshold,
+			CircuitBreakerCooldown:  cfg.Storage.CircuitBreakerCooldown.Milliseconds(),
+		},
+		Cache: CacheConfig{
+			MaxEntries:         cfg.Cache.MaxEntries,
+			MaxBytes:           cfg.Cache.MaxBytes,
+			MaxBodyBytes:       cfg.Cache.MaxBodyBytes,
+			MemoryWatchdogByte: cfg.Cache.MemoryWatchdogByte,
+		},
+		Logger: LoggerConfig{
+			Enabled: cfg.Logger.Enabled,
+			Level:   cfg.Logger.Level,
+			Format:  cfg.Logger.Format,
+		},
+	}
+
+	dir := filepath.Dir(jsonPath)
+	if dir != "" && dir != "." {
+		_ = os.MkdirAll(dir, 0755)
+	}
+
+	formatted, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal json: %w", err)
+	}
+	formatted = append(formatted, '\n')
+
+	return os.WriteFile(jsonPath, formatted, 0644)
 }

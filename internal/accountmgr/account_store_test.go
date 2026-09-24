@@ -264,3 +264,52 @@ func TestExtractSpDc(t *testing.T) {
 		t.Errorf("expected single token unchanged, got %q", ExtractSpDc(single))
 	}
 }
+
+func TestConvertEnvToJSON(t *testing.T) {
+	tmpDir := t.TempDir()
+	envPath := filepath.Join(tmpDir, ".env")
+	jsonPath := filepath.Join(tmpDir, "config.json")
+
+	envContent := `
+PORT=8080
+SPOTIFY_ACCOUNTS='[{"NAMEID":"spotify-converted","CLIENT_ID":"cid-123","COOKIE":"sp_dc=cook"}]'
+APPLE_MUSIC_ACCOUNTS='[{"NAMEID":"apple-converted","AUTH_TYPE":"android","ANDROID_AUTH_TOKEN":"tok","STOREFRONT":"in"}]'
+`
+	if err := os.WriteFile(envPath, []byte(envContent), 0644); err != nil {
+		t.Fatalf("write temp .env: %v", err)
+	}
+
+	if err := ConvertEnvToJSON(envPath, jsonPath); err != nil {
+		t.Fatalf("ConvertEnvToJSON failed: %v", err)
+	}
+
+	// Verify the output JSON file
+	data, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read converted json: %v", err)
+	}
+
+	var parsed struct {
+		Server struct {
+			Port string `json:"port"`
+		} `json:"server"`
+		Provider struct {
+			SpotifyAccounts []config.SpotifyAccount `json:"spotify_accounts"`
+			AppleAccounts   []config.AppleAccount   `json:"apple_music_accounts"`
+		} `json:"provider"`
+	}
+
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("parse converted json: %v", err)
+	}
+
+	if parsed.Server.Port != "8080" {
+		t.Errorf("expected port 8080, got %s", parsed.Server.Port)
+	}
+	if len(parsed.Provider.SpotifyAccounts) != 1 || parsed.Provider.SpotifyAccounts[0].NAMEID != "spotify-converted" {
+		t.Errorf("spotify accounts not converted properly: %+v", parsed.Provider.SpotifyAccounts)
+	}
+	if len(parsed.Provider.AppleAccounts) != 1 || parsed.Provider.AppleAccounts[0].NAMEID != "apple-converted" {
+		t.Errorf("apple accounts not converted properly: %+v", parsed.Provider.AppleAccounts)
+	}
+}

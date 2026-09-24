@@ -5,13 +5,16 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 
 	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 
 	"lyricsplus/backend/internal/accountmgr"
 	"lyricsplus/backend/internal/config"
@@ -44,15 +47,36 @@ func main() {
 	var (
 		filePath    string
 		interactive bool
+		convert     bool
+		convertOut  string
 	)
 
 	flag.StringVar(&filePath, "file", "", "Path to auth.json, config.json, or .env (defaults to auto-discovery)")
 	flag.StringVar(&filePath, "f", "", "Alias for --file")
+	flag.BoolVar(&convert, "convert", false, "Convert source .env to structured config.json")
+	flag.StringVar(&convertOut, "out", "", "Output JSON path when using --convert (default: config.json)")
 	flag.BoolVar(&interactive, "i", false, "Force interactive mode")
 	flag.Usage = func() { printUsage(os.Stderr) }
 	flag.Parse()
 
 	targetFile := accountmgr.FindConfigFile(filePath)
+
+	if convert {
+		targetJSON := convertOut
+		if targetJSON == "" {
+			targetJSON = "config.json"
+		}
+		srcFile := targetFile
+		if srcFile == "" {
+			srcFile = ".env"
+		}
+		if err := accountmgr.ConvertEnvToJSON(srcFile, targetJSON); err != nil {
+			fatal("convert %s -> %s: %v", srcFile, targetJSON, err)
+		}
+		fmt.Printf("%s%s✓ Converted %s -> %s successfully!%s\n", colorGreen, colorBold, srcFile, targetJSON, colorReset)
+		return
+	}
+
 	store, err := accountmgr.LoadStore(targetFile)
 	if err != nil {
 		fatal("error loading config %s: %v", targetFile, err)
@@ -65,7 +89,6 @@ func main() {
 		if isPipe() {
 			fatal("interactive mode needs a terminal; use subcommands (e.g. \"account_manager list\")")
 		}
-		ap.reader = bufio.NewReader(os.Stdin)
 		ap.run()
 		return
 	}
@@ -99,6 +122,7 @@ Usage:
                                                 Update any subset of fields
   account_manager remove <provider> <name>      Remove an account
   account_manager test [provider] [name]        Live health-check credentials
+  account_manager convert [target_file]         Convert .env to config.json
 
 Provider fields (add/edit):
   spotify:    --name --cookie --client-id --client-secret
@@ -112,6 +136,8 @@ Provider fields (add/edit):
 
 Flags:
   -f, --file <path>   Specify config auth.json / config.json / .env (auto-discovers)
+  --convert           Convert source .env to structured config.json
+  --out <path>        Target JSON output path for conversion (default: config.json)
   -i                  Force interactive mode
 `, strings.Join(providerKinds, ", "))
 }
@@ -431,7 +457,7 @@ func emptyOr(v, def string) string {
 
 type app struct {
 	store    *accountmgr.Store
-	reader   *bufio.Reader
+	reader   io.Reader
 	statuses map[string]accountmgr.TestResult // live test results (interactive)
 }
 
@@ -915,6 +941,21 @@ func (ap *app) runCLI(args []string) error {
 		ap.test(provider, name)
 		return nil
 
+	case "convert":
+		targetJSON := "config.json"
+		if len(args) > 1 {
+			targetJSON = args[1]
+		}
+		srcFile := ap.store.FilePath()
+		if srcFile == "" {
+			srcFile = ".env"
+		}
+		if err := accountmgr.ConvertEnvToJSON(srcFile, targetJSON); err != nil {
+			return fmt.Errorf("convert %s -> %s: %w", srcFile, targetJSON, err)
+		}
+		fmt.Printf("%s%s✓ Converted %s -> %s successfully!%s\n", colorGreen, colorBold, srcFile, targetJSON, colorReset)
+		return nil
+
 	case "help", "--help", "-h":
 		printUsage(os.Stdout)
 		return nil
@@ -1076,13 +1117,53 @@ func (ap *app) removeFromFlags(kind, name string) error {
 // Prompt helpers
 // ============================================================================
 
-func (ap *app) prompt(label, def string) string {
-	if def != "" {
-		fmt.Printf("%s%s [%s]: %s", colorCyan, label, def, colorReset)
-	} else {
-		fmt.Printf("%s%s: %s", colorCyan, label, colorReset)
+func (ap *app) readLine(promptStr string) (string, error) {
+	fd := int(os.Stdin.Fd())
+	if ap.reader == nil && term.IsTerminal(fd) {
+		oldState, err := term.MakeRaw(fd)
+		if err == nil {
+			defer func() {
+				_ = term.Restore(fd, oldState)
+			}()
+			t := term.NewTerminal(struct {
+				io.Reader
+				io.Writer
+			}{os.Stdin, os.Stdout}, promptStr)
+			return t.ReadLine()
+		}
 	}
-	line, _ := ap.reader.ReadString('\n')
+
+	if promptStr != "" {
+		fmt.Print(promptStr)
+	}
+	r := ap.reader
+	if r == nil {
+		r = os.Stdin
+	}
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReader(r)
+		ap.reader = br
+	}
+	line, err := br.ReadString('\n')
+	return strings.TrimRight(line, "\r\n"), err
+}
+
+func (ap *app) prompt(label, def string) string {
+	var promptStr string
+	if def != "" {
+		promptStr = fmt.Sprintf("%s%s [%s]: %s", colorCyan, label, def, colorReset)
+	} else {
+		promptStr = fmt.Sprintf("%s%s: %s", colorCyan, label, colorReset)
+	}
+	line, err := ap.readLine(promptStr)
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			fmt.Println()
+			os.Exit(0)
+		}
+		return def
+	}
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return def
@@ -1091,8 +1172,7 @@ func (ap *app) prompt(label, def string) string {
 }
 
 func (ap *app) pause() {
-	fmt.Print("\nPress Enter to continue...")
-	_, _ = ap.reader.ReadString('\n')
+	_, _ = ap.readLine("\nPress Enter to continue...")
 }
 
 func currentValue(a *account, key string) string {
