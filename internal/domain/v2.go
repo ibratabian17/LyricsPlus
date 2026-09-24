@@ -77,7 +77,7 @@ type Line struct {
 	Duration        int              `json:"duration"` // ms
 	Text            string           `json:"text"`
 	IsLineEnding    *int             `json:"isLineEnding,omitempty"` // legacy V1 line terminal flag
-	Syllabus        []Syllable       `json:"syllabus"`               // populated for word sync
+	Syllabus        []Syllable       `json:"syllabus,omitempty"`     // populated for word sync
 	Element         LineElement      `json:"element"`
 	Translation     *Translation     `json:"translation,omitempty"`
 	Transliteration *Transliteration `json:"transliteration,omitempty"`
