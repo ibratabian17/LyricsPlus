@@ -43,12 +43,36 @@ type SourceOutcome struct {
 
 // Racer performs the two-phase speculative fetch.
 type Racer struct {
-	sources   map[string]Source
-	timeout   time.Duration
+	sources map[string]Source
+	timeout time.Duration
+	logger  *logger.Logger
+}
+
+type raceSession struct {
+	r         *Racer
 	mu        sync.Mutex
 	status    map[string]SourceOutcome
 	raceStart time.Time
-	logger    *logger.Logger
+}
+
+func (s *raceSession) record(name, status string, ms int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := SourceOutcome{Status: status, ElapsedMs: ms}
+	if prev, ok := s.status[name]; ok && prev.Status == "OK" {
+		return
+	}
+	s.status[name] = st
+}
+
+func (s *raceSession) snapshot() map[string]SourceOutcome {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]SourceOutcome, len(s.status))
+	for k, v := range s.status {
+		out[k] = v
+	}
+	return out
 }
 
 // RacerOption configures a Racer.
@@ -64,7 +88,7 @@ func NewRacer(sources []Source, timeout time.Duration, opts ...RacerOption) *Rac
 	for _, s := range sources {
 		m[s.Name()] = s
 	}
-	r := &Racer{sources: m, timeout: timeout, status: map[string]SourceOutcome{}}
+	r := &Racer{sources: m, timeout: timeout}
 	for _, opt := range opts {
 		opt(r)
 	}
@@ -80,13 +104,18 @@ func (r *Racer) debugf(format string, args ...any) {
 
 // TryFetch runs a single provider with its own timeout already applied.
 func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery) *Result {
-	src, ok := r.sources[name]
+	sess := &raceSession{r: r, status: make(map[string]SourceOutcome), raceStart: time.Now()}
+	return sess.tryFetch(ctx, name, q)
+}
+
+func (s *raceSession) tryFetch(ctx context.Context, name string, q domain.SearchQuery) *Result {
+	src, ok := s.r.sources[name]
 	if !ok {
-		r.record(name, "SKIP", 0)
+		s.record(name, "SKIP", 0)
 		return &Result{Source: name, Status: "SKIP", Err: errUnavailable}
 	}
 	if c, ok := src.(interface{ Configured() bool }); ok && !c.Configured() {
-		r.record(name, "SKIP", 0)
+		s.record(name, "SKIP", 0)
 		return &Result{Source: name, Status: "SKIP"}
 	}
 	start := time.Now()
@@ -94,7 +123,7 @@ func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery)
 	defer cancel()
 
 	// Immediately record as BAD in case context cancels before return, matching JS trackedFetch
-	r.record(name, "BAD", 0)
+	s.record(name, "BAD", 0)
 
 	resp, err := src.FetchLyrics(reqCtx, q)
 	elapsed := time.Since(start)
@@ -113,51 +142,23 @@ func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery)
 	default:
 		res.Status = "BAD"
 	}
-	r.record(name, res.Status, elapsed.Milliseconds())
+	s.record(name, res.Status, elapsed.Milliseconds())
 	metrics.Default.RecordProviderCall(name, res.Status, elapsed.Milliseconds())
 	switch res.Status {
 	case "OK":
-		r.debugf("source %s OK priority=%d lines=%d took=%s", name, res.Priority, len(resp.Lyrics), elapsed.Round(time.Millisecond))
+		s.r.debugf("source %s OK priority=%d lines=%d took=%s", name, res.Priority, len(resp.Lyrics), elapsed.Round(time.Millisecond))
 	case "RTO":
-		r.debugf("source %s RTO took=%s", name, elapsed.Round(time.Millisecond))
+		s.r.debugf("source %s RTO took=%s", name, elapsed.Round(time.Millisecond))
 	case "BAD":
 		if err != nil {
-			r.debugf("source %s BAD took=%s err=%v", name, elapsed.Round(time.Millisecond), err)
+			s.r.debugf("source %s BAD took=%s err=%v", name, elapsed.Round(time.Millisecond), err)
 		} else {
-			r.debugf("source %s BAD took=%s (no lyrics)", name, elapsed.Round(time.Millisecond))
+			s.r.debugf("source %s BAD took=%s (no lyrics)", name, elapsed.Round(time.Millisecond))
 		}
 	default:
-		r.debugf("source %s %s", name, res.Status)
+		s.r.debugf("source %s %s", name, res.Status)
 	}
 	return res
-}
-
-func (r *Racer) record(name, status string, ms int64) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	st := SourceOutcome{Status: status, ElapsedMs: ms}
-	if prev, ok := r.status[name]; ok && prev.Status == "OK" {
-		return
-	}
-	r.status[name] = st
-}
-
-// Snapshot copies the cumulative per-source status map.
-func (r *Racer) Snapshot() map[string]SourceOutcome {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	out := make(map[string]SourceOutcome, len(r.status))
-	for k, v := range r.status {
-		out[k] = v
-	}
-	return out
-}
-
-// Reset clears accumulated status traces between races.
-func (r *Racer) Reset() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.status = map[string]SourceOutcome{}
 }
 
 func (r *Racer) has(name string) bool {
@@ -167,8 +168,11 @@ func (r *Racer) has(name string) bool {
 
 // Race orchestrates the full two-phase algorithm.
 func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources []string) *Result {
-	r.Reset()
-	r.raceStart = time.Now()
+	sess := &raceSession{
+		r:         r,
+		status:    make(map[string]SourceOutcome),
+		raceStart: time.Now(),
+	}
 	raceCtx, cancel := context.WithTimeout(ctx, r.timeout)
 	defer cancel()
 
@@ -185,14 +189,14 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 	r.debugf("race title=%q artist=%q phase1=%v remaining=%v", q.Title, q.Artist, phase1, remaining)
 
 	// Phase 1: first two sources, blocking semantics, P3 early exit.
-	p1 := r.runPhase(raceCtx, q, phase1)
+	p1 := sess.runPhase(raceCtx, q, phase1)
 
 	if p1 != nil && p1.Priority >= PriorityWord {
-		return r.finalize(p1)
+		return sess.finalize(p1)
 	}
 
 	if len(remaining) == 0 || raceCtx.Err() != nil {
-		return r.finalize(p1)
+		return sess.finalize(p1)
 	}
 
 	// Phase 2: P3-upgrade search if Phase 1 delivered line sync.
@@ -204,42 +208,42 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 			}
 		}
 		if len(p3Sources) > 0 {
-			p3 := r.raceForPriority(raceCtx, q, p3Sources, PriorityWord)
+			p3 := sess.raceForPriority(raceCtx, q, p3Sources, PriorityWord)
 			if p3 != nil {
-				return r.finalize(p3)
+				return sess.finalize(p3)
 			}
 		}
-		return r.finalize(p1)
+		return sess.finalize(p1)
 	}
 
 	// Otherwise race all remaining concurrently and pick the highest priority result.
-	p2 := r.runPhase(raceCtx, q, remaining)
+	p2 := sess.runPhase(raceCtx, q, remaining)
 	if p2 != nil {
 		if p1 == nil || p2.Priority > p1.Priority {
-			return r.finalize(p2)
+			return sess.finalize(p2)
 		}
 	}
-	return r.finalize(p1)
+	return sess.finalize(p1)
 }
 
-func (r *Racer) finalize(res *Result) *Result {
-	snap := r.Snapshot()
+func (s *raceSession) finalize(res *Result) *Result {
+	snap := s.snapshot()
 	if res == nil {
 		res = &Result{}
 	}
 	res.SourcesStatus = snap
-	res.Pipeline = time.Since(r.raceStart)
+	res.Pipeline = time.Since(s.raceStart)
 	if res.Status == "OK" || (res.Resp != nil && len(res.Resp.Lyrics) > 0) {
-		r.debugf("race winner source=%s priority=%d pipeline=%s", res.Source, res.Priority, res.Pipeline.Round(time.Millisecond))
+		s.r.debugf("race winner source=%s priority=%d pipeline=%s", res.Source, res.Priority, res.Pipeline.Round(time.Millisecond))
 	} else {
-		r.debugf("race no winner pipeline=%s statuses=%v", res.Pipeline.Round(time.Millisecond), snap)
+		s.r.debugf("race no winner pipeline=%s statuses=%v", res.Pipeline.Round(time.Millisecond), snap)
 	}
 	return res
 }
 
 // runPhase executes a set of sources concurrently, honoring the priority
 // blocking rule: later P2 waits for earlier sources; any P3 wins immediately.
-func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []string) *Result {
+func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names []string) *Result {
 	if len(names) == 0 {
 		return nil
 	}
@@ -259,14 +263,14 @@ func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []stri
 	ch := make(chan phaseOutcome, len(names))
 	var wg sync.WaitGroup
 	for _, n := range names {
-		if !r.has(n) {
+		if !s.r.has(n) {
 			results[idxByName[n]] = nil
 			continue
 		}
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			ch <- phaseOutcome{name: name, res: r.TryFetch(phaseCtx, name, q)}
+			ch <- phaseOutcome{name: name, res: s.tryFetch(phaseCtx, name, q)}
 		}(n)
 	}
 
@@ -308,20 +312,20 @@ func (r *Racer) runPhase(ctx context.Context, q domain.SearchQuery, names []stri
 }
 
 // raceForPriority runs remaining sources looking for an exact priority match.
-func (r *Racer) raceForPriority(ctx context.Context, q domain.SearchQuery, names []string, want int) *Result {
+func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery, names []string, want int) *Result {
 	phaseCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	ch := make(chan *Result, len(names))
 	var wg sync.WaitGroup
 	for _, n := range names {
-		if !r.has(n) {
+		if !s.r.has(n) {
 			continue
 		}
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			ch <- r.TryFetch(phaseCtx, name, q)
+			ch <- s.tryFetch(phaseCtx, name, q)
 		}(n)
 	}
 	go func() {

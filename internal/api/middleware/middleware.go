@@ -183,6 +183,10 @@ func ConcurrencyLimiter(max int64) func(http.Handler) http.Handler {
 	var inflight atomic.Int64
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if IsHealthPath(r) {
+				next.ServeHTTP(w, r)
+				return
+			}
 			cur := inflight.Add(1)
 			defer inflight.Add(-1)
 			if max > 0 && cur > max {
@@ -235,26 +239,49 @@ func ClientIP(r *http.Request) string {
 	return host
 }
 
-type slidingWindow struct {
+const numShards = 64
+
+type rateLimiterShard struct {
 	mu        sync.Mutex
-	window    time.Duration
-	max       int
 	perIP     map[string][]time.Time
 	lastPrune time.Time
 }
 
-// RateLimiter returns a sliding-window limiter keyed by client IP.
+type shardedRateLimiter struct {
+	window time.Duration
+	max    int
+	shards [numShards]rateLimiterShard
+}
+
+func fnv32(key string) uint32 {
+	var hash uint32 = 2166136261
+	for i := 0; i < len(key); i++ {
+		hash ^= uint32(key[i])
+		hash *= 16777619
+	}
+	return hash
+}
+
+// RateLimiter returns a sharded sliding-window limiter keyed by client IP.
 func RateLimiter(max int, window time.Duration) func(http.Handler) http.Handler {
-	l := &slidingWindow{
-		window:    window,
-		max:       max,
-		perIP:     map[string][]time.Time{},
-		lastPrune: time.Now(),
+	if max <= 0 {
+		return func(next http.Handler) http.Handler {
+			return next
+		}
+	}
+	l := &shardedRateLimiter{
+		window: window,
+		max:    max,
+	}
+	now := time.Now()
+	for i := 0; i < numShards; i++ {
+		l.shards[i].perIP = make(map[string][]time.Time)
+		l.shards[i].lastPrune = now
 	}
 	return l.middleware
 }
 
-func (l *slidingWindow) middleware(next http.Handler) http.Handler {
+func (l *shardedRateLimiter) middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if IsHealthPath(r) {
 			next.ServeHTTP(w, r)
@@ -275,19 +302,22 @@ func (l *slidingWindow) middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (l *slidingWindow) allow(key string) (string, bool) {
+func (l *shardedRateLimiter) allow(key string) (string, bool) {
+	shardIdx := fnv32(key) % numShards
+	shard := &l.shards[shardIdx]
+
 	now := time.Now()
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if now.Sub(l.lastPrune) > l.window*2 {
-		for k, stamps := range l.perIP {
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if now.Sub(shard.lastPrune) > l.window*2 {
+		for k, stamps := range shard.perIP {
 			if len(stamps) == 0 || now.Sub(stamps[len(stamps)-1]) > l.window*2 {
-				delete(l.perIP, k)
+				delete(shard.perIP, k)
 			}
 		}
-		l.lastPrune = now
+		shard.lastPrune = now
 	}
-	stamps := l.perIP[key]
+	stamps := shard.perIP[key]
 	cutoff := now.Add(-l.window)
 	keep := 0
 	for i, t := range stamps {
@@ -305,11 +335,11 @@ func (l *slidingWindow) allow(key string) (string, bool) {
 		if secs < 1 {
 			secs = 1
 		}
-		l.perIP[key] = stamps
+		shard.perIP[key] = stamps
 		return itoaSec(secs), false
 	}
 	stamps = append(stamps, now)
-	l.perIP[key] = stamps
+	shard.perIP[key] = stamps
 	return "0", true
 }
 

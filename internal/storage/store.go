@@ -46,9 +46,12 @@ CREATE TABLE IF NOT EXISTS lyrics (
   UNIQUE(filename, source)
 );
 CREATE INDEX IF NOT EXISTS idx_lyrics_filename ON lyrics(filename);
-CREATE INDEX IF NOT EXISTS idx_lyrics_isrc ON lyrics(isrc);
-CREATE INDEX IF NOT EXISTS idx_lyrics_platform ON lyrics(platform_id);
-CREATE INDEX IF NOT EXISTS idx_lyrics_title_artist ON lyrics(title, artist);
+CREATE INDEX IF NOT EXISTS idx_lyrics_isrc ON lyrics(isrc) WHERE isrc IS NOT NULL AND isrc != '';
+CREATE INDEX IF NOT EXISTS idx_lyrics_platform ON lyrics(platform_id) WHERE platform_id IS NOT NULL AND platform_id != '';
+CREATE INDEX IF NOT EXISTS idx_lyrics_isrc_source ON lyrics(isrc, source) WHERE isrc IS NOT NULL AND isrc != '';
+CREATE INDEX IF NOT EXISTS idx_lyrics_platform_source ON lyrics(platform_id, source) WHERE platform_id IS NOT NULL AND platform_id != '';
+CREATE INDEX IF NOT EXISTS idx_lyrics_title_artist ON lyrics(title COLLATE NOCASE, artist COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_lyrics_ta_covering ON lyrics(title COLLATE NOCASE, artist COLLATE NOCASE, id, filename, isrc, platform_id, source, duration_ms, created_at);
 `
 
 const lyricsFTS5Setup = `
@@ -99,7 +102,7 @@ func NewStore(cfg config.Storage) (*Store, error) {
 	}
 
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-32768)&_pragma=mmap_size(1073741824)&_pragma=temp_store(MEMORY)",
+		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-200000)&_pragma=mmap_size(1073741824)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)",
 		path,
 	)
 	db, err := sql.Open("sqlite", dsn)
@@ -107,8 +110,8 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		return nil, fmt.Errorf("storage: open sqlite: %w", err)
 	}
 	// In WAL mode, concurrent readers do not block each other or writers.
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
+	db.SetMaxOpenConns(100)
+	db.SetMaxIdleConns(50)
 	db.SetConnMaxLifetime(time.Hour)
 	db.SetConnMaxIdleTime(10 * time.Minute)
 
@@ -150,6 +153,10 @@ func initStoreSchema(db *sql.DB) error {
 		"PRAGMA journal_mode = WAL;",
 		"PRAGMA synchronous = NORMAL;",
 		"PRAGMA busy_timeout = 10000;",
+		"PRAGMA cache_size = -200000;",
+		"PRAGMA mmap_size = 1073741824;",
+		"PRAGMA temp_store = MEMORY;",
+		"PRAGMA foreign_keys = ON;",
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {
@@ -162,7 +169,8 @@ func initStoreSchema(db *sql.DB) error {
 	if _, err := db.Exec(lyricsFTS5Setup); err != nil {
 		return err
 	}
-	_, _ = db.Exec("PRAGMA optimize=0x10002;")
+	_, _ = db.Exec("ANALYZE;")
+	_, _ = db.Exec("PRAGMA optimize;")
 	return nil
 }
 
@@ -399,7 +407,7 @@ func (s *Store) GetByTitleArtist(ctx context.Context, title, artist string) ([]*
 func (s *Store) queryTitleArtist(ctx context.Context, title, artist string) ([]*Row, error) {
 	const q = `SELECT ` + storeLightRowColumns + `
 FROM lyrics
-WHERE title = ? AND artist = ?
+WHERE title = ? COLLATE NOCASE AND artist = ? COLLATE NOCASE
 LIMIT 10`
 	rows, err := s.db.QueryContext(ctx, q, title, artist)
 	if err != nil {
