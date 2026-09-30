@@ -124,6 +124,65 @@ func TestTTMLToJSONRoundtrip(t *testing.T) {
 	}
 }
 
+func TestTTMLLineSyncWithOffsetSeconds(t *testing.T) {
+	rawTTML := `<?xml version="1.0" encoding="utf-8"?>
+<tt xmlns="http://www.w3.org/ns/ttml" xmlns:itunes="http://music.apple.com/lyric-ttml-internal" itunes:timing="Line" xml:lang="id">
+<head>
+<metadata>
+<iTunesMetadata xmlns="http://music.apple.com/lyric-ttml-internal" leadingSilence="0.160">
+<translations/>
+<songwriters>
+<songwriter>Patrick Effendy</songwriter>
+<songwriter>SuperSound Music</songwriter>
+</songwriters>
+</iTunesMetadata>
+</metadata>
+</head>
+<body dur="3:17.053">
+<div begin="14.333s" end="41.157s">
+<p begin="14.333s" end="18.326s">Selamat pagi Tante Linda yang cantik</p>
+<p begin="21.343s" end="27.062s">Aku datang untuk meminta ijin baik-baik</p>
+<p begin="28.454s" end="32.558s">Maafkanku Tante Linda yang cantik</p>
+<p begin="35.514s" end="38.668s">Aku hanya ingin jalan-jalan</p>
+<p begin="38.993s" end="41.157s">Sama gadismu yang cantik</p>
+</div>
+</body>
+</tt>`
+
+	resp, err := TTMLToJSON([]byte(rawTTML))
+	if err != nil {
+		t.Fatalf("TTMLToJSON failed: %v", err)
+	}
+	if resp.Type != domain.SyncTypeLine {
+		t.Errorf("expected type Line, got %q", resp.Type)
+	}
+	if len(resp.Lyrics) != 5 {
+		t.Fatalf("expected 5 lines, got %d", len(resp.Lyrics))
+	}
+	if resp.Lyrics[0].Time != 14333 {
+		t.Errorf("line 0 time = %d, want 14333", resp.Lyrics[0].Time)
+	}
+	if resp.Lyrics[0].Duration != (18326 - 14333) {
+		t.Errorf("line 0 duration = %d, want %d", resp.Lyrics[0].Duration, 18326-14333)
+	}
+	if resp.Lyrics[0].Text != "Selamat pagi Tante Linda yang cantik" {
+		t.Errorf("line 0 text = %q", resp.Lyrics[0].Text)
+	}
+	if resp.Lyrics[1].Time != 21343 || resp.Lyrics[1].Duration != (27062-21343) {
+		t.Errorf("line 1 time/dur = %d/%d, want 21343/%d", resp.Lyrics[1].Time, resp.Lyrics[1].Duration, 27062-21343)
+	}
+	if len(resp.Metadata.SongParts) != 1 {
+		t.Fatalf("expected 1 song part from div, got %d", len(resp.Metadata.SongParts))
+	}
+	sp := resp.Metadata.SongParts[0]
+	if sp.Time == nil || *sp.Time != 14333 {
+		t.Errorf("song part time = %+v, want 14333", sp.Time)
+	}
+	if sp.Duration == nil || *sp.Duration != (41157-14333) {
+		t.Errorf("song part duration = %+v, want %d", sp.Duration, 41157-14333)
+	}
+}
+
 func TestV1V2Roundtrip(t *testing.T) {
 	v2 := &domain.LyricsResponse{
 		Type: domain.SyncTypeWord,

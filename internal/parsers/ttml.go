@@ -248,28 +248,74 @@ func parseTTMLTime(s string) (int, bool) {
 	return (hh*3600+mm*60+sec)*1000 + milli, true
 }
 
-// ttmlTimeToMs parses "hh:mm:ss.mmm", "mm:ss.mmm" or plain seconds.
+// ttmlTimeToMs parses TTML time expressions (e.g. "hh:mm:ss.mmm", "mm:ss.mmm", "ss.mmm",
+// or offset times like "14.333s", "500ms", "1.5m", "1h", "14.333") into milliseconds.
 func ttmlTimeToMs(timeStr string) int {
+	timeStr = strings.TrimSpace(timeStr)
 	if timeStr == "" {
 		return 0
 	}
+
+	if !strings.Contains(timeStr, ":") {
+		lower := strings.ToLower(timeStr)
+		if strings.HasSuffix(lower, "ms") {
+			val, _ := strconv.ParseFloat(strings.TrimSpace(timeStr[:len(timeStr)-2]), 64)
+			if math.IsNaN(val) || math.IsInf(val, 0) {
+				return 0
+			}
+			return int(math.Round(val))
+		}
+		if strings.HasSuffix(lower, "s") {
+			val, _ := strconv.ParseFloat(strings.TrimSpace(timeStr[:len(timeStr)-1]), 64)
+			if math.IsNaN(val) || math.IsInf(val, 0) {
+				return 0
+			}
+			return int(math.Round(val * 1000))
+		}
+		if strings.HasSuffix(lower, "m") {
+			val, _ := strconv.ParseFloat(strings.TrimSpace(timeStr[:len(timeStr)-1]), 64)
+			if math.IsNaN(val) || math.IsInf(val, 0) {
+				return 0
+			}
+			return int(math.Round(val * 60000))
+		}
+		if strings.HasSuffix(lower, "h") {
+			val, _ := strconv.ParseFloat(strings.TrimSpace(timeStr[:len(timeStr)-1]), 64)
+			if math.IsNaN(val) || math.IsInf(val, 0) {
+				return 0
+			}
+			return int(math.Round(val * 3600000))
+		}
+		val, _ := strconv.ParseFloat(timeStr, 64)
+		if math.IsNaN(val) || math.IsInf(val, 0) {
+			return 0
+		}
+		return int(math.Round(val * 1000))
+	}
+
+	// Clock-time format: [hh:]mm:ss[.mmm][s]
 	parts := strings.Split(timeStr, ":")
 	var totalMs float64
 	switch len(parts) {
 	case 3:
-		h, _ := strconv.ParseFloat(parts[0], 64)
-		m, _ := strconv.ParseFloat(parts[1], 64)
-		s, _ := strconv.ParseFloat(parts[2], 64)
+		h, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+		m, _ := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+		sStr := strings.TrimSpace(parts[2])
+		sStr = strings.TrimSuffix(strings.ToLower(sStr), "s")
+		s, _ := strconv.ParseFloat(sStr, 64)
 		totalMs = (h*3600 + m*60 + s) * 1000
 	case 2:
-		m, _ := strconv.ParseFloat(parts[0], 64)
-		s, _ := strconv.ParseFloat(parts[1], 64)
+		m, _ := strconv.ParseFloat(strings.TrimSpace(parts[0]), 64)
+		sStr := strings.TrimSpace(parts[1])
+		sStr = strings.TrimSuffix(strings.ToLower(sStr), "s")
+		s, _ := strconv.ParseFloat(sStr, 64)
 		totalMs = (m*60 + s) * 1000
 	default:
-		totalMs, _ = strconv.ParseFloat(parts[0], 64)
-		totalMs *= 1000
+		sStr := strings.TrimSuffix(strings.ToLower(timeStr), "s")
+		val, _ := strconv.ParseFloat(strings.TrimSpace(sStr), 64)
+		totalMs = val * 1000
 	}
-	if math.IsNaN(totalMs) {
+	if math.IsNaN(totalMs) || math.IsInf(totalMs, 0) {
 		return 0
 	}
 	return int(math.Round(totalMs))
@@ -303,9 +349,28 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 	}
 	scanNS(doc)
 
-	timingMode := getAttr(doc, itunesNS, "timing")
-	if timingMode == "" {
+	rawTiming := getAttr(doc, itunesNS, "timing")
+	timingMode := string(domain.SyncTypeWord)
+	if strings.EqualFold(rawTiming, string(domain.SyncTypeLine)) {
+		timingMode = string(domain.SyncTypeLine)
+	} else if strings.EqualFold(rawTiming, string(domain.SyncTypeNone)) {
+		timingMode = string(domain.SyncTypeNone)
+	} else if strings.EqualFold(rawTiming, string(domain.SyncTypeWord)) {
 		timingMode = string(domain.SyncTypeWord)
+	} else if rawTiming == "" {
+		spans := descendants(doc, "span")
+		hasWordSync := false
+		for _, sp := range spans {
+			if getAttr(sp, "", "begin") != "" {
+				hasWordSync = true
+				break
+			}
+		}
+		if hasWordSync {
+			timingMode = string(domain.SyncTypeWord)
+		} else {
+			timingMode = string(domain.SyncTypeLine)
+		}
 	}
 
 	metadata := domain.LyricsMetadata{
@@ -470,9 +535,20 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 							}
 							begin := getAttr(span, "", "begin")
 							end := getAttr(span, "", "end")
+							dur := getAttr(span, "", "dur")
+							spanBeginMs := ttmlTimeToMs(begin)
+							spanDurMs := 0
+							if dur != "" {
+								spanDurMs = ttmlTimeToMs(dur)
+							} else if end != "" {
+								spanDurMs = ttmlTimeToMs(end) - spanBeginMs
+							}
+							if spanDurMs < 0 {
+								spanDurMs = 0
+							}
 							syl := domain.Syllable{
-								Time:     ttmlTimeToMs(begin),
-								Duration: ttmlTimeToMs(end) - ttmlTimeToMs(begin),
+								Time:     spanBeginMs,
+								Duration: spanDurMs,
 								Text:     spanText,
 							}
 							syllabus = append(syllabus, syl)
@@ -496,6 +572,9 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 
 	var lyrics []domain.Line
 	divs := descendants(doc, "div")
+	if len(divs) == 0 && len(bodyEls) > 0 {
+		divs = []*txmlNode{bodyEls[0]}
+	}
 
 	for i, div := range divs {
 		songPart := getAttr(div, itunesNS, "song-part")
@@ -506,17 +585,28 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 
 		divBegin := getAttr(div, "", "begin")
 		divEnd := getAttr(div, "", "end")
-		if (divBegin == "" || divEnd == "") && len(ps) > 0 {
+		divDur := getAttr(div, "", "dur")
+		if (divBegin == "" || (divEnd == "" && divDur == "")) && len(ps) > 0 {
 			if divBegin == "" {
 				divBegin = getAttr(ps[0], "", "begin")
 			}
-			if divEnd == "" {
-				divEnd = getAttr(ps[len(ps)-1], "", "end")
+			if divEnd == "" && divDur == "" {
+				lastP := ps[len(ps)-1]
+				divEnd = getAttr(lastP, "", "end")
+				if divEnd == "" && getAttr(lastP, "", "dur") != "" && getAttr(lastP, "", "begin") != "" {
+					divEndMs := ttmlTimeToMs(getAttr(lastP, "", "begin")) + ttmlTimeToMs(getAttr(lastP, "", "dur"))
+					divDur = fmt.Sprintf("%dms", divEndMs-ttmlTimeToMs(divBegin))
+				}
 			}
 		}
 
 		partTime := ttmlTimeToMs(divBegin)
-		partDur := ttmlTimeToMs(divEnd) - ttmlTimeToMs(divBegin)
+		var partDur int
+		if divDur != "" {
+			partDur = ttmlTimeToMs(divDur)
+		} else if divEnd != "" {
+			partDur = ttmlTimeToMs(divEnd) - partTime
+		}
 		if partDur < 0 {
 			partDur = 0
 		}
@@ -535,14 +625,22 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 
 			pBegin := getAttr(p, "", "begin")
 			pEnd := getAttr(p, "", "end")
+			pDur := getAttr(p, "", "dur")
 
 			idx := i
 			currentLine := domain.Line{
 				Element: domain.LineElement{Key: key, Singer: singer, SongPartIndex: &idx},
 			}
-			if pBegin != "" && pEnd != "" {
+			if pBegin != "" {
 				currentLine.Time = ttmlTimeToMs(pBegin)
-				currentLine.Duration = ttmlTimeToMs(pEnd) - ttmlTimeToMs(pBegin)
+				if pDur != "" {
+					currentLine.Duration = ttmlTimeToMs(pDur)
+				} else if pEnd != "" {
+					currentLine.Duration = ttmlTimeToMs(pEnd) - currentLine.Time
+				}
+				if currentLine.Duration < 0 {
+					currentLine.Duration = 0
+				}
 			}
 
 			if timingMode == string(domain.SyncTypeWord) {
@@ -572,8 +670,17 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 							begin = "0"
 						}
 						end := getAttr(sp, "", "end")
-						if end == "" {
-							end = "0"
+						dur := getAttr(sp, "", "dur")
+
+						spanBeginMs := ttmlTimeToMs(begin)
+						spanDurMs := 0
+						if dur != "" {
+							spanDurMs = ttmlTimeToMs(dur)
+						} else if end != "" {
+							spanDurMs = ttmlTimeToMs(end) - spanBeginMs
+						}
+						if spanDurMs < 0 {
+							spanDurMs = 0
 						}
 
 						spanText := directText(sp)
@@ -586,8 +693,8 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 						}
 
 						syl := domain.Syllable{
-							Time:     ttmlTimeToMs(begin),
-							Duration: ttmlTimeToMs(end) - ttmlTimeToMs(begin),
+							Time:     spanBeginMs,
+							Duration: spanDurMs,
 							Text:     spanText,
 						}
 						if isBg {
@@ -596,12 +703,20 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 						currentLine.Syllabus = append(currentLine.Syllabus, syl)
 						currentLine.Text += spanText
 					}
+					if currentLine.Time == 0 && currentLine.Duration == 0 && len(currentLine.Syllabus) > 0 {
+						currentLine.Time = currentLine.Syllabus[0].Time
+						lastSyl := currentLine.Syllabus[len(currentLine.Syllabus)-1]
+						currentLine.Duration = (lastSyl.Time + lastSyl.Duration) - currentLine.Time
+						if currentLine.Duration < 0 {
+							currentLine.Duration = 0
+						}
+					}
 				} else {
 					currentLine.Text = strings.TrimSpace(textContent(p))
 				}
 			} else {
 				currentLine.Text = strings.TrimSpace(textContent(p))
-				if timingMode == string(domain.SyncTypeNone) || (pBegin == "" && pEnd == "") {
+				if timingMode == string(domain.SyncTypeNone) || (pBegin == "" && pEnd == "" && pDur == "") {
 					currentLine.Time = 0
 					currentLine.Duration = 0
 				}
