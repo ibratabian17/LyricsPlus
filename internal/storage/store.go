@@ -102,7 +102,7 @@ func NewStore(cfg config.Storage) (*Store, error) {
 	}
 
 	dsn := fmt.Sprintf(
-		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-200000)&_pragma=mmap_size(1073741824)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)",
+		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-16384)&_pragma=mmap_size(1073741824)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)",
 		path,
 	)
 	db, err := sql.Open("sqlite", dsn)
@@ -153,7 +153,7 @@ func initStoreSchema(db *sql.DB) error {
 		"PRAGMA journal_mode = WAL;",
 		"PRAGMA synchronous = NORMAL;",
 		"PRAGMA busy_timeout = 10000;",
-		"PRAGMA cache_size = -200000;",
+		"PRAGMA cache_size = -16384;",
 		"PRAGMA mmap_size = 1073741824;",
 		"PRAGMA temp_store = MEMORY;",
 		"PRAGMA foreign_keys = ON;",
