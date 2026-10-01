@@ -84,7 +84,7 @@ func NewGDriveClient(cfg config.GDrive, httpClient *http.Client) *GDriveClient {
 
 // IsConfigured checks if credentials exist.
 func (g *GDriveClient) IsConfigured() bool {
-	if !g.cfg.Enabled || len(g.accounts) == 0 {
+	if len(g.accounts) == 0 {
 		return false
 	}
 	acc := g.accounts[0]
@@ -506,49 +506,59 @@ func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []stri
 	if isrc == "" && platformID == "" {
 		return nil, nil
 	}
-	searchTerm := isrc
-	if searchTerm == "" {
-		searchTerm = platformID
-	}
 
-	var qParts []string
-	if mimeType != "" {
-		qParts = append(qParts, fmt.Sprintf("mimeType = '%s'", escapeQueryLiteral(mimeType)))
-	}
-	qParts = append(qParts, fmt.Sprintf("name contains '%s'", escapeQueryLiteral(searchTerm)))
-	query := strings.Join(qParts, " and ")
-
-	cacheKey := fmt.Sprintf("exact:%s:%s", searchTerm, mimeType)
+	cacheKey := fmt.Sprintf("exact:%s:%s", isrc, platformID)
 	if cached, ok := g.searchCache.Get(cacheKey); ok && len(cached) > 0 {
 		return &cached[0], nil
 	}
 
-	res, err := g.SearchFiles(ctx, folderIDs, query, 10, "")
-	if err != nil || res == nil || len(res.Files) == 0 {
-		return nil, err
+	var searchTerms []string
+	if isrc != "" {
+		searchTerms = append(searchTerms, isrc)
+	}
+	if platformID != "" && platformID != isrc {
+		searchTerms = append(searchTerms, platformID)
 	}
 
-	for _, f := range res.Files {
-		parsed := ParseFilename(f.Name)
-		if isrc != "" && strings.EqualFold(parsed.ISRC, isrc) {
-			g.searchCache.Add(cacheKey, []FileItem{f})
-			return &f, nil
+	for _, term := range searchTerms {
+		var qParts []string
+		if mimeType != "" {
+			qParts = append(qParts, fmt.Sprintf("mimeType = '%s'", escapeQueryLiteral(mimeType)))
 		}
-		if platformID != "" && strings.EqualFold(parsed.PlatformID, platformID) {
-			g.searchCache.Add(cacheKey, []FileItem{f})
-			return &f, nil
+		qParts = append(qParts, fmt.Sprintf("name contains '%s'", escapeQueryLiteral(term)))
+		query := strings.Join(qParts, " and ")
+
+		res, err := g.SearchFiles(ctx, folderIDs, query, 15, "")
+		if err != nil || res == nil || len(res.Files) == 0 {
+			continue
+		}
+
+		for _, f := range res.Files {
+			parsed := ParseFilename(f.Name)
+			if isrc != "" && strings.EqualFold(parsed.ISRC, isrc) {
+				g.searchCache.Add(cacheKey, []FileItem{f})
+				return &f, nil
+			}
+			if platformID != "" && strings.EqualFold(parsed.PlatformID, platformID) {
+				g.searchCache.Add(cacheKey, []FileItem{f})
+				return &f, nil
+			}
 		}
 	}
+
 	return nil, nil
 }
 
 // FindExistingFile searches GDrive for a file matching metadata keywords using similarity scoring.
 func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string, title, artist, album string, durationSec float64, isrc, platformID, mimeType string) (*FileItem, error) {
-	if title == "" || artist == "" {
-		return nil, nil
+	if title == "" && artist == "" {
+		return g.FindExactMatchByIds(ctx, folderIDs, isrc, platformID, mimeType)
 	}
 
 	keywords := append(ExtractKeywords(title), ExtractKeywords(artist)...)
+	if album != "" {
+		keywords = append(keywords, ExtractKeywords(album)...)
+	}
 	if len(keywords) == 0 {
 		return g.FindExactMatchByIds(ctx, folderIDs, isrc, platformID, mimeType)
 	}
@@ -562,8 +572,11 @@ func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string,
 	}
 	query := strings.Join(qParts, " and ")
 
-	res, err := g.SearchFiles(ctx, folderIDs, query, 15, "")
+	res, err := g.SearchFiles(ctx, folderIDs, query, 20, "")
 	if err != nil || res == nil || len(res.Files) == 0 {
+		if isrc != "" || platformID != "" {
+			return g.FindExactMatchByIds(ctx, folderIDs, isrc, platformID, mimeType)
+		}
 		return nil, err
 	}
 
@@ -583,6 +596,9 @@ func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string,
 
 	best := similarity.FindBestSongMatch(candidates, title, artist, album, durationSec, isrc, platformID)
 	if best == nil {
+		if isrc != "" || platformID != "" {
+			return g.FindExactMatchByIds(ctx, folderIDs, isrc, platformID, mimeType)
+		}
 		return nil, nil
 	}
 	idx := best.Candidate.Data.(int)

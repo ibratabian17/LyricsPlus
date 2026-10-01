@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,36 @@ import (
 	"lyricsplus/backend/internal/similarity"
 	"lyricsplus/backend/internal/storage"
 )
+
+var kpoeToolsRe = regexp.MustCompile(`"KpoeTools"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)`)
+
+func parseLyricsPayload(content []byte) *domain.LyricsResponse {
+	trimmedRaw := strings.TrimSpace(string(content))
+	if trimmedRaw == "" {
+		return nil
+	}
+	if strings.HasPrefix(trimmedRaw, "<") {
+		if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+			return p
+		}
+	}
+	coerced := kpoeToolsRe.ReplaceAllString(trimmedRaw, `"KpoeTools": "$1"`)
+
+	if strings.Contains(coerced, `"isLineEnding"`) {
+		var v1 domain.V1Response
+		if json.Unmarshal([]byte(coerced), &v1) == nil && len(v1.Lyrics) > 0 {
+			if p := parsers.V1ToV2(&v1); p != nil && len(p.Lyrics) > 0 {
+				return p
+			}
+		}
+	}
+
+	var resp domain.LyricsResponse
+	if json.Unmarshal([]byte(coerced), &resp) == nil && len(resp.Lyrics) > 0 {
+		return parsers.NormalizeV2(&resp)
+	}
+	return nil
+}
 
 const lyricsplusName = "lyricsplus"
 
@@ -118,9 +149,8 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 				}
 			}
 			if len(row.ContentJSON) > 0 {
-				var resp domain.LyricsResponse
-				if json.Unmarshal(row.ContentJSON, &resp) == nil && len(resp.Lyrics) > 0 {
-					norm := parsers.NormalizeV2(&resp)
+				if parsed := parseLyricsPayload(row.ContentJSON); parsed != nil && len(parsed.Lyrics) > 0 {
+					norm := parsers.NormalizeV2(parsed)
 					norm.Metadata.Source = "Lyrics+"
 					norm.Cached = domain.CacheUserJSON
 					norm.RawData = string(row.ContentJSON)
@@ -200,18 +230,17 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		folders := gd.Config().FolderUserTML
 		var gfile *storage.FileItem
 		if q.ISRC != "" || q.PlatformID != "" {
-			gfile, _ = gd.FindExactMatchByIds(ctx, folders, q.ISRC, q.PlatformID, "application/json")
+			gfile, _ = gd.FindExactMatchByIds(ctx, folders, q.ISRC, q.PlatformID, "")
 		}
-		if gfile == nil && q.Title != "" && q.Artist != "" {
+		if gfile == nil && (q.Title != "" || q.Artist != "") {
 			durationSec := float64(q.Duration) / 1000.0
-			gfile, _ = gd.FindExistingFile(ctx, folders, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID, "application/json")
+			gfile, _ = gd.FindExistingFile(ctx, folders, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID, "")
 		}
 		if gfile != nil {
 			content, err := gd.FetchFile(ctx, gfile.ID)
 			if err == nil && len(content) > 0 {
-				var resp domain.LyricsResponse
-				if json.Unmarshal(content, &resp) == nil && len(resp.Lyrics) > 0 {
-					norm := parsers.NormalizeV2(&resp)
+				if parsed := parseLyricsPayload(content); parsed != nil && len(parsed.Lyrics) > 0 {
+					norm := parsers.NormalizeV2(parsed)
 					norm.Metadata.Source = "Lyrics+"
 					norm.Cached = domain.CacheGDrive
 					norm.RawData = string(content)
