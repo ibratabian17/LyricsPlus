@@ -57,11 +57,15 @@ func parseLyricsPayload(content []byte) *domain.LyricsResponse {
 
 const lyricsplusName = "lyricsplus"
 
+const (
+	gdriveBudget      = 2500 * time.Millisecond
+	driveWriteTimeout = 15 * time.Second
+)
+
 type qapleEngine interface {
 	FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error)
 }
 
-// LyricsPlusProvider serves user-generated lyrics from the UGC store and falls back to Qaple.
 type LyricsPlusProvider struct {
 	client     *proxy.Client
 	jwtSecret  string
@@ -83,7 +87,6 @@ func NewLyricsPlus(client *proxy.Client) *LyricsPlusProvider {
 	}
 }
 
-// SetLogger attaches a logger for debug output.
 func (p *LyricsPlusProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
 
 func (p *LyricsPlusProvider) debugf(format string, args ...any) {
@@ -225,19 +228,21 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		}
 	}
 
-	// Check Google Drive USERTML_JSON if not found or word sync needed
 	if !q.ForceReload && (lpResult == nil || !hasWordSync(lpResult)) && gd != nil && gd.IsConfigured() {
+		driveCtx, driveCancel := context.WithTimeout(ctx, gdriveBudget)
+		defer driveCancel()
+
 		folders := gd.Config().FolderUserTML
 		var gfile *storage.FileItem
 		if q.ISRC != "" || q.PlatformID != "" {
-			gfile, _ = gd.FindExactMatchByIds(ctx, folders, q.ISRC, q.PlatformID, "")
+			gfile, _ = gd.FindExactMatchByIds(driveCtx, folders, q.ISRC, q.PlatformID, "")
 		}
 		if gfile == nil && (q.Title != "" || q.Artist != "") {
 			durationSec := float64(q.Duration) / 1000.0
-			gfile, _ = gd.FindExistingFile(ctx, folders, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID, "")
+			gfile, _ = gd.FindExistingFile(driveCtx, folders, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID, "")
 		}
 		if gfile != nil {
-			content, err := gd.FetchFile(ctx, gfile.ID)
+			content, err := gd.FetchFile(driveCtx, gfile.ID)
 			if err == nil && len(content) > 0 {
 				if parsed := parseLyricsPayload(content); parsed != nil && len(parsed.Lyrics) > 0 {
 					norm := parsers.NormalizeV2(parsed)
@@ -292,9 +297,7 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 
 					lpResult = norm
 					if st != nil {
-						go func(c []byte, query domain.SearchQuery) {
-							_ = st.SaveUserLyrics(context.Background(), query, c)
-						}(content, q)
+						st.SaveUserLyricsAsync(q, content, driveWriteTimeout)
 					}
 					if hasWordSync(norm) {
 						return norm, nil
@@ -304,7 +307,6 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		}
 	}
 
-	// Attempt Qaple as part of LyricsPlus fallback
 	if qp != nil {
 		qapleResult, err := qp.FetchLyrics(ctx, q)
 		if err == nil && qapleResult != nil && len(qapleResult.Lyrics) > 0 {
@@ -354,7 +356,6 @@ func getSyncPriority(resp *domain.LyricsResponse) int {
 	return 1
 }
 
-// IsVandalismUpdate checks whether an update constitutes vandalism.
 func IsVandalismUpdate(prev, next *domain.LyricsResponse) bool {
 	if next == nil || len(next.Lyrics) == 0 {
 		return true
@@ -389,7 +390,6 @@ func IsVandalismUpdate(prev, next *domain.LyricsResponse) bool {
 	return false
 }
 
-// SetChallenge configures the PoW parameters (used when synthesized).
 func (p *LyricsPlusProvider) SetChallenge(secret string, difficulty int, ttl time.Duration) {
 	if secret != "" {
 		p.jwtSecret = secret
@@ -402,13 +402,11 @@ func (p *LyricsPlusProvider) SetChallenge(secret string, difficulty int, ttl tim
 	}
 }
 
-// challengeClaim is the issued PoW challenge JWT payload.
 type challengeClaim struct {
 	Challenge string `json:"challenge"`
 	jwt.RegisteredClaims
 }
 
-// Issuer issues a challenge JWT with a UUID challenge.
 type Issuer struct {
 	secret string
 	ttl    time.Duration
@@ -418,7 +416,6 @@ func NewIssuer(secret string, ttl time.Duration) *Issuer {
 	return &Issuer{secret: secret, ttl: ttl}
 }
 
-// Issue returns a signed challenge token.
 func (i *Issuer) Issue(now time.Time) (string, string, error) {
 	challenge := uuid.NewString()
 	claims := challengeClaim{
@@ -432,7 +429,6 @@ func (i *Issuer) Issue(now time.Time) (string, string, error) {
 	return tok, challenge, err
 }
 
-// Verifier validates the PoW nonce against a challenge token.
 type Verifier struct {
 	secret     string
 	difficulty int
@@ -442,12 +438,10 @@ func NewVerifier(secret string, difficulty int) *Verifier {
 	return &Verifier{secret: secret, difficulty: difficulty}
 }
 
-// Difficulty exposes the required leading-zero count.
 func (v *Verifier) Difficulty() int {
 	return v.difficulty
 }
 
-// Verify checks JWT signature/expiry and the SHA-256(prefix) nonce.
 func (v *Verifier) Verify(token, nonce string) (string, error) {
 	claims := &challengeClaim{}
 	parsed, err := jwt.ParseWithClaims(token, claims, func(t *jwt.Token) (interface{}, error) {

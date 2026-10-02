@@ -1,23 +1,29 @@
-// Package storage provides SQLite-backed caching, submissions, and backups.
 package storage
 
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	_ "modernc.org/sqlite"
 
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
 )
 
-// Row mirrors a single row of the lyrics cache table.
+var (
+	errWritePanic = errors.New("storage: write-back panicked")
+	errQueueFull  = errors.New("storage: write-back queue full")
+)
+
 type Row struct {
 	ID          int64
 	Filename    string
@@ -81,17 +87,22 @@ END;
 const storeRowColumns = "id, filename, content, isrc, platform_id, source, title, artist, duration_ms, created_at"
 const storeLightRowColumns = "id, filename, isrc, platform_id, source, title, artist, duration_ms, created_at"
 
-// Store is the SQLite-backed two-tier lyrics cache sitting behind positive LRU caches.
 type Store struct {
-	cfg        config.Storage
-	db         *sql.DB
+	cfg config.Storage
+
+	db  *sql.DB
+	wdb *sql.DB
+
 	exact      *lru.Cache[string, *Row]
 	exactTitle *lru.Cache[string, []*Row]
 	exist      *lru.Cache[string, []*Row]
 	content    *lru.Cache[int64, []byte]
+	miss       *expirable.LRU[string, struct{}]
+
+	writes    *writeQueue
+	closeOnce sync.Once
 }
 
-// NewStore opens (creating if needed) the SQLite cache at cfg.DBPath.
 func NewStore(cfg config.Storage) (*Store, error) {
 	path := cfg.DBPath
 	if path == "" {
@@ -101,22 +112,33 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		return nil, fmt.Errorf("storage: mkdir: %w", err)
 	}
 
-	dsn := fmt.Sprintf(
-		"file:%s?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-16384)&_pragma=mmap_size(1073741824)&_pragma=temp_store(MEMORY)&_pragma=foreign_keys(ON)",
-		path,
-	)
-	db, err := sql.Open("sqlite", dsn)
+	readDSN := buildDSN(path, readCacheKB)
+	writeDSN := buildDSN(path, writeCacheKB)
+
+	db, err := sql.Open("sqlite", readDSN)
 	if err != nil {
 		return nil, fmt.Errorf("storage: open sqlite: %w", err)
 	}
-	// In WAL mode, concurrent readers do not block each other or writers.
-	db.SetMaxOpenConns(100)
-	db.SetMaxIdleConns(50)
-	db.SetConnMaxLifetime(time.Hour)
-	db.SetConnMaxIdleTime(10 * time.Minute)
+	readConns := cfg.ReadConns
+	if readConns <= 0 {
+		readConns = defaultReadConns
+	}
+	db.SetMaxOpenConns(readConns)
+	db.SetMaxIdleConns(readConns)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	wdb, err := sql.Open("sqlite", writeDSN)
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("storage: open sqlite writer: %w", err)
+	}
+	wdb.SetMaxOpenConns(1)
+	wdb.SetMaxIdleConns(1)
+	wdb.SetConnMaxLifetime(time.Hour)
 
 	if err := initStoreSchema(db); err != nil {
 		_ = db.Close()
+		_ = wdb.Close()
 		return nil, fmt.Errorf("storage: init schema: %w", err)
 	}
 
@@ -129,15 +151,47 @@ func NewStore(cfg config.Storage) (*Store, error) {
 	exist, _ := lru.New[string, []*Row](size)
 	content, _ := lru.New[int64, []byte](size)
 
+	negSize := cfg.MissMemoSize
+	if negSize <= 0 {
+		negSize = size / 4
+	}
+	negTTL := cfg.NegativeTTL
+	if negTTL <= 0 {
+		negTTL = 30 * time.Second
+	}
+	miss := expirable.NewLRU[string, struct{}](negSize, nil, negTTL)
+
 	st := &Store{
 		cfg:        cfg,
 		db:         db,
+		wdb:        wdb,
 		exact:      exact,
 		exactTitle: exactTitle,
 		exist:      exist,
 		content:    content,
+		miss:       miss,
 	}
+	st.writes = newWriteQueue(1, cfg.WriteQueueSize)
 	return st, nil
+}
+
+const (
+	defaultReadConns = 8
+	readCacheKB      = 16384
+	writeCacheKB     = 2000
+)
+
+func buildDSN(path string, cacheKB int) string {
+	return fmt.Sprintf(
+		"file:%s?_pragma=busy_timeout(10000)"+
+			"&_pragma=journal_mode(WAL)"+
+			"&_pragma=synchronous(NORMAL)"+
+			"&_pragma=cache_size(%d)"+
+			"&_pragma=mmap_size(1073741824)"+
+			"&_pragma=temp_store(MEMORY)"+
+			"&_pragma=foreign_keys(ON)",
+		path, cacheKB,
+	)
 }
 
 func (s *Store) BackfillFTS5() {
@@ -174,7 +228,6 @@ func initStoreSchema(db *sql.DB) error {
 	return nil
 }
 
-// GetExact returns the most recent row matching an ISRC or platform ID.
 func (s *Store) GetExact(ctx context.Context, isrc, platformID string) (*Row, bool) {
 	if isrc == "" && platformID == "" {
 		return nil, false
@@ -183,18 +236,21 @@ func (s *Store) GetExact(ctx context.Context, isrc, platformID string) (*Row, bo
 	if v, ok := s.exact.Get(key); ok {
 		return v, v != nil
 	}
+	if s.wasMiss(key) {
+		return nil, false
+	}
 	row, err := s.queryExact(ctx, isrc, platformID)
 	if err != nil {
 		return nil, false
 	}
 	if row != nil {
 		s.exact.Add(key, row)
+	} else {
+		s.noteMiss(key)
 	}
 	return row, row != nil
 }
 
-// GetExisting returns rows matching the extracted keywords (title/artist LIKE).
-// Prefer GetByFTS5 for performance; this is kept as a legacy fallback.
 func (s *Store) GetExisting(ctx context.Context, keywords []string) ([]*Row, bool) {
 	var clean []string
 	for _, k := range keywords {
@@ -235,6 +291,9 @@ func (s *Store) GetByFTS5(ctx context.Context, title, artist string) ([]*Row, bo
 	if v, ok := s.exist.Get(key); ok {
 		return v, len(v) > 0
 	}
+	if s.wasMiss(key) {
+		return nil, false
+	}
 
 	rows, err := s.queryFTS5(ctx, tokens)
 	if err != nil {
@@ -242,12 +301,12 @@ func (s *Store) GetByFTS5(ctx context.Context, title, artist string) ([]*Row, bo
 	}
 	if len(rows) > 0 {
 		s.exist.Add(key, rows)
+	} else {
+		s.noteMiss(key)
 	}
 	return rows, len(rows) > 0
 }
 
-// buildFTSQuery builds a fast, targeted FTS5 match expression from title and artist.
-// It leverages exact phrase and prefix matching to perform sub-millisecond lookups.
 func buildFTSQuery(title, artist string) string {
 	cleanTitle := sanitizeFTSToken(title)
 	cleanArtist := sanitizeFTSToken(artist)
@@ -258,7 +317,6 @@ func buildFTSQuery(title, artist string) string {
 
 	var clauses []string
 
-	// 1. Exact phrase match on title
 	if cleanTitle != "" {
 		clauses = append(clauses, fmt.Sprintf(`title: "%s"`, cleanTitle))
 		if strings.Contains(cleanTitle, " ") {
@@ -266,7 +324,6 @@ func buildFTSQuery(title, artist string) string {
 		}
 	}
 
-	// 2. Phrase combination of title + artist
 	if cleanTitle != "" && cleanArtist != "" {
 		clauses = append(clauses, fmt.Sprintf(`(title: "%s" AND artist: "%s")`, cleanTitle, cleanArtist))
 	} else if cleanArtist != "" {
@@ -276,11 +333,9 @@ func buildFTSQuery(title, artist string) string {
 	return strings.Join(clauses, " OR ")
 }
 
-// sanitizeFTSToken removes characters that would break an FTS5 query.
 func sanitizeFTSToken(word string) string {
 	var b strings.Builder
 	for _, r := range word {
-		// Keep letters, digits, apostrophes; strip FTS5 special chars.
 		if r == '"' || r == '(' || r == ')' || r == '^' || r == '*' || r == ':' || r == '{' || r == '}' || r == '[' || r == ']' {
 			continue
 		}
@@ -290,7 +345,6 @@ func sanitizeFTSToken(word string) string {
 }
 
 func (s *Store) queryFTS5(ctx context.Context, matchExpr string) ([]*Row, error) {
-	// Join FTS5 virtual table with main table via rowid to get metadata.
 	const q = `SELECT l.id, l.filename, l.isrc, l.platform_id, l.source, l.title, l.artist, l.duration_ms, l.created_at
 FROM lyrics_fts
 JOIN lyrics l ON lyrics_fts.rowid = l.id
@@ -338,19 +392,18 @@ func (s *Store) scanSingleRow(ctx context.Context, query string, args ...any) (*
 
 func (s *Store) queryExact(ctx context.Context, isrc, platformID string) (*Row, error) {
 	if isrc != "" {
-		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE isrc = ? LIMIT 1`
-		if row, err := s.scanSingleRow(ctx, q, isrc); err != nil || row != nil {
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE isrc = ? LIMIT 1`
+		if row, err := s.scanLightRow(ctx, q, isrc); err != nil || row != nil {
 			return row, err
 		}
 	}
 	if platformID != "" {
-		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE platform_id = ? LIMIT 1`
-		return s.scanSingleRow(ctx, q, platformID)
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE platform_id = ? LIMIT 1`
+		return s.scanLightRow(ctx, q, platformID)
 	}
 	return nil, nil
 }
 
-// GetExactUser returns the most recent row matching an ISRC or platform ID with source = 'lyricsplus'.
 func (s *Store) GetExactUser(ctx context.Context, isrc, platformID string) (*Row, bool) {
 	if isrc == "" && platformID == "" {
 		return nil, false
@@ -359,31 +412,52 @@ func (s *Store) GetExactUser(ctx context.Context, isrc, platformID string) (*Row
 	if v, ok := s.exact.Get(key); ok {
 		return v, v != nil
 	}
+	if s.wasMiss(key) {
+		return nil, false
+	}
 	row, err := s.queryExactUser(ctx, isrc, platformID)
 	if err != nil {
 		return nil, false
 	}
 	if row != nil {
 		s.exact.Add(key, row)
+	} else {
+		s.noteMiss(key)
 	}
 	return row, row != nil
 }
 
 func (s *Store) queryExactUser(ctx context.Context, isrc, platformID string) (*Row, error) {
 	if isrc != "" {
-		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE isrc = ? AND source = 'lyricsplus' LIMIT 1`
-		if row, err := s.scanSingleRow(ctx, q, isrc); err != nil || row != nil {
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE isrc = ? AND source = 'lyricsplus' LIMIT 1`
+		if row, err := s.scanLightRow(ctx, q, isrc); err != nil || row != nil {
 			return row, err
 		}
 	}
 	if platformID != "" {
-		const q = `SELECT ` + storeRowColumns + ` FROM lyrics WHERE platform_id = ? AND source = 'lyricsplus' LIMIT 1`
-		return s.scanSingleRow(ctx, q, platformID)
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE platform_id = ? AND source = 'lyricsplus' LIMIT 1`
+		return s.scanLightRow(ctx, q, platformID)
 	}
 	return nil, nil
 }
 
-// GetByTitleArtist returns rows matching title and artist using idx_lyrics_title_artist index.
+func (s *Store) scanLightRow(ctx context.Context, query string, args ...any) (*Row, error) {
+	row := &Row{}
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, query, args...).Scan(
+		&row.ID, &row.Filename, &row.ISRC, &row.PlatformID,
+		&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
+	)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	row.CreatedAt = time.UnixMilli(createdAt)
+	return row, nil
+}
+
 func (s *Store) GetByTitleArtist(ctx context.Context, title, artist string) ([]*Row, bool) {
 	title = strings.TrimSpace(title)
 	artist = strings.TrimSpace(artist)
@@ -394,12 +468,17 @@ func (s *Store) GetByTitleArtist(ctx context.Context, title, artist string) ([]*
 	if v, ok := s.exactTitle.Get(key); ok {
 		return v, len(v) > 0
 	}
+	if s.wasMiss(key) {
+		return nil, false
+	}
 	rows, err := s.queryTitleArtist(ctx, title, artist)
 	if err != nil {
 		return nil, false
 	}
 	if len(rows) > 0 {
 		s.exactTitle.Add(key, rows)
+	} else {
+		s.noteMiss(key)
 	}
 	return rows, len(rows) > 0
 }
@@ -431,7 +510,6 @@ LIMIT 10`
 	return out, rows.Err()
 }
 
-// GetContent loads and decompresses content BLOB by primary key ID, caching in LRU.
 func (s *Store) GetContent(ctx context.Context, id int64) ([]byte, error) {
 	if id <= 0 {
 		return nil, nil
@@ -441,8 +519,7 @@ func (s *Store) GetContent(ctx context.Context, id int64) ([]byte, error) {
 	}
 	const q = `SELECT content FROM lyrics WHERE id = ?`
 	var raw []byte
-	err := s.db.QueryRowContext(ctx, q, id).Scan(&raw)
-	if err != nil {
+	if err := s.db.QueryRowContext(ctx, q, id).Scan(&raw); err != nil {
 		return nil, err
 	}
 	content := DecompressContent(raw)
@@ -484,7 +561,6 @@ func (s *Store) queryExisting(ctx context.Context, keywords []string) ([]*Row, e
 	return out, rows.Err()
 }
 
-// SaveUserLyrics persists a user-generated submission.
 func (s *Store) SaveUserLyrics(ctx context.Context, query domain.SearchQuery, content []byte) error {
 	row := &Row{
 		Filename:    CanonicalFilename(query.Artist, query.Title, query.Album, query.Duration, query.ISRC, query.PlatformID, "json"),
@@ -500,7 +576,6 @@ func (s *Store) SaveUserLyrics(ctx context.Context, query domain.SearchQuery, co
 	return s.SaveLyrics(ctx, row)
 }
 
-// SaveLyrics upserts a provider result row into the cache.
 func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
 	if row == nil {
 		return nil
@@ -513,37 +588,91 @@ func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
 	}
 	row.ContentJSON = CompressContent(row.ContentJSON)
 	const upsert = `INSERT INTO lyrics (filename, content, isrc, platform_id, source, title, artist, duration_ms, created_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(filename, source) DO UPDATE SET
-  content = excluded.content,
-  isrc = excluded.isrc,
-  platform_id = excluded.platform_id,
-  title = excluded.title,
-  artist = excluded.artist,
-  duration_ms = excluded.duration_ms,
-  created_at = excluded.created_at`
-	_, err := s.db.ExecContext(ctx, upsert,
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(filename, source) DO UPDATE SET
+	  content = excluded.content,
+	  isrc = excluded.isrc,
+	  platform_id = excluded.platform_id,
+	  title = excluded.title,
+	  artist = excluded.artist,
+	  duration_ms = excluded.duration_ms,
+	  created_at = excluded.created_at
+	RETURNING id`
+	var id int64
+	if err := s.wdb.QueryRowContext(ctx, upsert,
 		row.Filename, row.ContentJSON, row.ISRC, row.PlatformID, row.Source,
 		row.Title, row.Artist, row.DurationMS, row.CreatedAt.UnixMilli(),
-	)
-	if err != nil {
+	).Scan(&id); err != nil {
 		return err
 	}
-	s.exact.Remove("exact::" + strings.ToLower(row.ISRC) + "::" + strings.ToLower(row.PlatformID))
-	s.exact.Remove("exact_user::" + strings.ToLower(row.ISRC) + "::" + strings.ToLower(row.PlatformID))
-	s.exactTitle.Remove("ta::" + strings.ToLower(row.Title) + "::" + strings.ToLower(row.Artist))
+	s.invalidate(row, id)
 	return nil
 }
 
-// Close releases the underlying database handle.
-func (s *Store) Close() error {
-	if s.db != nil {
-		return s.db.Close()
+func (s *Store) SaveLyricsAsync(row *Row, timeout time.Duration) {
+	if row == nil {
+		return
 	}
-	return nil
+	s.writes.Submit(context.Background(), func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		_ = s.SaveLyrics(ctx, row)
+	})
 }
 
-// Ping verifies the underlying database is reachable.
+func (s *Store) SaveUserLyricsAsync(q domain.SearchQuery, content []byte, timeout time.Duration) {
+	buf := make([]byte, len(content))
+	copy(buf, content)
+	s.writes.Submit(context.Background(), func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+		_ = s.SaveUserLyrics(ctx, q, buf)
+	})
+}
+
+func (s *Store) invalidate(row *Row, id int64) {
+	loISRC := strings.ToLower(row.ISRC)
+	loPlat := strings.ToLower(row.PlatformID)
+	s.exact.Remove("exact::" + loISRC + "::" + loPlat)
+	s.exact.Remove("exact_user::" + loISRC + "::" + loPlat)
+	s.exactTitle.Remove("ta::" + strings.ToLower(row.Title) + "::" + strings.ToLower(row.Artist))
+	if id > 0 {
+		s.content.Remove(id)
+	}
+	s.miss.Purge()
+}
+
+func (s *Store) noteMiss(key string) {
+	if s.miss == nil {
+		return
+	}
+	s.miss.Add(key, struct{}{})
+}
+
+func (s *Store) wasMiss(key string) bool {
+	if s.miss == nil {
+		return false
+	}
+	_, ok := s.miss.Get(key)
+	return ok
+}
+
+func (s *Store) Close() error {
+	var err error
+	s.closeOnce.Do(func() {
+		if s.writes != nil {
+			s.writes.CloseWithin(5 * time.Second)
+		}
+		if s.wdb != nil {
+			_ = s.wdb.Close()
+		}
+		if s.db != nil {
+			err = s.db.Close()
+		}
+	})
+	return err
+}
+
 func (s *Store) Ping(ctx context.Context) error {
 	if s.db == nil {
 		return fmt.Errorf("storage: store not initialized")

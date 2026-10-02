@@ -4,25 +4,24 @@ import (
 	"bytes"
 	"compress/zlib"
 	"io"
+	"sync"
 )
 
-// Content blobs are prefixed with a marker byte so readers can tell compressed
-// payloads from plain ones. Plain payloads written before this scheme existed
-// carry no prefix at all and are passed through untouched.
 const (
 	contentRaw        byte = 0x00
 	contentCompressed byte = 0x01
 )
 
-// CompressContent compresses a lyrics payload with zlib BestSpeed and prefixes
-// the blob with a marker byte. Payloads that would not shrink are stored
-// uncompressed. BestSpeed is chosen over the default level because the importer
-// is network-bound; it compresses ~1.5x faster for only ~11% more size.
+var decompressBufs = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
 func CompressContent(data []byte) []byte {
 	if len(data) < 64 {
 		return append([]byte{contentRaw}, data...)
 	}
 	var buf bytes.Buffer
+	buf.Grow(len(data)/2 + 32)
 	buf.WriteByte(contentCompressed)
 	zw, _ := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
 	_, _ = zw.Write(data)
@@ -33,8 +32,6 @@ func CompressContent(data []byte) []byte {
 	return buf.Bytes()
 }
 
-// DecompressContent reverses CompressContent and is safe for legacy rows that
-// were stored without any marker prefix.
 func DecompressContent(data []byte) []byte {
 	if len(data) == 0 {
 		return data
@@ -45,9 +42,21 @@ func DecompressContent(data []byte) []byte {
 		if err != nil {
 			return data
 		}
-		defer func() { _ = zr.Close() }()
-		out, err := io.ReadAll(zr)
-		if err != nil {
+		scratch, _ := decompressBufs.Get().(*bytes.Buffer)
+		if scratch == nil {
+			scratch = new(bytes.Buffer)
+		}
+		scratch.Reset()
+		_, readErr := io.Copy(scratch, zr)
+
+		out := make([]byte, scratch.Len())
+		copy(out, scratch.Bytes())
+
+		scratch.Reset()
+		decompressBufs.Put(scratch)
+		_ = zr.Close()
+
+		if readErr != nil && len(out) == 0 {
 			return data
 		}
 		return out

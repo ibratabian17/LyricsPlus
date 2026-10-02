@@ -1,5 +1,3 @@
-// Package config loads and validates all server configuration from JSON auth/config files,
-// .env files, and environment variables.
 package config
 
 import (
@@ -13,7 +11,6 @@ import (
 	"time"
 )
 
-// Server holds HTTP server tuning.
 type Server struct {
 	Addr             string
 	MaxConcurrency   int
@@ -24,7 +21,6 @@ type Server struct {
 	ShutdownTimeout  time.Duration
 }
 
-// Proxy configures the SSRF-safe forward proxy for outbound requests.
 type Proxy struct {
 	Enabled     bool
 	URL         string
@@ -33,7 +29,6 @@ type Proxy struct {
 	Token       string
 }
 
-// SpotifyAccount holds a single Spotify credential.
 type SpotifyAccount struct {
 	NAMEID        string `json:"NAMEID"`
 	CLIENT_ID     string `json:"CLIENT_ID"`
@@ -41,10 +36,9 @@ type SpotifyAccount struct {
 	COOKIE        string `json:"COOKIE"`
 }
 
-// AppleAccount holds a single Apple Music credential (android or web auth).
 type AppleAccount struct {
 	NAMEID             string `json:"NAMEID"`
-	AUTH_TYPE          string `json:"AUTH_TYPE"` // "android" | "web"
+	AUTH_TYPE          string `json:"AUTH_TYPE"`
 	ANDROID_AUTH_TOKEN string `json:"ANDROID_AUTH_TOKEN"`
 	ANDROID_DSID       string `json:"ANDROID_DSID"`
 	ANDROID_USER_AGENT string `json:"ANDROID_USER_AGENT"`
@@ -53,25 +47,22 @@ type AppleAccount struct {
 	MUSIC_AUTH_TOKEN   string `json:"MUSIC_AUTH_TOKEN"`
 }
 
-// MusixmatchAccount holds a single Musixmatch credential (web or android auth).
 type MusixmatchAccount struct {
 	NAMEID     string `json:"NAMEID"`
-	AUTH_TYPE  string `json:"AUTH_TYPE"` // "web" | "android"
+	AUTH_TYPE  string `json:"AUTH_TYPE"`
 	USER_AGENT string `json:"USER_AGENT"`
 	COOKIE     string `json:"COOKIE"`
 	EMAIL      string `json:"EMAIL"`
 	PASSWORD   string `json:"PASSWORD"`
 }
 
-// DeezerAccount holds a single Deezer credential (refresh-token or arl).
 type DeezerAccount struct {
 	NAMEID        string `json:"NAMEID"`
-	AUTH_TYPE     string `json:"AUTH_TYPE"` // "refresh-token" | "arl"
+	AUTH_TYPE     string `json:"AUTH_TYPE"`
 	REFRESH_TOKEN string `json:"REFRESH_TOKEN"`
 	ARL           string `json:"ARL"`
 }
 
-// GDriveAccount holds a single OAuth2 credential for Google Drive.
 type GDriveAccount struct {
 	NAMEID       string `json:"NAMEID,omitempty"`
 	ClientID     string `json:"CLIENT_ID"`
@@ -80,12 +71,10 @@ type GDriveAccount struct {
 	Root         string `json:"ROOT"`
 }
 
-// IsConfigured reports whether the account carries any usable credential.
 func (a SpotifyAccount) IsConfigured() bool {
 	return a.COOKIE != "" || (a.CLIENT_ID != "" && a.CLIENT_SECRET != "")
 }
 
-// IsConfigured reports whether the account carries any usable credential.
 func (a AppleAccount) IsConfigured() bool {
 	if strings.EqualFold(a.AUTH_TYPE, "android") || a.AUTH_TYPE == "" {
 		return a.ANDROID_AUTH_TOKEN != ""
@@ -93,30 +82,29 @@ func (a AppleAccount) IsConfigured() bool {
 	return a.MUSIC_AUTH_TOKEN != ""
 }
 
-// IsConfigured reports whether the account carries any usable credential.
 func (a MusixmatchAccount) IsConfigured() bool {
 	return a.COOKIE != "" || a.USER_AGENT != "" || (a.EMAIL != "" && a.PASSWORD != "")
 }
 
-// IsConfigured reports whether the account carries any usable credential.
 func (a DeezerAccount) IsConfigured() bool {
 	return a.REFRESH_TOKEN != "" || a.ARL != ""
 }
 
-// IsConfigured reports whether the GDrive account carries usable credentials.
 func (a GDriveAccount) IsConfigured() bool {
 	return a.ClientID != "" || a.RefreshToken != ""
 }
 
-// Provider mirrors credentials and tuning knobs for each provider.
 type Provider struct {
 	Timeout                  time.Duration
-	SpotifySpotifySecretsURL string // Alias for SpotifySecretsURL for backward compatibility
+	SpotifySpotifySecretsURL string
 	SpotifySecretsURL        string
 	SpotifyFallbackSecrets   [][]int
 	SpotifyAccounts          []SpotifyAccount
 
-	// Legacy single-account aliases (automatically populated from Accounts)
+	MaxConcurrentFetches   int64
+	MaxConcurrentPerSource int64
+	FetchAdmissionWait     time.Duration
+
 	SpotifySpotifyDCCookie    string
 	SpotifyClientID           string
 	SpotifyClientSecret       string
@@ -138,7 +126,6 @@ type Provider struct {
 	DeezerAccounts            []DeezerAccount
 }
 
-// LyricsPlus holds UGC PoW configuration.
 type LyricsPlus struct {
 	JWTSecret        string
 	ChallengeTTL     time.Duration
@@ -148,13 +135,11 @@ type LyricsPlus struct {
 	AllowSubmissions bool
 }
 
-// RateLimit configures sliding-window limiter.
 type RateLimit struct {
 	Requests int
 	Window   time.Duration
 }
 
-// Storage holds the two-tier cache knobs.
 type Storage struct {
 	DBPath                  string
 	LRUSize                 int
@@ -166,9 +151,12 @@ type Storage struct {
 	GDriveFolders           []string
 	CircuitBreakerThreshold int
 	CircuitBreakerCooldown  time.Duration
+
+	ReadConns      int
+	WriteQueueSize int
+	MissMemoSize   int
 }
 
-// Cache holds in-memory HTTP cache sizing.
 type Cache struct {
 	MaxEntries         int
 	MaxBytes           int64
@@ -176,14 +164,12 @@ type Cache struct {
 	MemoryWatchdogByte int64
 }
 
-// Logger configures the structured application logger.
 type Logger struct {
 	Enabled bool
-	Level   string // debug | info | warn | error | disabled
-	Format  string // text | json
+	Level   string
+	Format  string
 }
 
-// GDrive holds Google Drive configuration, multi-account rotation, and folder IDs.
 type GDrive struct {
 	Enabled           bool
 	Accounts          []GDriveAccount
@@ -199,7 +185,6 @@ type GDrive struct {
 	DailyDumpDir      string
 }
 
-// Config is the root configuration tree.
 type Config struct {
 	Server     Server
 	Provider   Provider
@@ -211,7 +196,6 @@ type Config struct {
 	Logger     Logger
 }
 
-// Default returns a clean Config with safe production defaults.
 func Default() Config {
 	secretsURL := "https://raw.githubusercontent.com/Thereallo1026/spotify-secrets/main/secrets/secretDict.json"
 	return Config{
@@ -232,6 +216,9 @@ func Default() Config {
 		},
 		Provider: Provider{
 			Timeout:                  8 * time.Second,
+			MaxConcurrentFetches:     4096,
+			MaxConcurrentPerSource:   1024,
+			FetchAdmissionWait:       2 * time.Second,
 			SpotifySpotifySecretsURL: secretsURL,
 			SpotifySecretsURL:        secretsURL,
 			SpotifyFallbackSecrets: [][]int{
@@ -259,6 +246,9 @@ func Default() Config {
 		Storage: Storage{
 			DBPath:                  "database/lyrics_cache.db",
 			LRUSize:                 20000,
+			ReadConns:               8,
+			WriteQueueSize:          2048,
+			MissMemoSize:            5000,
 			ContentCacheBytes:       48 << 20,
 			ExactTTL:                15 * time.Minute,
 			ExistingTTL:             15 * time.Minute,
@@ -294,10 +284,6 @@ func Default() Config {
 	}
 }
 
-// Load reads configuration by layering:
-// 1. Defaults
-// 2. Config files (JSON or .env)
-// 3. Environment variable overrides (highest precedence)
 func Load(customPaths ...string) Config {
 	cfg := Default()
 	loaded := false
@@ -313,27 +299,22 @@ func Load(customPaths ...string) Config {
 		autoDiscover(&cfg)
 	}
 
-	// Layer real environment variables on top
 	applyEnvOverrides(&cfg)
 
-	// Post-process accounts & backward compatibility aliases
 	finalizeConfig(&cfg)
 
 	return cfg
 }
 
-// LoadFile reads configuration from a specific file (.json or .env) and overlays it.
 func LoadFile(path string) error {
 	cfg := Default()
 	err := loadConfigFile(&cfg, path)
 	if err != nil {
 		return err
 	}
-	// For backward-compatibility with tests or code expecting env vars set by LoadFile:
 	return nil
 }
 
-// AutoDiscoverAndLoad discovers and applies configuration files in standard locations.
 func AutoDiscoverAndLoad() {
 	_ = Load()
 }
@@ -344,7 +325,6 @@ func autoDiscover(cfg *Config) {
 		return
 	}
 
-	// 1. JSON configurations
 	for _, jsonPath := range []string{"auth.json", "data/auth.json", "config.json"} {
 		if _, err := os.Stat(jsonPath); err == nil {
 			_ = loadConfigFile(cfg, jsonPath)
@@ -352,7 +332,6 @@ func autoDiscover(cfg *Config) {
 		}
 	}
 
-	// 2. DotEnv configurations
 	for _, envPath := range []string{".env", "../.env"} {
 		if _, err := os.Stat(envPath); err == nil {
 			_ = loadConfigFile(cfg, envPath)
@@ -373,10 +352,6 @@ func loadConfigFile(cfg *Config, path string) error {
 	return loadDotEnv(cfg, clean)
 }
 
-// ============================================================================
-// JSON Config Parser
-// ============================================================================
-
 func loadJSONConfig(cfg *Config, path string) error {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -385,7 +360,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 
 	trimmed := strings.TrimSpace(string(data))
 	if strings.HasPrefix(trimmed, "[") {
-		// Raw JSON array of GDrive accounts
 		var accounts []GDriveAccount
 		if err := parseAccountListToSlice(trimmed, &accounts); err == nil && len(accounts) > 0 {
 			cfg.GDrive.Accounts = accounts
@@ -399,7 +373,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 		return fmt.Errorf("parse json config %s: %w", path, err)
 	}
 
-	// 1. Root-level GCP installed / web credentials
 	for _, wrapperKey := range []string{"installed", "web"} {
 		if raw, ok := rawMap[wrapperKey]; ok {
 			var wrapper struct {
@@ -423,7 +396,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 		}
 	}
 
-	// 2. Root-level GDrive scalar fields
 	var rootGDrive struct {
 		ClientID     string `json:"client_id"`
 		ClientSecret string `json:"client_secret"`
@@ -442,7 +414,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 		}
 	}
 
-	// 3. Root-level common fields
 	if raw, ok := rawMap["jwt_secret"]; ok {
 		var s string
 		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
@@ -487,7 +458,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 		}
 	}
 
-	// 4. Structured "server"
 	if raw, ok := rawMap["server"]; ok {
 		var s struct {
 			Port             *string  `json:"port"`
@@ -543,7 +513,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 		}
 	}
 
-	// 5. Structured "gdrive"
 	if raw, ok := rawMap["gdrive"]; ok {
 		var gd struct {
 			Enabled           *bool           `json:"enabled"`
@@ -608,7 +577,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 		}
 	}
 
-	// 6. Structured "provider"
 	if raw, ok := rawMap["provider"]; ok {
 		var prov map[string]json.RawMessage
 		if err := json.Unmarshal(raw, &prov); err == nil {
@@ -651,7 +619,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 					if err := json.Unmarshal(pv, &s); err == nil {
 						cfg.Provider.QQCookie = s
 					}
-				// Single account scalar fallbacks
 				case "spotify_cookie", "spotify_dc_cookie":
 					var s string
 					if err := json.Unmarshal(pv, &s); err == nil && s != "" && len(cfg.Provider.SpotifyAccounts) == 0 {
@@ -705,7 +672,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 		}
 	}
 
-	// 7. Structured "lyricsplus", "ratelimit", "storage", "cache", "logger"
 	if raw, ok := rawMap["lyricsplus"]; ok {
 		_ = json.Unmarshal(raw, &cfg.LyricsPlus)
 	}
@@ -784,10 +750,6 @@ func parseFolderInterface(v any) []string {
 	return nil
 }
 
-// ============================================================================
-// DotEnv Parser
-// ============================================================================
-
 func loadDotEnv(cfg *Config, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -815,7 +777,6 @@ func loadDotEnv(cfg *Config, path string) error {
 		}
 		val := strings.TrimSpace(line[eqIdx+1:])
 
-		// Strip quotes
 		if len(val) >= 2 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
 			quote := val[0]
 			val = val[1 : len(val)-1]
@@ -823,7 +784,6 @@ func loadDotEnv(cfg *Config, path string) error {
 				val = unescapeString(val)
 			}
 		} else {
-			// Strip trailing inline comments if not quoted
 			if cIdx := strings.Index(val, " #"); cIdx >= 0 {
 				val = strings.TrimSpace(val[:cIdx])
 			}
@@ -844,10 +804,6 @@ func unescapeString(s string) string {
 	return s
 }
 
-// ============================================================================
-// Environment Overrides & Mapping
-// ============================================================================
-
 func applyEnvOverrides(cfg *Config) {
 	envMap := make(map[string]string)
 	for _, kv := range os.Environ() {
@@ -860,7 +816,6 @@ func applyEnvOverrides(cfg *Config) {
 }
 
 func applyMapToConfig(cfg *Config, m map[string]string) {
-	// Server
 	if v, ok := m["PORT"]; ok && v != "" {
 		cfg.Server.Addr = v
 	}
@@ -895,7 +850,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		cfg.Server.ShutdownTimeout = time.Duration(parseInt(v, int(cfg.Server.ShutdownTimeout/time.Millisecond))) * time.Millisecond
 	}
 
-	// Logging
 	if v, ok := m["DISABLE_LOGGING"]; ok {
 		cfg.Logger.Enabled = !parseBool(v, false)
 	}
@@ -906,7 +860,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		cfg.Logger.Format = v
 	}
 
-	// RateLimit
 	if v, ok := m["RATE_LIMIT_REQUESTS"]; ok {
 		cfg.RateLimit.Requests = parseInt(v, cfg.RateLimit.Requests)
 	}
@@ -914,7 +867,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		cfg.RateLimit.Window = time.Duration(parseInt(v, int(cfg.RateLimit.Window/time.Millisecond))) * time.Millisecond
 	}
 
-	// LyricsPlus
 	if v, ok := m["JWT_SECRET"]; ok && v != "" {
 		cfg.LyricsPlus.JWTSecret = v
 	}
@@ -934,7 +886,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		cfg.LyricsPlus.AllowSubmissions = parseBool(v, cfg.LyricsPlus.AllowSubmissions)
 	}
 
-	// Storage & Cache
 	if v, ok := m["SQLITE_PATH"]; ok && v != "" {
 		cfg.Storage.DBPath = v
 	} else if v, ok := m["CACHE_DB_PATH"]; ok && v != "" {
@@ -955,6 +906,15 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 	if v, ok := m["NEGATIVE_TTL_MS"]; ok {
 		cfg.Storage.NegativeTTL = time.Duration(parseInt(v, int(cfg.Storage.NegativeTTL/time.Millisecond))) * time.Millisecond
 	}
+	if v, ok := m["SQLITE_READ_CONNS"]; ok {
+		cfg.Storage.ReadConns = parseInt(v, cfg.Storage.ReadConns)
+	}
+	if v, ok := m["SQLITE_WRITE_QUEUE"]; ok {
+		cfg.Storage.WriteQueueSize = parseInt(v, cfg.Storage.WriteQueueSize)
+	}
+	if v, ok := m["MISS_MEMO_SIZE"]; ok {
+		cfg.Storage.MissMemoSize = parseInt(v, cfg.Storage.MissMemoSize)
+	}
 	if v, ok := m["HTTP_CACHE_MAX_KEYS"]; ok {
 		cfg.Cache.MaxEntries = parseInt(v, cfg.Cache.MaxEntries)
 	}
@@ -968,7 +928,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		cfg.Cache.MemoryWatchdogByte = parseInt64(v, cfg.Cache.MemoryWatchdogByte)
 	}
 
-	// Google Drive
 	if v, ok := m["GDRIVE_ENABLED"]; ok {
 		cfg.GDrive.Enabled = parseBool(v, cfg.GDrive.Enabled)
 	}
@@ -1009,20 +968,17 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		cfg.GDrive.FolderBackup = parseCommaSlice(v)
 	}
 
-	// GDrive Accounts
 	if raw, ok := m["GDRIVE_ACCOUNTS"]; ok && raw != "" {
 		var accounts []GDriveAccount
 		if err := parseAccountListToSlice(raw, &accounts); err == nil && len(accounts) > 0 {
 			cfg.GDrive.Accounts = accounts
 		} else {
-			// Try pipe-delimited format: CLIENT_ID|CLIENT_SECRET|REFRESH_TOKEN|ROOT, ...
 			accounts = parsePipeGDriveAccounts(raw)
 			if len(accounts) > 0 {
 				cfg.GDrive.Accounts = accounts
 			}
 		}
 	} else {
-		// Single scalar auth credentials
 		cid := m["AUTH_KEY_CLIENT_ID"]
 		csec := m["AUTH_KEY_CLIENT_SECRET"]
 		rtok := m["AUTH_KEY_REFRESH_TOKEN"]
@@ -1038,16 +994,23 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		}
 	}
 
-	// Provider Tuning
 	if v, ok := m["PROVIDER_TIMEOUT_MS"]; ok {
 		cfg.Provider.Timeout = time.Duration(parseInt(v, int(cfg.Provider.Timeout/time.Millisecond))) * time.Millisecond
+	}
+	if v, ok := m["PROVIDER_MAX_CONCURRENT_FETCHES"]; ok {
+		cfg.Provider.MaxConcurrentFetches = parseInt64(v, cfg.Provider.MaxConcurrentFetches)
+	}
+	if v, ok := m["PROVIDER_MAX_CONCURRENT_PER_SOURCE"]; ok {
+		cfg.Provider.MaxConcurrentPerSource = parseInt64(v, cfg.Provider.MaxConcurrentPerSource)
+	}
+	if v, ok := m["PROVIDER_FETCH_ADMISSION_WAIT_MS"]; ok {
+		cfg.Provider.FetchAdmissionWait = time.Duration(parseInt(v, int(cfg.Provider.FetchAdmissionWait/time.Millisecond))) * time.Millisecond
 	}
 	if v, ok := m["SPOTIFY_SECRETS_URL"]; ok && v != "" {
 		cfg.Provider.SpotifySecretsURL = v
 		cfg.Provider.SpotifySpotifySecretsURL = v
 	}
 
-	// Spotify Accounts
 	if raw, ok := m["SPOTIFY_ACCOUNTS"]; ok && raw != "" {
 		var accs []SpotifyAccount
 		if err := parseAccountListToSlice(raw, &accs); err == nil && len(accs) > 0 {
@@ -1062,7 +1025,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		}}
 	}
 
-	// Apple Music Accounts
 	if raw, ok := m["APPLE_MUSIC_ACCOUNTS"]; ok && raw != "" {
 		var accs []AppleAccount
 		if err := parseAccountListToSlice(raw, &accs); err == nil && len(accs) > 0 {
@@ -1094,7 +1056,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		}
 	}
 
-	// Musixmatch Accounts
 	if raw, ok := m["MUSIXMATCH_ACCOUNTS"]; ok && raw != "" {
 		var accs []MusixmatchAccount
 		if err := parseAccountListToSlice(raw, &accs); err == nil && len(accs) > 0 {
@@ -1123,7 +1084,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		}
 	}
 
-	// Deezer Accounts
 	if raw, ok := m["DEEZER_ACCOUNTS"]; ok && raw != "" {
 		var accs []DeezerAccount
 		if err := parseAccountListToSlice(raw, &accs); err == nil && len(accs) > 0 {
@@ -1137,15 +1097,12 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		}}
 	}
 
-	// QQ Music
 	if v, ok := m["QQ_COOKIE"]; ok {
 		cfg.Provider.QQCookie = v
 	}
 }
 
-// finalizeConfig sets backward compatibility scalar fields and defaults.
 func finalizeConfig(cfg *Config) {
-	// Provider aliases from Account 0 if set
 	if len(cfg.Provider.SpotifyAccounts) > 0 {
 		first := cfg.Provider.SpotifyAccounts[0]
 		cfg.Provider.SpotifyClientID = first.CLIENT_ID
@@ -1183,8 +1140,6 @@ func finalizeConfig(cfg *Config) {
 	}
 }
 
-// parseAccountListToSlice unmarshals a JSON array of accounts, normalizing object
-// keys to UPPERCASE so both lowercase ("client_id") and uppercase keys work.
 func parseAccountListToSlice[T any](raw string, out *[]T) error {
 	trimmed := strings.TrimSpace(raw)
 	if trimmed == "" {

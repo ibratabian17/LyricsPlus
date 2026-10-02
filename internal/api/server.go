@@ -1,4 +1,3 @@
-// Package api wires the HTTP router, middleware, and handlers for the LyricsPlus server.
 package api
 
 import (
@@ -23,7 +22,6 @@ import (
 	"lyricsplus/backend/internal/version"
 )
 
-// Server wires the full HTTP API.
 type Server struct {
 	cfg      config.Config
 	router   http.Handler
@@ -33,9 +31,9 @@ type Server struct {
 	dumper   *storage.Dumper
 	gdrive   *storage.GDriveClient
 	httpSrv  *http.Server
+	powH     *handlers.Pow
 }
 
-// New builds and connects all layers.
 func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 	if lg == nil {
 		lg = logger.Nop()
@@ -56,7 +54,6 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		return nil, err
 	}
 
-	// Register platforms for live health and status monitoring
 	if providerSet.AppleMusic != nil {
 		metrics.Default.RegisterPlatform("apple", "Apple Music", providerSet.AppleMusic.Configured, "Apple Music API Availability")
 	}
@@ -86,7 +83,15 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		}, "Local LyricsPlus UGC + Cache Database Availability")
 	}
 
-	racer := orchestrator.NewRacer(toOrchestratorSources(providerSet.Sources), cfg.Provider.Timeout, orchestrator.WithLogger(lg))
+	limiter := orchestrator.NewLimiter(orchestrator.LimiterConfig{
+		Global:    cfg.Provider.MaxConcurrentFetches,
+		PerSource: cfg.Provider.MaxConcurrentPerSource,
+		Wait:      cfg.Provider.FetchAdmissionWait,
+	})
+	racer := orchestrator.NewRacer(toOrchestratorSources(providerSet.Sources), cfg.Provider.Timeout,
+		orchestrator.WithLogger(lg),
+		orchestrator.WithLimiter(limiter),
+	)
 	dedup := orchestrator.NewDedup(racer)
 
 	svc := &service.Service{
@@ -131,6 +136,7 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		watchdog: watchdog,
 		dumper:   dumper,
 		gdrive:   gdrive,
+		powH:     powH,
 	}, nil
 }
 
@@ -175,7 +181,6 @@ func newRouter(cfg config.Config, lg *logger.Logger, l *handlers.Lyrics, c *hand
 	return r
 }
 
-// Start begins serving with graceful shutdown.
 func (s *Server) Start() error {
 	s.watchdog.Start()
 	defer s.watchdog.Stop()
@@ -188,25 +193,27 @@ func (s *Server) Start() error {
 		Handler:           s.router,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      60 * time.Second, // must be > provider timeout (8s) + pipeline overhead
+		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
 	s.logger.Infof("lyricsplus serving on :%s (version=%s, commit=%s)", s.cfg.Server.Addr, version.Version, version.Commit)
 	return s.httpSrv.ListenAndServe()
 }
 
-// Shutdown performs a graceful stop.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.dumper != nil {
 		s.dumper.Stop()
 	}
+	var err error
 	if s.httpSrv != nil {
-		return s.httpSrv.Shutdown(ctx)
+		err = s.httpSrv.Shutdown(ctx)
 	}
-	return nil
+	if s.powH != nil {
+		_ = s.powH.WaitBackground(ctx)
+	}
+	return err
 }
 
-// Close releases backend resources.
 func (s *Server) Close() error {
 	if s.store != nil {
 		return s.store.Close()

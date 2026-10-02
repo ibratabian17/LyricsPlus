@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"lyricsplus/backend/internal/domain"
@@ -17,7 +18,6 @@ import (
 	"lyricsplus/backend/internal/storage"
 )
 
-// Pow serves /v1/lyricsplus/challenge and /v1/lyricsplus/submit.
 type Pow struct {
 	Issuer           *lyricsplus.Issuer
 	Verifier         *lyricsplus.Verifier
@@ -27,9 +27,24 @@ type Pow struct {
 	AcceptVandal     bool
 	AllowSubmissions bool
 	Logger           *logger.Logger
+
+	background sync.WaitGroup
 }
 
-// GetChallenge issues a fresh PoW challenge JWT.
+func (h *Pow) WaitBackground(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		h.background.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (h *Pow) GetChallenge(w http.ResponseWriter, r *http.Request) {
 	if h.Issuer == nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Server configuration error"})
@@ -65,7 +80,6 @@ type submitPayload struct {
 	ForceUpload      bool            `json:"forceUpload"`
 }
 
-// Submit verifies the PoW solution and persists the UGC lyrics.
 func (h *Pow) Submit(w http.ResponseWriter, r *http.Request) {
 	if !h.AllowSubmissions {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "Submissions are currently disabled"})
@@ -142,16 +156,12 @@ func (h *Pow) Submit(w http.ResponseWriter, r *http.Request) {
 	fileName := storage.CanonicalFilename(query.Artist, query.Title, query.Album, query.Duration, query.ISRC, query.PlatformID, "json")
 
 	if h.Store != nil {
-		go func() {
-			sctx, c := contextWithTimeoutRaw(15 * time.Second)
-			defer c()
-			if err := h.Store.SaveUserLyrics(sctx, query, content); err != nil {
-				h.logf("submit save to store failed: %v", err)
-			}
-		}()
+		h.Store.SaveUserLyricsAsync(query, content, 15*time.Second)
 	}
 	if h.GDrive != nil && h.GDrive.IsConfigured() {
+		h.background.Add(1)
 		go func() {
+			defer h.background.Done()
 			guctx, c := contextWithTimeoutRaw(30 * time.Second)
 			defer c()
 			if _, err := h.GDrive.UploadUserLyrics(guctx, fileName, content); err != nil {
@@ -174,9 +184,12 @@ func (h *Pow) isVandalism(ctx context.Context, payload submitPayload, next *doma
 	var prev *domain.LyricsResponse
 	if payload.SongISRC != "" || payload.SongPlatformID != "" {
 		if row, ok := h.Store.GetExact(ctx, payload.SongISRC, payload.SongPlatformID); ok && row != nil {
-			var pr domain.LyricsResponse
-			if json.Unmarshal(row.ContentJSON, &pr) == nil {
-				prev = &pr
+			content, err := h.Store.GetContent(ctx, row.ID)
+			if err == nil && len(content) > 0 {
+				var pr domain.LyricsResponse
+				if json.Unmarshal(content, &pr) == nil {
+					prev = &pr
+				}
 			}
 		}
 	}

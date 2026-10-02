@@ -9,28 +9,26 @@ import (
 	"time"
 )
 
-// PlatformChecker is an interface for components that report their configuration/active status.
 type PlatformChecker interface {
 	Name() string
 	Configured() bool
 }
 
-// PlatformStatus holds the runtime and health status of a provider/platform.
 type PlatformStatus struct {
 	Name               string   `json:"name"`
 	Active             bool     `json:"active"`
-	Status             string   `json:"status"` // "ONLINE", "OFFLINE", "NOT_CONFIGURED", "DEGRADED"
+	Status             string   `json:"status"`
 	TotalCalls         int64    `json:"totalCalls"`
 	SuccessCalls       int64    `json:"successCalls"`
 	FailedCalls        int64    `json:"failedCalls"`
 	RtoCalls           int64    `json:"rtoCalls"`
+	OverloadCalls      int64    `json:"overloadCalls"`
 	SuccessRatePercent *float64 `json:"successRatePercent,omitempty"`
 	LastStatus         string   `json:"lastStatus,omitempty"`
 	LastSeenAt         *string  `json:"lastSeenAt,omitempty"`
 	Details            string   `json:"details,omitempty"`
 }
 
-// RequestMetrics summarizes HTTP request outcomes.
 type RequestMetrics struct {
 	TotalRequests      int64            `json:"total"`
 	SuccessRequests    int64            `json:"success"`
@@ -40,7 +38,6 @@ type RequestMetrics struct {
 	StatusCodes        map[string]int64 `json:"statusCodes"`
 }
 
-// LyricsMetrics summarizes lyrics resolution statistics.
 type LyricsMetrics struct {
 	TotalLookups       int64            `json:"totalLookups"`
 	Found              int64            `json:"found"`
@@ -50,7 +47,6 @@ type LyricsMetrics struct {
 	WinnerDistribution map[string]int64 `json:"winnerDistribution"`
 }
 
-// SystemMetrics summarizes runtime resource usage.
 type SystemMetrics struct {
 	Goroutines    int     `json:"goroutines"`
 	MemoryAllocMB float64 `json:"memoryAllocMB"`
@@ -58,7 +54,6 @@ type SystemMetrics struct {
 	NumGC         uint32  `json:"numGC"`
 }
 
-// HealthDebugReport is the complete diagnostics view for /health.
 type HealthDebugReport struct {
 	Requests  RequestMetrics            `json:"requests"`
 	Lyrics    LyricsMetrics             `json:"lyrics"`
@@ -67,44 +62,39 @@ type HealthDebugReport struct {
 }
 
 type providerCounters struct {
-	mu           sync.Mutex
-	name         string
-	configuredFn func() bool
-	details      string
-	totalCalls   int64
-	successCalls int64
-	failedCalls  int64
-	rtoCalls     int64
-	lastStatus   string
-	lastSeen     time.Time
+	mu            sync.Mutex
+	name          string
+	configuredFn  func() bool
+	details       string
+	totalCalls    int64
+	successCalls  int64
+	failedCalls   int64
+	rtoCalls      int64
+	overloadCalls int64
+	lastStatus    string
+	lastSeen      time.Time
 }
 
-// Collector collects live runtime and platform statistics.
 type Collector struct {
 	started time.Time
 
-	// HTTP counters
 	totalReqs   atomic.Int64
 	successReqs atomic.Int64
 	failedReqs  atomic.Int64
-	statusCodes sync.Map // string -> *atomic.Int64
+	statusCodes sync.Map
 
-	// Lyrics counters
 	totalLookups atomic.Int64
 	foundLookups atomic.Int64
 	missLookups  atomic.Int64
-	cacheHits    sync.Map // string -> *atomic.Int64
-	winners      sync.Map // string -> *atomic.Int64
+	cacheHits    sync.Map
+	winners      sync.Map
 
-	// Platform trackers
 	platformMu sync.RWMutex
 	platforms  map[string]*providerCounters
 }
 
-// Default is the singleton collector used across the process.
 var Default = NewCollector()
 
-// NewCollector creates an initialized metrics collector.
 func NewCollector() *Collector {
 	return &Collector{
 		started:   time.Now(),
@@ -112,7 +102,6 @@ func NewCollector() *Collector {
 	}
 }
 
-// RegisterPlatform registers a provider/platform checker for health tracking.
 func (c *Collector) RegisterPlatform(id, name string, configuredFn func() bool, details string) {
 	c.platformMu.Lock()
 	defer c.platformMu.Unlock()
@@ -124,7 +113,6 @@ func (c *Collector) RegisterPlatform(id, name string, configuredFn func() bool, 
 	}
 }
 
-// RecordHTTPRequest records an HTTP request outcome.
 func (c *Collector) RecordHTTPRequest(statusCode int) {
 	c.totalReqs.Add(1)
 	if statusCode >= 200 && statusCode < 400 {
@@ -138,7 +126,6 @@ func (c *Collector) RecordHTTPRequest(statusCode int) {
 	val.(*atomic.Int64).Add(1)
 }
 
-// RecordLyricsLookup records a lyrics fetch outcome.
 func (c *Collector) RecordLyricsLookup(winner string, cacheLevel string, found bool) {
 	c.totalLookups.Add(1)
 	if found {
@@ -158,7 +145,6 @@ func (c *Collector) RecordLyricsLookup(winner string, cacheLevel string, found b
 	}
 }
 
-// RecordProviderCall records the outcome of a provider invocation.
 func (c *Collector) RecordProviderCall(providerID string, status string, elapsedMs int64) {
 	c.platformMu.Lock()
 	p, ok := c.platforms[providerID]
@@ -188,7 +174,23 @@ func (c *Collector) RecordProviderCall(providerID string, status string, elapsed
 	}
 }
 
-// Snapshot builds the diagnostics report.
+func (c *Collector) RecordProviderOverload(providerID string) {
+	c.platformMu.Lock()
+	p, ok := c.platforms[providerID]
+	if !ok {
+		p = &providerCounters{name: providerID, lastStatus: "OVERLOAD"}
+		c.platforms[providerID] = p
+	}
+	c.platformMu.Unlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.totalCalls++
+	p.overloadCalls++
+	p.lastStatus = "OVERLOAD"
+	p.lastSeen = time.Now()
+}
+
 func (c *Collector) Snapshot() HealthDebugReport {
 	totReq := c.totalReqs.Load()
 	succReq := c.successReqs.Load()
@@ -269,6 +271,7 @@ func (c *Collector) Snapshot() HealthDebugReport {
 			SuccessCalls:       p.successCalls,
 			FailedCalls:        p.failedCalls,
 			RtoCalls:           p.rtoCalls,
+			OverloadCalls:      p.overloadCalls,
 			SuccessRatePercent: rate,
 			LastStatus:         p.lastStatus,
 			LastSeenAt:         lastSeenStr,

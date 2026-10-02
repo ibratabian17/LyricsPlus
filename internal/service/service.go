@@ -1,4 +1,3 @@
-// Package service normalizes, caches, and serves canonical lyrics payloads.
 package service
 
 import (
@@ -17,8 +16,8 @@ import (
 	"lyricsplus/backend/internal/storage"
 )
 
-// Service exposes lyrics retrieval with caching, singleflight dedup and
-// fire-and-forget background persistence.
+const backgroundWriteTimeout = 15 * time.Second
+
 type Service struct {
 	Dedup       *orchestrator.Dedup
 	Store       *storage.Store
@@ -27,7 +26,6 @@ type Service struct {
 	NegativeTTL time.Duration
 }
 
-// RawResult is the raw source payload for /v1/raw/get.
 type RawResult struct {
 	Source  string
 	Raw     string
@@ -112,8 +110,6 @@ func lyricsCacheKey(q domain.SearchQuery) string   { return "lyrics::" + q.Conte
 func rawCacheKey(q domain.SearchQuery) string      { return "raw::" + q.ContentKey() }
 func negativeCacheKey(q domain.SearchQuery) string { return "neg::" + q.ContentKey() }
 
-// FetchLyrics resolves lyrics for a query, consulting the memory cache and
-// SQLite store before racing providers. Cache writes are never blocking.
 func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*domain.LyricsResponse, error) {
 	start := time.Now()
 	if !forceReload {
@@ -172,53 +168,36 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 		resp.Cached = domain.CacheNone
 	}
 
-	// Fire-and-forget persistence: never block the HTTP response.
-	// Qaple results are synthesized on-the-fly from live sources and are never saved to the SQLite store.
 	if s.Store != nil && resp.RawData != "" && res.Source != "qaple" && !strings.Contains(resp.Metadata.Source, "with QQ") {
-		winner := res.Source
-		go func() {
-			defer func() {
-				if rec := recover(); rec != nil && s.Logger != nil {
-					s.Logger.Errorf("panic in saveLyrics background: %v", rec)
-				}
-			}()
-			ctx2, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			contentJSON, err := json.Marshal(resp)
-			if err != nil {
-				return
+		title := q.Title
+		artist := q.Artist
+		album := q.Album
+		if pt := resp.ProcessingTime; pt != nil && pt.SelectedSongMetadata != nil {
+			m := pt.SelectedSongMetadata
+			if m.Title != "" {
+				title = m.Title
 			}
-			title := q.Title
-			artist := q.Artist
-			album := q.Album
-			if resp.ProcessingTime != nil && resp.ProcessingTime.SelectedSongMetadata != nil {
-				if resp.ProcessingTime.SelectedSongMetadata.Title != "" {
-					title = resp.ProcessingTime.SelectedSongMetadata.Title
-				}
-				if resp.ProcessingTime.SelectedSongMetadata.Artist != "" {
-					artist = resp.ProcessingTime.SelectedSongMetadata.Artist
-				}
-				if resp.ProcessingTime.SelectedSongMetadata.Album != "" {
-					album = resp.ProcessingTime.SelectedSongMetadata.Album
-				}
+			if m.Artist != "" {
+				artist = m.Artist
 			}
-			row := &storage.Row{
+			if m.Album != "" {
+				album = m.Album
+			}
+		}
+		contentJSON, err := json.Marshal(resp)
+		if err == nil {
+			s.Store.SaveLyricsAsync(&storage.Row{
 				Filename:    storage.CanonicalFilename(artist, title, album, q.Duration, q.ISRC, q.PlatformID, extFor(resp.Metadata.Source)),
 				ContentJSON: contentJSON,
 				ISRC:        q.ISRC,
 				PlatformID:  q.PlatformID,
-				Source:      winner,
+				Source:      res.Source,
 				Title:       title,
 				Artist:      artist,
 				DurationMS:  q.Duration,
 				CreatedAt:   now,
-			}
-			if err := s.Store.SaveLyrics(ctx2, row); err != nil {
-				if s.Logger != nil {
-					s.Logger.Errorf("background cache save failed: %v", err)
-				}
-			}
-		}()
+			}, backgroundWriteTimeout)
+		}
 	}
 
 	s.cacheResponse(ctx, q, resp, res.Source)
@@ -226,7 +205,6 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 	return resp, nil
 }
 
-// FetchRaw returns the raw provider payload for /v1/raw/get.
 func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*RawResult, error) {
 	start := time.Now()
 	if !forceReload {
@@ -350,7 +328,6 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	bestPrio := -1
 	var candidates []*storage.Row
 
-	// 1. Exact ID match (ISRC / Platform ID) via B-Tree index (<1ms)
 	if q.ISRC != "" || q.PlatformID != "" {
 		if r, ok := s.Store.GetExact(dbCtx, q.ISRC, q.PlatformID); ok && r != nil {
 			src := rowSource(r)
@@ -364,7 +341,6 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		}
 	}
 
-	// 2. Exact Title + Artist match via idx_lyrics_title_artist B-Tree index (<1ms)
 	if (row == nil || bestPrio > 0) && (q.Title != "" && q.Artist != "") {
 		if rows, ok := s.Store.GetByTitleArtist(dbCtx, q.Title, q.Artist); ok && len(rows) > 0 {
 			candidates = append(candidates, rows...)
@@ -377,7 +353,6 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		}
 	}
 
-	// 3. FTS5 full-text search (sub-ms inverted index), Go-side fuzzy scoring.
 	if (row == nil || bestPrio > 0) && (q.Title != "" || q.Artist != "") {
 		if rows, ok := s.Store.GetByFTS5(dbCtx, q.Title, q.Artist); ok && len(rows) > 0 {
 			candidates = append(candidates, rows...)
@@ -393,8 +368,6 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		return nil, false
 	}
 
-	// If explicit sources were specified and top preference (index 0) was not found in cache,
-	// do not return a lower-priority fallback from cache so providers can race live.
 	if len(q.Sources) > 0 && bestPrio > 0 {
 		return nil, false
 	}
@@ -809,8 +782,6 @@ func providerDisplayName(source string) string {
 	}
 }
 
-// ProviderNameForSource maps a metadata source label back to the racer's
-// provider name, so cache hits can report a winner.
 func ProviderNameForSource(source string) string {
 	s := strings.ToLower(strings.TrimSpace(source))
 	switch s {
@@ -840,8 +811,6 @@ func ProviderNameForSource(source string) string {
 
 var providerNameForSource = ProviderNameForSource
 
-// sourcePriority returns the 0-indexed position of candidate in allowed,
-// or -1 if candidate is not allowed. If allowed is empty, returns 0.
 func sourcePriority(candidate string, allowed []string) int {
 	if len(allowed) == 0 {
 		return 0
@@ -919,7 +888,6 @@ func extFor(source string) string {
 	}
 }
 
-// pickBestRow evaluates duplicate candidates by duration, album similarity, and source preference.
 func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) {
 	if len(rows) == 0 {
 		return nil, -1
@@ -939,7 +907,6 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 		return nil, -1
 	}
 
-	// When explicit sources are requested, evaluate in order of source priority
 	if len(q.Sources) > 0 {
 		for prio := 0; prio < len(q.Sources); prio++ {
 			var prioRows []*storage.Row
@@ -960,7 +927,6 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 
 	queryDurSec := float64(q.Duration) / 1000.0
 
-	// Rank title queries by song similarity
 	if q.Title != "" {
 		candidates := make([]similarity.SongCandidate, len(valid))
 		for i, r := range valid {
@@ -995,7 +961,6 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 		return nil, -1
 	}
 
-	// Artist-only queries fall back to best source priority.
 	var best *storage.Row
 	bestPrio := -1
 	for _, r := range valid {
