@@ -301,11 +301,9 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 			return pickWinner(results, names)
 		case <-phaseCtx.Done():
 			cancel()
-			<-done
 			return pickWinner(results, names)
 		case <-ctx.Done():
 			cancel()
-			<-done
 			return pickWinner(results, names)
 		}
 	}

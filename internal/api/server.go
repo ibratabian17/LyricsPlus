@@ -187,6 +187,9 @@ func (s *Server) Start() error {
 		Addr:              ":" + s.cfg.Server.Addr,
 		Handler:           s.router,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second, // must be > provider timeout (8s) + pipeline overhead
+		IdleTimeout:       90 * time.Second,
 	}
 	s.logger.Infof("lyricsplus serving on :%s (version=%s, commit=%s)", s.cfg.Server.Addr, version.Version, version.Commit)
 	return s.httpSrv.ListenAndServe()

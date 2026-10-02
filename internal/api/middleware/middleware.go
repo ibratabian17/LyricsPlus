@@ -19,6 +19,14 @@ import (
 	"lyricsplus/backend/internal/metrics"
 )
 
+// gzipPool reuses gzip.Writers to avoid per-request heap allocations under load.
+var gzipPool = sync.Pool{
+	New: func() interface{} {
+		gw, _ := gzip.NewWriterLevel(nil, gzip.BestSpeed)
+		return gw
+	},
+}
+
 type ctxKey int
 
 const (
@@ -140,12 +148,12 @@ func Compression(next http.Handler) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Encoding", "gzip")
-		gz, err := gzip.NewWriterLevel(w, gzip.BestSpeed)
-		if err != nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-		defer func() { _ = gz.Close() }()
+		gz := gzipPool.Get().(*gzip.Writer)
+		gz.Reset(w)
+		defer func() {
+			_ = gz.Close()
+			gzipPool.Put(gz)
+		}()
 		next.ServeHTTP(gzipResponseWriter{ResponseWriter: w, gw: gz}, r)
 	})
 }
@@ -264,9 +272,20 @@ func ClientIP(r *http.Request) string {
 
 const numShards = 64
 
+// ipEntry holds a fixed-capacity ring buffer of request timestamps (unix nano)
+// to avoid heap allocations on the hot path. maxStamps must be >= max config value.
+const maxStamps = 128
+
+type ipEntry struct {
+	ts   [maxStamps]int64 // ring buffer of arrival times (unix ns)
+	head int              // write head
+	n    int              // count of entries currently valid
+	last int64            // last-seen timestamp (ns) for pruning
+}
+
 type rateLimiterShard struct {
 	mu        sync.Mutex
-	perIP     map[string][]time.Time
+	perIP     map[string]*ipEntry
 	lastPrune time.Time
 }
 
@@ -292,13 +311,16 @@ func RateLimiter(max int, window time.Duration) func(http.Handler) http.Handler 
 			return next
 		}
 	}
+	if max > maxStamps {
+		max = maxStamps // safety clamp
+	}
 	l := &shardedRateLimiter{
 		window: window,
 		max:    max,
 	}
 	now := time.Now()
 	for i := 0; i < numShards; i++ {
-		l.shards[i].perIP = make(map[string][]time.Time)
+		l.shards[i].perIP = make(map[string]*ipEntry, 32)
 		l.shards[i].lastPrune = now
 	}
 	return l.middleware
@@ -330,39 +352,62 @@ func (l *shardedRateLimiter) allow(key string) (string, bool) {
 	shard := &l.shards[shardIdx]
 
 	now := time.Now()
+	nowNs := now.UnixNano()
+	cutoffNs := now.Add(-l.window).UnixNano()
+
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+
+	// Periodic prune: remove IPs that haven't been seen in 2 windows.
 	if now.Sub(shard.lastPrune) > l.window*2 {
-		for k, stamps := range shard.perIP {
-			if len(stamps) == 0 || now.Sub(stamps[len(stamps)-1]) > l.window*2 {
+		pruneAfter := now.Add(-l.window * 2).UnixNano()
+		for k, e := range shard.perIP {
+			if e.last < pruneAfter {
 				delete(shard.perIP, k)
 			}
 		}
 		shard.lastPrune = now
 	}
-	stamps := shard.perIP[key]
-	cutoff := now.Add(-l.window)
-	keep := 0
-	for i, t := range stamps {
-		if t.After(cutoff) {
-			keep = i
-			break
-		}
-		keep = i + 1
+
+	e := shard.perIP[key]
+	if e == nil {
+		e = &ipEntry{}
+		shard.perIP[key] = e
 	}
-	stamps = stamps[keep:]
-	if len(stamps) >= l.max {
-		oldest := stamps[0]
-		remaining := l.window - now.Sub(oldest)
+	e.last = nowNs
+
+	// Count how many entries fall within the current window.
+	count := 0
+	for i := 0; i < e.n; i++ {
+		idx := (e.head - e.n + i + maxStamps) % maxStamps
+		if e.ts[idx] >= cutoffNs {
+			count++
+		}
+	}
+
+	if count >= l.max {
+		// Find the oldest timestamp in the window to compute retry-after.
+		oldest := nowNs
+		for i := 0; i < e.n; i++ {
+			idx := (e.head - e.n + i + maxStamps) % maxStamps
+			if e.ts[idx] >= cutoffNs && e.ts[idx] < oldest {
+				oldest = e.ts[idx]
+			}
+		}
+		remaining := l.window - time.Duration(nowNs-oldest)
 		secs := int(remaining.Seconds())
 		if secs < 1 {
 			secs = 1
 		}
-		shard.perIP[key] = stamps
 		return itoaSec(secs), false
 	}
-	stamps = append(stamps, now)
-	shard.perIP[key] = stamps
+
+	// Write new timestamp into the ring buffer.
+	e.ts[e.head] = nowNs
+	e.head = (e.head + 1) % maxStamps
+	if e.n < maxStamps {
+		e.n++
+	}
 	return "0", true
 }
 

@@ -13,10 +13,54 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"lyricsplus/backend/internal/config"
 )
+
+// dnsCache caches successful IP lookups to avoid per-request blocking DNS on
+// the validate() hot path. Entries expire after dnsCacheTTL.
+const dnsCacheTTL = 60 * time.Second
+
+type dnsCacheEntry struct {
+	ips    []net.IP
+	expiry time.Time
+}
+
+var (
+	dnsMu    sync.Mutex
+	dnsStore = make(map[string]dnsCacheEntry, 64)
+)
+
+func lookupIPCached(host string) ([]net.IP, error) {
+	now := time.Now()
+	dnsMu.Lock()
+	if e, ok := dnsStore[host]; ok && now.Before(e.expiry) {
+		ips := e.ips
+		dnsMu.Unlock()
+		return ips, nil
+	}
+	dnsMu.Unlock()
+
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil, err
+	}
+
+	dnsMu.Lock()
+	// Prune stale entries if the map grows too large.
+	if len(dnsStore) > 512 {
+		for k, v := range dnsStore {
+			if now.After(v.expiry) {
+				delete(dnsStore, k)
+			}
+		}
+	}
+	dnsStore[host] = dnsCacheEntry{ips: ips, expiry: now.Add(dnsCacheTTL)}
+	dnsMu.Unlock()
+	return ips, nil
+}
 
 // hopByHopHeaders are stripped per RFC 7230 when forwarding.
 var hopByHopHeaders = []string{
@@ -95,7 +139,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	req = withDefaultDeadline(req)
+	req, cancel := withDefaultDeadline(req)
 
 	if c.cfg.Enabled {
 		if proxyURL := c.pickProxyURL(); proxyURL != "" && shouldProxy(u) {
@@ -112,6 +156,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			}
 			newU, err := url.Parse(fullURL)
 			if err != nil {
+				cancel()
 				return nil, fmt.Errorf("invalid proxy url: %w", err)
 			}
 			internal.URL = newU
@@ -130,9 +175,10 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 			}
 			resp, err := c.http.Do(internal)
 			if err != nil {
+				cancel()
 				return nil, dedupeErr(err)
 			}
-			return decompressIfNeeded(resp), nil
+			return wrapCancelBody(decompressIfNeeded(resp), cancel), nil
 		}
 	}
 
@@ -142,9 +188,21 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
+		cancel()
 		return nil, dedupeErr(err)
 	}
-	return decompressIfNeeded(resp), nil
+	return wrapCancelBody(decompressIfNeeded(resp), cancel), nil
+}
+
+// wrapCancelBody attaches the cancel func to the response body so it is called
+// when the caller closes the body, releasing context timer resources promptly.
+func wrapCancelBody(resp *http.Response, cancel context.CancelFunc) *http.Response {
+	if resp == nil || resp.Body == nil {
+		cancel()
+		return resp
+	}
+	resp.Body = &cancelBody{ReadCloser: resp.Body, cancel: cancel}
+	return resp
 }
 
 // pickProxyURL returns a randomly selected proxy URL from the configured list.
@@ -174,15 +232,28 @@ func shouldProxy(u *url.URL) bool {
 	return true
 }
 
+// cancelBody wraps a ReadCloser and calls cancel when closed, releasing the
+// context resources as soon as the response body is drained or discarded.
+type cancelBody struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b *cancelBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel()
+	return err
+}
+
 // withDefaultDeadline applies the JS-equivalent 15s per-request timeout when
 // the caller did not provide a context deadline of its own.
-func withDefaultDeadline(req *http.Request) *http.Request {
+// The returned cancel is wired to the response body so it fires on Close().
+func withDefaultDeadline(req *http.Request) (*http.Request, context.CancelFunc) {
 	if _, ok := req.Context().Deadline(); ok {
-		return req
+		return req, func() {}
 	}
 	ctx, cancel := context.WithTimeout(req.Context(), defaultRequestTimeout)
-	_ = cancel // timer is bounded by defaultRequestTimeout; released on firing
-	return req.WithContext(ctx)
+	return req.WithContext(ctx), cancel
 }
 
 type gzipReadCloser struct {
@@ -221,7 +292,7 @@ func (c *Client) validate(u *url.URL) error {
 		return nil
 	}
 	// Pin DNS resolution verbatim to prevent rebinding.
-	ips, err := net.LookupIP(host)
+	ips, err := lookupIPCached(host)
 	if err != nil {
 		return fmt.Errorf("dns lookup failed: %w", err)
 	}

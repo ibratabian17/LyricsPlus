@@ -81,10 +81,20 @@ func (c *MemoryCache) Len() int {
 	return c.entries.Len()
 }
 
-// Shed empties the cache (invoked by the memory watchdog).
+// Shed evicts the oldest 50% of entries (invoked by the memory watchdog) to relieve memory without causing a full cache stampede.
 func (c *MemoryCache) Shed() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries.Purge()
-	c.bytes = 0
+	toRemove := c.entries.Len() / 2
+	if toRemove == 0 {
+		toRemove = c.entries.Len()
+	}
+	for i := 0; i < toRemove; i++ {
+		if _, v, ok := c.entries.RemoveOldest(); ok && v != nil {
+			c.bytes -= int64(len(v.Body))
+		}
+	}
+	if c.bytes < 0 {
+		c.bytes = 0
+	}
 }

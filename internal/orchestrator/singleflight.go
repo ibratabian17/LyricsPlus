@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 
@@ -27,24 +28,37 @@ func (d *Dedup) Get(ctx context.Context, q domain.SearchQuery, preferredSources 
 	}
 	key := q.NormalizeKey()
 
-	v, err, _ := d.group.Do(key, func() (interface{}, error) {
-		return d.racer.Race(ctx, q, preferredSources), nil
+	timeout := d.racer.timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+
+	ch := d.group.DoChan(key, func() (interface{}, error) {
+		fetchCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		return d.racer.Race(fetchCtx, q, preferredSources), nil
 	})
-	if err != nil {
-		return nil, err
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		r, ok := res.Val.(*Result)
+		if !ok {
+			return nil, errUnavailable
+		}
+		if r == nil {
+			return nil, nil
+		}
+		// Return a shallow copy so callers can decorate diagnostics safely.
+		cp := *r
+		if r.Resp != nil {
+			rCopy := *r.Resp
+			cp.Resp = &rCopy
+		}
+		return &cp, nil
 	}
-	res, ok := v.(*Result)
-	if !ok {
-		return nil, errUnavailable
-	}
-	if res == nil {
-		return nil, nil
-	}
-	// Return a shallow copy so callers can decorate diagnostics safely.
-	cp := *res
-	if res.Resp != nil {
-		r := *res.Resp
-		cp.Resp = &r
-	}
-	return &cp, nil
 }
