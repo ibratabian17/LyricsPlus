@@ -20,10 +20,11 @@ import (
 // Service exposes lyrics retrieval with caching, singleflight dedup and
 // fire-and-forget background persistence.
 type Service struct {
-	Dedup    *orchestrator.Dedup
-	Store    *storage.Store
-	MemCache *storage.MemoryCache
-	Logger   *logger.Logger
+	Dedup       *orchestrator.Dedup
+	Store       *storage.Store
+	MemCache    *storage.MemoryCache
+	Logger      *logger.Logger
+	NegativeTTL time.Duration
 }
 
 // RawResult is the raw source payload for /v1/raw/get.
@@ -107,14 +108,19 @@ type rawCacheEntry struct {
 	Raw    string `json:"raw"`
 }
 
-func lyricsCacheKey(q domain.SearchQuery) string { return "lyrics::" + q.ContentKey() }
-func rawCacheKey(q domain.SearchQuery) string    { return "raw::" + q.ContentKey() }
+func lyricsCacheKey(q domain.SearchQuery) string   { return "lyrics::" + q.ContentKey() }
+func rawCacheKey(q domain.SearchQuery) string      { return "raw::" + q.ContentKey() }
+func negativeCacheKey(q domain.SearchQuery) string { return "neg::" + q.ContentKey() }
 
 // FetchLyrics resolves lyrics for a query, consulting the memory cache and
 // SQLite store before racing providers. Cache writes are never blocking.
 func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*domain.LyricsResponse, error) {
 	start := time.Now()
 	if !forceReload {
+		if s.fromNegativeCache(q) {
+			metrics.Default.RecordLyricsLookup("", "memory_negative", false)
+			return nil, s.buildNotFound(q, preferredSources, nil, time.Since(start))
+		}
 		if resp, ok := s.fromMemory(ctx, q); ok {
 			decorateCacheHit(resp, q, preferredSources, time.Since(start))
 			winner := providerNameForSource(resp.Metadata.Source)
@@ -136,6 +142,7 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 	}
 	if res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
 		metrics.Default.RecordLyricsLookup("", "", false)
+		s.cacheNegative(q)
 		return nil, s.buildNotFound(q, preferredSources, res, time.Since(start))
 	}
 
@@ -170,6 +177,11 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 	if s.Store != nil && resp.RawData != "" && res.Source != "qaple" && !strings.Contains(resp.Metadata.Source, "with QQ") {
 		winner := res.Source
 		go func() {
+			defer func() {
+				if rec := recover(); rec != nil && s.Logger != nil {
+					s.Logger.Errorf("panic in saveLyrics background: %v", rec)
+				}
+			}()
 			ctx2, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
 			contentJSON, err := json.Marshal(resp)
@@ -218,6 +230,9 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*RawResult, error) {
 	start := time.Now()
 	if !forceReload {
+		if s.fromNegativeCache(q) {
+			return nil, s.buildNotFound(q, preferredSources, nil, time.Since(start))
+		}
 		if s.MemCache != nil {
 			if e, ok := s.MemCache.Get(rawCacheKey(q)); ok && e != nil {
 				var entry rawCacheEntry
@@ -235,6 +250,7 @@ func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredS
 		return nil, err
 	}
 	if res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
+		s.cacheNegative(q)
 		return nil, s.buildNotFound(q, preferredSources, res, time.Since(start))
 	}
 	if res.Resp.RawData == "" {
@@ -687,6 +703,29 @@ func (s *Service) cacheResponse(ctx context.Context, q domain.SearchQuery, resp 
 			s.MemCache.Set(rawCacheKey(q), &storage.CacheEntry{Body: b, StoredAt: time.Now()})
 		}
 	}
+}
+
+func (s *Service) cacheNegative(q domain.SearchQuery) {
+	if s.MemCache == nil {
+		return
+	}
+	ttl := s.NegativeTTL
+	if ttl <= 0 {
+		ttl = 30 * time.Second
+	}
+	s.MemCache.Set(negativeCacheKey(q), &storage.CacheEntry{
+		Status:   404,
+		StoredAt: time.Now(),
+		TTL:      ttl,
+	})
+}
+
+func (s *Service) fromNegativeCache(q domain.SearchQuery) bool {
+	if s.MemCache == nil {
+		return false
+	}
+	e, ok := s.MemCache.Get(negativeCacheKey(q))
+	return ok && e != nil && e.Status == 404
 }
 
 func buildProcessTiming(res *orchestrator.Result, q domain.SearchQuery, lastProcessed int64) *domain.ProcessTiming {

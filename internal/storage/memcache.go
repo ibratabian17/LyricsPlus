@@ -15,6 +15,7 @@ type CacheEntry struct {
 	Header   map[string][]string
 	Status   int
 	StoredAt time.Time
+	TTL      time.Duration
 }
 
 // MemoryCache emulates the Web Cache API with byte-budget shedding.
@@ -43,6 +44,11 @@ func (c *MemoryCache) Get(key string) (*CacheEntry, bool) {
 	defer c.mu.Unlock()
 	e, ok := c.entries.Get(key)
 	if !ok {
+		return nil, false
+	}
+	if e.TTL > 0 && time.Since(e.StoredAt) > e.TTL {
+		c.bytes -= int64(len(e.Body))
+		c.entries.Remove(key)
 		return nil, false
 	}
 	return e, true

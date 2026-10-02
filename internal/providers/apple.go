@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/logger"
@@ -45,6 +47,16 @@ const (
 	appleSuggestionsBaseURL = "https://amp-api-edge.music.apple.com/v1"
 )
 
+type appleSongCacheEntry struct {
+	songs   []appleSong
+	created time.Time
+}
+
+type appleISRCCacheEntry struct {
+	song    *appleSong
+	created time.Time
+}
+
 // AppleMusicProvider fetches TTML or syllable lyrics from Apple Music,
 // rotating through a list of android/web accounts on 401/429 (503 rate-limits
 // reuse the same account).
@@ -57,6 +69,10 @@ type AppleMusicProvider struct {
 	storefrontMu     sync.Mutex
 	cachedWebToken   string
 	cachedStorefront string
+
+	searchCache      *lru.Cache[string, *appleSongCacheEntry]
+	suggestionsCache *lru.Cache[string, *appleSongCacheEntry]
+	isrcCache        *lru.Cache[string, *appleISRCCacheEntry]
 }
 
 func NewAppleMusic(client *proxy.Client) *AppleMusicProvider {
@@ -88,9 +104,15 @@ func NewAppleMusicWithConfig(client *proxy.Client, cfg config.Provider) *AppleMu
 			accounts[i].ANDROID_USER_AGENT = "Music/6.1 Android/16 model/RealmeGT2Pro build/1472 (dt:66)"
 		}
 	}
+	searchCache, _ := lru.New[string, *appleSongCacheEntry](500)
+	suggestionsCache, _ := lru.New[string, *appleSongCacheEntry](500)
+	isrcCache, _ := lru.New[string, *appleISRCCacheEntry](500)
 	return &AppleMusicProvider{
-		client: client,
-		mgm:    newAccountManager(accounts),
+		client:           client,
+		mgm:              newAccountManager(accounts),
+		searchCache:      searchCache,
+		suggestionsCache: suggestionsCache,
+		isrcCache:        isrcCache,
 	}
 }
 
@@ -362,12 +384,11 @@ func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr s
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusServiceUnavailable && rateLimitRetries < maxAccountRetries {
-		body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusServiceUnavailable && rateLimitRetries < 2 {
 		_ = resp.Body.Close()
-		_ = body
+		delay := time.Duration(200+rand.Intn(400)) * time.Millisecond
 		select {
-		case <-time.After(time.Duration(500+rand.Intn(1501)) * time.Millisecond):
+		case <-time.After(delay):
 			return p.makeAppleMusicRequest(ctx, urlstr, extra, retries, rateLimitRetries+1, accountIdx)
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -503,6 +524,15 @@ func (p *AppleMusicProvider) GetStorefront(ctx context.Context) (string, error) 
 }
 
 func (p *AppleMusicProvider) SearchByISRC(ctx context.Context, isrc, storefront string) (*appleSong, error) {
+	cacheKey := storefront + ":" + isrc
+	if p.isrcCache != nil {
+		if entry, ok := p.isrcCache.Get(cacheKey); ok && entry != nil {
+			if time.Since(entry.created) < 60*time.Second {
+				return entry.song, nil
+			}
+		}
+	}
+
 	searchURL := fmt.Sprintf("%s/catalog/%s/songs?filter[isrc]=%s", appleBaseURL, storefront, url.QueryEscape(isrc))
 
 	resp, err := p.makeAppleMusicRequest(ctx, searchURL, nil, 0, 0, 0)
@@ -521,16 +551,29 @@ func (p *AppleMusicProvider) SearchByISRC(ctx context.Context, isrc, storefront 
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return nil, err
 	}
+	var matched *appleSong
 	if len(res.Data) > 0 {
-		return &res.Data[0], nil
+		matched = &res.Data[0]
 	}
-	return nil, nil
+	if p.isrcCache != nil {
+		p.isrcCache.Add(cacheKey, &appleISRCCacheEntry{song: matched, created: time.Now()})
+	}
+	return matched, nil
 }
 
 func (p *AppleMusicProvider) SearchSongBySuggestions(ctx context.Context, query, storefront string) ([]appleSong, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
 	}
+	cacheKey := storefront + ":" + strings.ToLower(strings.TrimSpace(query))
+	if p.suggestionsCache != nil {
+		if entry, ok := p.suggestionsCache.Get(cacheKey); ok && entry != nil {
+			if time.Since(entry.created) < 60*time.Second {
+				return entry.songs, nil
+			}
+		}
+	}
+
 	vals := url.Values{}
 	vals.Set("art[url]", "f")
 	vals.Set("fields[albums]", "artistName,artwork,contentRating,name,playParams,url")
@@ -584,6 +627,9 @@ func (p *AppleMusicProvider) SearchSongBySuggestions(ctx context.Context, query,
 			}
 		}
 	}
+	if p.suggestionsCache != nil {
+		p.suggestionsCache.Add(cacheKey, &appleSongCacheEntry{songs: songs, created: time.Now()})
+	}
 	return songs, nil
 }
 
@@ -591,6 +637,15 @@ func (p *AppleMusicProvider) SearchSong(ctx context.Context, query, storefront s
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
 	}
+	cacheKey := storefront + ":" + strings.ToLower(strings.TrimSpace(query))
+	if p.searchCache != nil {
+		if entry, ok := p.searchCache.Get(cacheKey); ok && entry != nil {
+			if time.Since(entry.created) < 60*time.Second {
+				return entry.songs, nil
+			}
+		}
+	}
+
 	searchURL := fmt.Sprintf("%s/catalog/%s/search?types=songs&term=%s", appleBaseURL, storefront, url.QueryEscape(query))
 
 	resp, err := p.makeAppleMusicRequest(ctx, searchURL, nil, 0, 0, 0)
@@ -613,7 +668,11 @@ func (p *AppleMusicProvider) SearchSong(ctx context.Context, query, storefront s
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return nil, err
 	}
-	return res.Results.Songs.Data, nil
+	songs := res.Results.Songs.Data
+	if p.searchCache != nil {
+		p.searchCache.Add(cacheKey, &appleSongCacheEntry{songs: songs, created: time.Now()})
+	}
+	return songs, nil
 }
 
 func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist, album string, durationSec float64, songISRC, songPlatformID string) (*appleSong, error) {
@@ -640,6 +699,11 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 		wg.Add(1)
 		go func(query string) {
 			defer wg.Done()
+			defer func() {
+				if rec := recover(); rec != nil && p.logger != nil {
+					p.logger.Errorf("panic in SearchSongBySuggestions: %v", rec)
+				}
+			}()
 			sugSongs, err := p.SearchSongBySuggestions(ctx, query, storefront)
 			if err == nil && len(sugSongs) > 0 {
 				sugCh <- sugResult{songs: sugSongs}

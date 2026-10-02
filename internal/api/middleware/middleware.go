@@ -93,6 +93,29 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
+// PanicRecovery catches unhandled panics, logs the stack, and returns a 500 JSON error.
+func PanicRecovery(l *logger.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					if l != nil {
+						l.Errorf("unhandled panic recovered on %s %s: %v", r.Method, r.URL.Path, rec)
+					}
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.Header().Set("Cache-Control", "no-store")
+					w.WriteHeader(http.StatusInternalServerError)
+					_ = json.NewEncoder(w).Encode(map[string]interface{}{
+						"error":   "Internal Server Error",
+						"message": "An unexpected error occurred",
+					})
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
 // CORS allows any origin with default methods and headers.
 func CORS() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {

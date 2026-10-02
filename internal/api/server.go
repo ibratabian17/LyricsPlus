@@ -90,10 +90,11 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 	dedup := orchestrator.NewDedup(racer)
 
 	svc := &service.Service{
-		Dedup:    dedup,
-		Store:    store,
-		MemCache: httpCache,
-		Logger:   lg,
+		Dedup:       dedup,
+		Store:       store,
+		MemCache:    httpCache,
+		Logger:      lg,
+		NegativeTTL: cfg.Storage.NegativeTTL,
 	}
 
 	lyricsH := &handlers.Lyrics{Service: svc, Logger: lg, KpoeInfo: "lyricsplus"}
@@ -137,6 +138,7 @@ func newRouter(cfg config.Config, lg *logger.Logger, l *handlers.Lyrics, c *hand
 	r := chi.NewRouter()
 	r.Use(
 		middleware.Tracing(lg),
+		middleware.PanicRecovery(lg),
 		middleware.CORS(),
 		middleware.QueryLimits(cfg.Server.MaxURLBytes, cfg.Server.MaxQueryParams, cfg.Server.MaxQueryValueLen),
 		middleware.RateLimiter(cfg.RateLimit.Requests, cfg.RateLimit.Window),
