@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -23,7 +24,10 @@ import (
 
 const qqmusicName = "qq"
 
-const qqAPIEndpoint = "https://u.y.qq.com/cgi-bin/musics.fcg"
+const (
+	qqAPIEndpoint      = "https://u.y.qq.com/cgi-bin/musics.fcg"
+	qqSmartboxEndpoint = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg"
+)
 
 type QQMusicProvider struct {
 	client *proxy.Client
@@ -63,32 +67,45 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 			return nil, nil
 		}
 
-		query := strings.TrimSpace(q.Title + " " + q.Artist)
-		if query == "" {
-			return nil, nil
+		queries := []string{}
+		t := strings.TrimSpace(q.Title)
+		a := strings.TrimSpace(q.Artist)
+		if t != "" && a != "" {
+			queries = append(queries, t+" "+a)
+			queries = append(queries, a+" "+t)
+		}
+		if t != "" {
+			queries = append(queries, t)
 		}
 
-		songs, err := p.search(ctx, query)
-		if err != nil || len(songs) == 0 {
-			p.debugf("search %q returned no songs (err=%v)", query, err)
-			return nil, nil
+		var candidates []similarity.SongCandidate
+		for _, query := range queries {
+			songs, err := p.search(ctx, query)
+			if err != nil || len(songs) == 0 {
+				continue
+			}
+			for _, s := range songs {
+				singer := ""
+				if len(s.Singer) > 0 {
+					singer = s.Singer[0].Name
+				}
+				candidates = append(candidates, similarity.SongCandidate{
+					Title:      s.Title,
+					Artist:     singer,
+					Album:      s.Album.Title,
+					DurationMs: s.Interval * 1000,
+					PlatformID: s.Mid,
+					Data:       s,
+				})
+			}
+			if len(candidates) > 0 {
+				break
+			}
 		}
-		p.debugf("search %q returned %d songs", query, len(songs))
 
-		candidates := make([]similarity.SongCandidate, len(songs))
-		for i, s := range songs {
-			singer := ""
-			if len(s.Singer) > 0 {
-				singer = s.Singer[0].Name
-			}
-			candidates[i] = similarity.SongCandidate{
-				Title:      s.Title,
-				Artist:     singer,
-				Album:      s.Album.Title,
-				DurationMs: s.Interval * 1000,
-				PlatformID: s.Mid,
-				Data:       s,
-			}
+		if len(candidates) == 0 {
+			p.debugf("search returned no songs for %q / %q", q.Title, q.Artist)
+			return nil, nil
 		}
 
 		durationSec := float64(q.Duration) / 1000.0
@@ -194,6 +211,10 @@ type songItem struct {
 }
 
 func (p *QQMusicProvider) search(ctx context.Context, query string) ([]songItem, error) {
+	if items, err := p.searchSmartbox(ctx, query); err == nil && len(items) > 0 {
+		return items, nil
+	}
+
 	searchParams := map[string]interface{}{
 		"searchid":     getSearchID(),
 		"query":        query,
@@ -218,6 +239,56 @@ func (p *QQMusicProvider) search(ctx context.Context, query string) ([]songItem,
 		return nil, err
 	}
 	return res.Body.ItemSong, nil
+}
+
+func (p *QQMusicProvider) searchSmartbox(ctx context.Context, query string) ([]songItem, error) {
+	reqURL := fmt.Sprintf("%s?key=%s&format=json", qqSmartboxEndpoint, url.QueryEscape(query))
+	headers := make(http.Header)
+	headers.Set("Referer", "https://y.qq.com/")
+	headers.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	if p.cookie != "" {
+		headers.Set("Cookie", p.cookie)
+	}
+
+	resp, err := p.client.Get(ctx, reqURL, headers)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var res struct {
+		Code int `json:"code"`
+		Data struct {
+			Song struct {
+				ItemList []struct {
+					Mid    string `json:"mid"`
+					Name   string `json:"name"`
+					Singer string `json:"singer"`
+				} `json:"itemlist"`
+			} `json:"song"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+	if res.Code != 0 || len(res.Data.Song.ItemList) == 0 {
+		return nil, nil
+	}
+
+	var items []songItem
+	for _, it := range res.Data.Song.ItemList {
+		if it.Mid == "" {
+			continue
+		}
+		items = append(items, songItem{
+			Mid:   it.Mid,
+			Title: it.Name,
+			Singer: []struct {
+				Name string `json:"name"`
+			}{{Name: it.Singer}},
+		})
+	}
+	return items, nil
 }
 
 func (p *QQMusicProvider) fetchQRC(ctx context.Context, songMid string) (string, error) {
