@@ -215,6 +215,10 @@ func (p *QQMusicProvider) search(ctx context.Context, query string) ([]songItem,
 		return items, nil
 	}
 
+	if items, err := p.searchSmartboxCgi(ctx, query); err == nil && len(items) > 0 {
+		return items, nil
+	}
+
 	searchParams := map[string]interface{}{
 		"searchid":     getSearchID(),
 		"query":        query,
@@ -286,6 +290,121 @@ func (p *QQMusicProvider) searchSmartbox(ctx context.Context, query string) ([]s
 			Singer: []struct {
 				Name string `json:"name"`
 			}{{Name: it.Singer}},
+		})
+	}
+	return items, nil
+}
+
+func (p *QQMusicProvider) searchSmartboxCgi(ctx context.Context, query string) ([]songItem, error) {
+	smartboxParams := map[string]interface{}{
+		"search_id":    getSearchID(),
+		"query":        query,
+		"num_per_page": 10,
+		"page_idx":     0,
+	}
+
+	raw, err := p.apiRequest(ctx, "music.smartboxCgi.SmartBoxCgi", "GetSmartBoxResult", smartboxParams)
+	if err != nil {
+		return nil, err
+	}
+
+	var res struct {
+		Items []struct {
+			AssociateItem []struct {
+				AssociateID   []int64 `json:"associate_id"`
+				AssociateType int     `json:"associate_type"`
+			} `json:"associate_item"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, err
+	}
+
+	var songIDs []int64
+	seen := make(map[int64]bool)
+	for _, it := range res.Items {
+		for _, assoc := range it.AssociateItem {
+			if assoc.AssociateType == 1 {
+				for _, id := range assoc.AssociateID {
+					if id > 0 && !seen[id] {
+						seen[id] = true
+						songIDs = append(songIDs, id)
+						if len(songIDs) >= 10 {
+							break
+						}
+					}
+				}
+			}
+		}
+		if len(songIDs) >= 10 {
+			break
+		}
+	}
+
+	if len(songIDs) == 0 {
+		return nil, nil
+	}
+
+	return p.getTracksByID(ctx, songIDs)
+}
+
+func (p *QQMusicProvider) getTracksByID(ctx context.Context, songIDs []int64) ([]songItem, error) {
+	types := make([]int, len(songIDs))
+	stamps := make([]int, len(songIDs))
+
+	trackParams := map[string]interface{}{
+		"ctx":          0,
+		"client":       1,
+		"types":        types,
+		"modify_stamp": stamps,
+		"ids":          songIDs,
+	}
+
+	raw, err := p.apiRequest(ctx, "music.trackInfo.UniformRuleCtrl", "CgiGetTrackInfo", trackParams)
+	if err != nil {
+		return nil, err
+	}
+
+	var res struct {
+		Tracks []struct {
+			Mid      string `json:"mid"`
+			Name     string `json:"name"`
+			Title    string `json:"title"`
+			Interval int    `json:"interval"`
+			Singer   []struct {
+				Name string `json:"name"`
+			} `json:"singer"`
+			Album struct {
+				Name  string `json:"name"`
+				Title string `json:"title"`
+			} `json:"album"`
+		} `json:"tracks"`
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return nil, err
+	}
+
+	var items []songItem
+	for _, t := range res.Tracks {
+		if t.Mid == "" {
+			continue
+		}
+		title := t.Title
+		if title == "" {
+			title = t.Name
+		}
+		albumTitle := t.Album.Title
+		if albumTitle == "" {
+			albumTitle = t.Album.Name
+		}
+		items = append(items, songItem{
+			Mid:      t.Mid,
+			Title:    title,
+			Interval: t.Interval,
+			Singer:   t.Singer,
+			Album: struct {
+				Title string `json:"title"`
+			}{Title: albumTitle},
 		})
 	}
 	return items, nil
@@ -444,22 +563,33 @@ func getSearchID() string {
 }
 
 func buildCommonParams() map[string]interface{} {
+	guid := getGUID()
+	aid := guid
+	if len(aid) > 16 {
+		aid = aid[:16]
+	}
 	return map[string]interface{}{
-		"wid":        getGUID(),
-		"cv":         13020508,
-		"v":          13020508,
-		"QIMEI36":    "8888888888888888",
-		"ct":         "11",
-		"tmeAppID":   "qqmusic",
-		"format":     "json",
-		"inCharset":  "utf-8",
-		"outCharset": "utf-8",
-		"uid":        "3931641530",
+		"ct":           "11",
+		"cv":           20090008,
+		"v":            20090008,
+		"chid":         "10003505",
+		"tmeAppID":     "qqmusic",
+		"tmeLoginType": "2",
+		"OpenUDID":     guid,
+		"udid":         guid,
+		"OpenUDID2":    guid,
+		"aid":          aid,
+		"phonetype":    "V2408A",
+		"os_ver":       "15",
+		"format":       "json",
+		"inCharset":    "utf-8",
+		"outCharset":   "utf-8",
+		"uid":          "3931641530",
 	}
 }
 
 func getGUID() string {
-	const chars = "0123456789ABCDEF"
+	const chars = "0123456789abcdef"
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	var b strings.Builder
 	for i := 0; i < 32; i++ {
@@ -472,15 +602,10 @@ var xorScrambleBytes = []byte{89, 39, 179, 150, 218, 82, 58, 252, 177, 52, 186, 
 
 func Sign(payload string) string {
 	hash := sha1.Sum([]byte(payload))
-	hashHex := hex.EncodeToString(hash[:])
+	hashHex := strings.ToUpper(hex.EncodeToString(hash[:]))
 
-	part1Idx := []int{23, 14, 6, 36, 16, 40, 7, 19}
-	part1 := ""
-	for _, i := range part1Idx {
-		if i < 40 {
-			part1 += string(hashHex[i])
-		}
-	}
+	part1Idx := []int{23, 14, 6, 36, 16, 7, 19}
+	part1 := stringAt(hashHex, part1Idx)
 	part2 := stringAt(hashHex, []int{16, 1, 32, 12, 19, 27, 8, 5})
 
 	scrambled := make([]byte, len(xorScrambleBytes))

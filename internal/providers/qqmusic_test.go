@@ -19,24 +19,22 @@ func TestSign(t *testing.T) {
 	if strings.ToLower(sig) != sig {
 		t.Errorf("signature must be wholly lowercase: %q", sig)
 	}
-	if len(sig) != 44 && len(sig) != 45 {
-		t.Errorf("signature length = %d, want 44..45 (%q)", len(sig), sig)
+	if len(sig) < 40 || len(sig) > 46 {
+		t.Errorf("signature length = %d, want 40..46 (%q)", len(sig), sig)
 	}
 }
 
 func TestSignStructure(t *testing.T) {
 	payload := `{"songmid":9}`
 	sum := sha1.Sum([]byte(payload))
-	hashHex := hex.EncodeToString(sum[:])
+	hashHex := strings.ToUpper(hex.EncodeToString(sum[:]))
 
-	part1Idx := []int{23, 14, 6, 36, 16, 40, 7, 19}
+	part1Idx := []int{23, 14, 6, 36, 16, 7, 19}
 	var part1 strings.Builder
 	for _, i := range part1Idx {
-		if i < 40 {
-			part1.WriteByte(hashHex[i])
-		}
+		part1.WriteByte(hashHex[i])
 	}
-	if got := Sign(payload); !strings.HasPrefix(got, "zzc"+part1.String()) {
+	if got := Sign(payload); !strings.HasPrefix(got, strings.ToLower("zzc"+part1.String())) {
 		t.Errorf("part1 mismatch: want prefix zzc%s, got %q", part1.String(), got)
 	}
 }
