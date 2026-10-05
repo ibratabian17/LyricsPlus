@@ -40,12 +40,15 @@ func (h *Catalog) Search(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	var results []domain.SongCatalogItem
+	var resMu sync.Mutex
 	agg := func(items []domain.SongCatalogItem, err error) {
 		if err != nil {
 			h.logf("catalog search %q failed: %v", q, err)
 			return
 		}
+		resMu.Lock()
 		results = append(results, items...)
+		resMu.Unlock()
 	}
 
 	type searchFn struct {

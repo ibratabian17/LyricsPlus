@@ -2,7 +2,6 @@
 package middleware
 
 import (
-	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -15,17 +14,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
+
 	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/metrics"
 )
-
-// gzipPool reuses gzip.Writers to avoid per-request heap allocations under load.
-var gzipPool = sync.Pool{
-	New: func() interface{} {
-		gw, _ := gzip.NewWriterLevel(nil, gzip.BestSpeed)
-		return gw
-	},
-}
 
 type ctxKey int
 
@@ -140,31 +133,9 @@ func CORS() func(http.Handler) http.Handler {
 	}
 }
 
-// Compression serves gzip when the client accepts it.
+// Compression
 func Compression(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-			next.ServeHTTP(w, r)
-			return
-		}
-		w.Header().Set("Content-Encoding", "gzip")
-		gz := gzipPool.Get().(*gzip.Writer)
-		gz.Reset(w)
-		defer func() {
-			_ = gz.Close()
-			gzipPool.Put(gz)
-		}()
-		next.ServeHTTP(gzipResponseWriter{ResponseWriter: w, gw: gz}, r)
-	})
-}
-
-type gzipResponseWriter struct {
-	http.ResponseWriter
-	gw *gzip.Writer
-}
-
-func (g gzipResponseWriter) Write(b []byte) (int, error) {
-	return g.gw.Write(b)
+	return chimiddleware.Compress(5, "text/*", "application/*")(next)
 }
 
 // QueryLimits rejects oversized URLs and too many/long query parameters.
