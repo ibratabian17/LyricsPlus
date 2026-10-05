@@ -142,13 +142,18 @@ func (p *MusixmatchProvider) Configured() bool {
 }
 
 func (p *MusixmatchProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
-	for accountIdx := 0; ; {
+	startIdx := p.mgm.CurrentIndex()
+	accountIdx := startIdx
+	for {
 		res, err := p.fetchLyricsWithAccount(ctx, q, accountIdx)
-		if err == nil {
+		if err == nil && res != nil {
 			return res, nil
 		}
+		if err != nil {
+			p.debugf("musixmatch account %d error: %v, rotating", accountIdx, err)
+		}
 		next, hasNext := p.mgm.Next(accountIdx)
-		if !hasNext {
+		if !hasNext || next == startIdx {
 			break
 		}
 		accountIdx = next
@@ -175,7 +180,11 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 			return nil, nil
 		}
 		durationSec := float64(q.Duration) / 1000.0
-		matchedTrack, _ = p.searchBestMatch(ctx, q.Title, q.Artist, q.Album, durationSec, q.ISRC, accountIdx)
+		var searchErr error
+		matchedTrack, searchErr = p.searchBestMatch(ctx, q.Title, q.Artist, q.Album, durationSec, q.ISRC, accountIdx)
+		if searchErr != nil {
+			return nil, searchErr
+		}
 		if matchedTrack != nil {
 			p.debugf("best match track %q id=%d", matchedTrack.TrackName, matchedTrack.TrackID)
 		}
@@ -896,6 +905,11 @@ func (p *MusixmatchProvider) androidRequest(ctx context.Context, endpoint string
 	}
 
 	// Token expired or invalid (401): refresh and retry once.
+	p.androidMu.Lock()
+	st.currentToken = ""
+	st.isLoggedIn = false
+	st.expiresAt = time.Time{}
+	p.androidMu.Unlock()
 	if err := p.ensureLoggedIn(ctx, accountIdx); err != nil {
 		return nil, err
 	}

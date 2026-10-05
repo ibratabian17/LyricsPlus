@@ -127,7 +127,11 @@ func (s *raceSession) tryFetch(ctx context.Context, name string, q domain.Search
 	defer release()
 
 	start := time.Now()
-	reqCtx, cancel := context.WithCancel(ctx)
+	timeout := s.r.timeout
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	s.record(name, "BAD", 0)
@@ -179,8 +183,6 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 		status:    make(map[string]SourceOutcome),
 		raceStart: time.Now(),
 	}
-	raceCtx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
 
 	order := SourceOrder(q, preferredSources)
 	phase1 := order
@@ -194,13 +196,13 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 
 	r.debugf("race title=%q artist=%q phase1=%v remaining=%v", q.Title, q.Artist, phase1, remaining)
 
-	p1 := sess.runPhase(raceCtx, q, phase1)
+	p1 := sess.runPhase(ctx, q, phase1)
 
 	if p1 != nil && p1.Priority >= PriorityWord {
 		return sess.finalize(p1)
 	}
 
-	if len(remaining) == 0 || raceCtx.Err() != nil {
+	if len(remaining) == 0 || ctx.Err() != nil {
 		return sess.finalize(p1)
 	}
 
@@ -212,7 +214,7 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 			}
 		}
 		if len(p3Sources) > 0 {
-			p3 := sess.raceForPriority(raceCtx, q, p3Sources, PriorityWord)
+			p3 := sess.raceForPriority(ctx, q, p3Sources, PriorityWord)
 			if p3 != nil {
 				return sess.finalize(p3)
 			}
@@ -220,7 +222,7 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 		return sess.finalize(p1)
 	}
 
-	p2 := sess.runPhase(raceCtx, q, remaining)
+	p2 := sess.runPhase(ctx, q, remaining)
 	if p2 != nil {
 		if p1 == nil || p2.Priority > p1.Priority {
 			return sess.finalize(p2)
@@ -348,7 +350,7 @@ func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery,
 		case <-ctx.Done():
 			return nil
 		}
-		if res.Priority == want {
+		if res != nil && res.Priority >= want {
 			cancel()
 			return res
 		}

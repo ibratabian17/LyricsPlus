@@ -124,7 +124,7 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	qrcContent, err := p.fetchQRC(ctx, songMid)
 	if err != nil || qrcContent == "" {
 		p.debugf("QRC fetch failed for mid=%s (err=%v)", songMid, err)
-		return nil, err
+		return nil, nil
 	}
 
 	exactMeta := parsers.ExactMetadata{
@@ -251,17 +251,21 @@ func (p *QQMusicProvider) fetchQRC(ctx context.Context, songMid string) (string,
 		return "", err
 	}
 
-	var content string
+	var qrcContent string
 	if s, ok := res.QRC.(string); ok && s != "" {
-		content = s
-	} else if s, ok := res.Lyric.(string); ok && s != "" {
-		content = s
+		if proc, err := processLyric(s); err == nil && proc != "" {
+			qrcContent = proc
+		}
 	}
-	if content == "" {
-		return "", nil
+	if qrcContent == "" {
+		if s, ok := res.Lyric.(string); ok && s != "" {
+			if proc, err := processLyric(s); err == nil && proc != "" {
+				qrcContent = proc
+			}
+		}
 	}
 
-	return processLyric(content)
+	return qrcContent, nil
 }
 
 func processLyric(content string) (string, error) {

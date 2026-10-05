@@ -168,7 +168,10 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 				p.debugf("id-only query, no track resolved")
 				return nil, nil
 			}
-			searchQ := q.Title + " artist:" + q.Artist
+			searchQ := q.Title
+			if q.Artist != "" {
+				searchQ += " artist:" + q.Artist
+			}
 			var err error
 			tracks, err = p.SearchTrack(ctx, searchQ)
 			if err != nil || len(tracks) == 0 {
@@ -227,7 +230,7 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	lyricsJSON, err := p.fetchColorLyrics(ctx, trackID)
 	if err != nil || lyricsJSON == nil {
 		p.debugf("color lyrics fetch failed for track %s (err=%v)", trackID, err)
-		return nil, err
+		return nil, nil
 	}
 
 	converted, err := parsers.ConvertSpotifyToJSON(lyricsJSON)
@@ -490,6 +493,14 @@ func (p *SpotifyProvider) doSpotifyRequest(ctx context.Context, urlstr string, e
 		errMsg, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		message := parseSpotifyErrorMessage(errMsg)
+		if resp.StatusCode == http.StatusUnauthorized {
+			p.webTokMu.Lock()
+			delete(p.webTok, accountIdx)
+			p.webTokMu.Unlock()
+			p.apiTokMu.Lock()
+			delete(p.apiTok, accountIdx)
+			p.apiTokMu.Unlock()
+		}
 		if retries < maxAccountRetries {
 			if next, hasNext := p.mgm.Next(accountIdx); hasNext {
 				return p.doSpotifyRequest(ctx, urlstr, extra, retries+1, next)
@@ -541,7 +552,7 @@ func parseSpotifyErrorMessage(body []byte) string {
 
 func (p *SpotifyProvider) SearchTrack(ctx context.Context, query string) ([]spotifyTrack, error) {
 	searchURL := fmt.Sprintf("%s/search?q=%s&type=track&limit=10", spotifyBaseURL, url.QueryEscape(query))
-	resp, err := p.doSpotifyRequest(ctx, searchURL, nil, 0, 0)
+	resp, err := p.doSpotifyRequest(ctx, searchURL, nil, 0, p.mgm.CurrentIndex())
 	if err != nil {
 		return nil, err
 	}
@@ -560,7 +571,7 @@ func (p *SpotifyProvider) SearchTrack(ctx context.Context, query string) ([]spot
 
 func (p *SpotifyProvider) fetchColorLyrics(ctx context.Context, trackID string) ([]byte, error) {
 	reqURL := fmt.Sprintf("%s%s?format=json&vocalRemoval=false&market=from_token", spotifyLyricsURL, trackID)
-	resp, err := p.doSpotifyRequest(ctx, reqURL, nil, 0, 0)
+	resp, err := p.doSpotifyRequest(ctx, reqURL, nil, 0, p.mgm.CurrentIndex())
 	if err != nil {
 		return nil, err
 	}
@@ -573,7 +584,7 @@ func (p *SpotifyProvider) fetchColorLyrics(ctx context.Context, trackID string) 
 // track-credits view, overriding the converted songWriters list.
 func (p *SpotifyProvider) fetchSpotifySongwriters(ctx context.Context, trackID string) ([]string, error) {
 	reqURL := fmt.Sprintf("https://spclient.wg.spotify.com/track-credits-view/v0/experimental/%s/credits", trackID)
-	resp, err := p.doSpotifyRequest(ctx, reqURL, nil, 0, 0)
+	resp, err := p.doSpotifyRequest(ctx, reqURL, nil, 0, p.mgm.CurrentIndex())
 	if err != nil {
 		return nil, err
 	}
@@ -736,7 +747,7 @@ func (p *SpotifyProvider) NormalizeSong(track spotifyTrack) domain.SongCatalogIt
 
 // SearchCatalog searches Spotify tracks and normalizes the top 10 results.
 func (p *SpotifyProvider) SearchCatalog(ctx context.Context, query string) ([]domain.SongCatalogItem, error) {
-	tracks, err := p.SearchTrack(ctx, query+" artist:")
+	tracks, err := p.SearchTrack(ctx, query)
 	if err != nil {
 		return nil, err
 	}

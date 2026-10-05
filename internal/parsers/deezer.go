@@ -3,10 +3,35 @@ package parsers
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"lyricsplus/backend/internal/domain"
 )
+
+type flexInt int
+
+func (fi *flexInt) UnmarshalJSON(b []byte) error {
+	if len(b) == 0 {
+		*fi = 0
+		return nil
+	}
+	s := strings.Trim(string(b), `"`)
+	if s == "" || s == "null" {
+		*fi = 0
+		return nil
+	}
+	if v, err := strconv.Atoi(s); err == nil {
+		*fi = flexInt(v)
+		return nil
+	}
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		*fi = flexInt(f)
+		return nil
+	}
+	*fi = 0
+	return nil
+}
 
 type deezerTrackLyrics struct {
 	SynchronizedWordByWordLines []struct {
@@ -19,9 +44,9 @@ type deezerTrackLyrics struct {
 		} `json:"words"`
 	} `json:"synchronizedWordByWordLines"`
 	SynchronizedLines []struct {
-		Milliseconds int    `json:"milliseconds"`
-		Duration     int    `json:"duration"`
-		Line         string `json:"line"`
+		Milliseconds flexInt `json:"milliseconds"`
+		Duration     flexInt `json:"duration"`
+		Line         string  `json:"line"`
 	} `json:"synchronizedLines"`
 	Text      string `json:"text"`
 	Writers   string `json:"writers"`
@@ -93,8 +118,8 @@ func NormalizeDeezerLyrics(data []byte) (*domain.LyricsResponse, error) {
 		result.Type = domain.SyncTypeLine
 		for _, line := range lyricsData.SynchronizedLines {
 			result.Lyrics = append(result.Lyrics, domain.Line{
-				Time:     line.Milliseconds,
-				Duration: line.Duration,
+				Time:     int(line.Milliseconds),
+				Duration: int(line.Duration),
 				Text:     line.Line,
 			})
 		}

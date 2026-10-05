@@ -196,10 +196,10 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 		return nil, nil
 	}
 
-	lyricsJSON, err := p.getLyrics(ctx, trackID, 0)
+	lyricsJSON, err := p.getLyrics(ctx, trackID, p.mgm.CurrentIndex())
 	if err != nil || lyricsJSON == nil {
 		p.debugf("lyrics fetch failed for track %s (err=%v)", trackID, err)
-		return nil, err
+		return nil, nil
 	}
 
 	converted, err := parsers.NormalizeDeezerLyrics(lyricsJSON)
@@ -307,6 +307,7 @@ func (p *DeezerProvider) authenticate(ctx context.Context, accountIdx int) (stri
 
 	cleanToken := strings.TrimSpace(rawToken)
 	cleanToken = strings.TrimPrefix(cleanToken, "refresh-token=")
+	cleanToken = strings.TrimPrefix(cleanToken, "arl=")
 
 	var cookieString string
 	if isARL {

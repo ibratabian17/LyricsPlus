@@ -14,18 +14,23 @@ func normalizeString(str string) string {
 	if str == "" {
 		return ""
 	}
-	s := nonWordSpace.ReplaceAllString(strings.ToLower(str), " ")
+	t := translit(str)
+	if t == "" {
+		t = str
+	}
+	s := nonWordSpace.ReplaceAllString(strings.ToLower(t), " ")
 	s = collapseSpace.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
 }
 
 func getNGrams(str string, size int) map[string]bool {
-	if str == "" || len(str) < size {
+	runes := []rune(str)
+	if len(runes) < size {
 		return map[string]bool{}
 	}
 	set := make(map[string]bool)
-	for i := 0; i <= len(str)-size; i++ {
-		set[str[i:i+size]] = true
+	for i := 0; i <= len(runes)-size; i++ {
+		set[string(runes[i:i+size])] = true
 	}
 	return set
 }
@@ -59,32 +64,34 @@ func levenshteinDistance(str1, str2 string) int {
 	if str1 == str2 {
 		return 0
 	}
-	if len(str1) == 0 {
-		return len(str2)
+	r1 := []rune(str1)
+	r2 := []rune(str2)
+	if len(r1) == 0 {
+		return len(r2)
 	}
-	if len(str2) == 0 {
-		return len(str1)
+	if len(r2) == 0 {
+		return len(r1)
 	}
-	if len(str1) > len(str2) {
-		str1, str2 = str2, str1
+	if len(r1) > len(r2) {
+		r1, r2 = r2, r1
 	}
-	prevRow := make([]int, len(str1)+1)
-	currRow := make([]int, len(str1)+1)
+	prevRow := make([]int, len(r1)+1)
+	currRow := make([]int, len(r1)+1)
 	for i := range prevRow {
 		prevRow[i] = i
 	}
-	for j := 1; j <= len(str2); j++ {
+	for j := 1; j <= len(r2); j++ {
 		currRow[0] = j
-		for i := 1; i <= len(str1); i++ {
+		for i := 1; i <= len(r1); i++ {
 			cost := 0
-			if str1[i-1] != str2[j-1] {
+			if r1[i-1] != r2[j-1] {
 				cost = 1
 			}
 			currRow[i] = minInt(currRow[i-1]+1, minInt(prevRow[i]+1, prevRow[i-1]+cost))
 		}
 		prevRow, currRow = currRow, prevRow
 	}
-	return prevRow[len(str1)]
+	return prevRow[len(r1)]
 }
 
 func minInt(a, b int) int {
@@ -96,7 +103,9 @@ func minInt(a, b int) int {
 
 // LevenshteinNorm returns 1 - Levenshtein/max(len).
 func LevenshteinNorm(str1, str2 string) float64 {
-	maxLen := math.Max(float64(len(str1)), float64(len(str2)))
+	r1 := []rune(str1)
+	r2 := []rune(str2)
+	maxLen := math.Max(float64(len(r1)), float64(len(r2)))
 	if maxLen == 0 {
 		return 1.0
 	}

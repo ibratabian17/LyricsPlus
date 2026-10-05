@@ -138,8 +138,12 @@ func (p *AppleMusicProvider) Configured() bool {
 
 func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
 	storefront, err := p.GetStorefront(ctx)
-	if err != nil {
-		storefront = "in"
+	if err != nil || storefront == "" {
+		if acc, ok := p.mgm.At(p.mgm.CurrentIndex()); ok && acc.STOREFRONT != "" {
+			storefront = acc.STOREFRONT
+		} else {
+			storefront = "us"
+		}
 	}
 
 	var bestMatch *appleSong
@@ -178,7 +182,7 @@ func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	lyricURL := fmt.Sprintf("%s/catalog/%s/songs/%s/syllable-lyrics?l%%5Blyrics%%5D=en-US&extend=ttmlLocalizations&l%%5Bscript%%5D=en-Latn",
 		appleBaseURL, storefront, bestMatch.ID)
 
-	resp, err := p.makeAppleMusicRequest(ctx, lyricURL, nil, 0, 0, 0)
+	resp, err := p.makeAppleMusicRequest(ctx, lyricURL, nil, 0, 0, p.mgm.CurrentIndex())
 	if err != nil {
 		if isAppleStatus(err, http.StatusNotFound) {
 			p.debugf("lyrics 404 for song %q", bestMatch.Attributes.Name)
@@ -384,9 +388,9 @@ func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr s
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusServiceUnavailable && rateLimitRetries < 2 {
+	if resp.StatusCode == http.StatusServiceUnavailable && rateLimitRetries < 3 {
 		_ = resp.Body.Close()
-		delay := time.Duration(200+rand.Intn(400)) * time.Millisecond
+		delay := time.Duration(500+rand.Intn(1500)) * time.Millisecond
 		select {
 		case <-time.After(delay):
 			return p.makeAppleMusicRequest(ctx, urlstr, extra, retries, rateLimitRetries+1, accountIdx)
@@ -397,8 +401,8 @@ func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr s
 
 	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests) && retries < maxAccountRetries {
 		_ = resp.Body.Close()
+		p.resetCaches()
 		if next, hasNext := p.mgm.Next(accountIdx); hasNext {
-			p.resetCaches()
 			return p.makeAppleMusicRequest(ctx, urlstr, extra, retries+1, 0, next)
 		}
 	}
@@ -535,7 +539,7 @@ func (p *AppleMusicProvider) SearchByISRC(ctx context.Context, isrc, storefront 
 
 	searchURL := fmt.Sprintf("%s/catalog/%s/songs?filter[isrc]=%s", appleBaseURL, storefront, url.QueryEscape(isrc))
 
-	resp, err := p.makeAppleMusicRequest(ctx, searchURL, nil, 0, 0, 0)
+	resp, err := p.makeAppleMusicRequest(ctx, searchURL, nil, 0, 0, p.mgm.CurrentIndex())
 	if err != nil {
 		return nil, err
 	}
@@ -590,7 +594,7 @@ func (p *AppleMusicProvider) SearchSongBySuggestions(ctx context.Context, query,
 
 	sugURL := fmt.Sprintf("%s/catalog/%s/search/suggestions?%s", appleSuggestionsBaseURL, storefront, vals.Encode())
 
-	resp, err := p.makeAppleMusicRequest(ctx, sugURL, nil, 0, 0, 0)
+	resp, err := p.makeAppleMusicRequest(ctx, sugURL, nil, 0, 0, p.mgm.CurrentIndex())
 	if err != nil {
 		return nil, err
 	}
@@ -648,7 +652,7 @@ func (p *AppleMusicProvider) SearchSong(ctx context.Context, query, storefront s
 
 	searchURL := fmt.Sprintf("%s/catalog/%s/search?types=songs&term=%s", appleBaseURL, storefront, url.QueryEscape(query))
 
-	resp, err := p.makeAppleMusicRequest(ctx, searchURL, nil, 0, 0, 0)
+	resp, err := p.makeAppleMusicRequest(ctx, searchURL, nil, 0, 0, p.mgm.CurrentIndex())
 	if err != nil {
 		return nil, err
 	}
@@ -678,7 +682,11 @@ func (p *AppleMusicProvider) SearchSong(ctx context.Context, query, storefront s
 func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist, album string, durationSec float64, songISRC, songPlatformID string) (*appleSong, error) {
 	storefront, err := p.GetStorefront(ctx)
 	if err != nil || storefront == "" {
-		storefront = "in"
+		if acc, ok := p.mgm.At(p.mgm.CurrentIndex()); ok && acc.STOREFRONT != "" {
+			storefront = acc.STOREFRONT
+		} else {
+			storefront = "us"
+		}
 	}
 
 	queries := buildSearchQueries(title, artist, album)

@@ -48,7 +48,10 @@ func ConvertLRCLIBtoJSON(syncedLyrics string, durationSec float64) *domain.Lyric
 		lines[i].duration = lines[i+1].time - lines[i].time
 	}
 	if len(lines) > 0 {
-		lines[len(lines)-1].duration = durationMs - lines[len(lines)-1].time
+		lastDur := durationMs - lines[len(lines)-1].time
+		if lastDur > 0 {
+			lines[len(lines)-1].duration = lastDur
+		}
 	}
 
 	var lyrics []domain.Line

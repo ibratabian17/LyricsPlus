@@ -82,12 +82,17 @@ type Client struct {
 
 func New(cfg config.Server) *Client {
 	tr := &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          2000,
+		MaxIdleConnsPerHost:   500,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
-		Proxy:                 http.ProxyFromEnvironment,
 	}
 	return &Client{
 		http: &http.Client{Transport: tr, Timeout: 30 * time.Second},

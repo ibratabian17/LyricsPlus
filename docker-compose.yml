@@ -9,6 +9,10 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     environment:
       PORT: "3000"
       # Structured logging toggle + tuning.

@@ -221,6 +221,7 @@ func ConcurrencyLimiter(max int64) func(http.Handler) http.Handler {
 			cur := inflight.Add(1)
 			defer inflight.Add(-1)
 			if max > 0 && cur > max {
+				w.Header().Set("Content-Type", "application/json")
 				w.Header().Set("Retry-After", "1")
 				w.Header().Set("Cache-Control", "no-store")
 				w.WriteHeader(http.StatusServiceUnavailable)
