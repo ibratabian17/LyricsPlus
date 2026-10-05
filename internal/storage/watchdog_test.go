@@ -25,7 +25,7 @@ func (d *dummyCache) Count() int {
 
 func TestWatchdogThresholdAndCooldown(t *testing.T) {
 	c := &dummyCache{}
-	// Threshold set very low (1 byte) so current memory exceeds it
+
 	w := NewWatchdog(1, 10*time.Millisecond, c)
 	w.SetCooldown(100 * time.Millisecond)
 
@@ -34,13 +34,11 @@ func TestWatchdogThresholdAndCooldown(t *testing.T) {
 		t.Fatalf("expected 1 shed call, got %d", c.Count())
 	}
 
-	// Immediately calling check() should respect cooldown
 	w.check()
 	if c.Count() != 1 {
 		t.Fatalf("expected still 1 shed call due to cooldown, got %d", c.Count())
 	}
 
-	// After cooldown expires
 	time.Sleep(120 * time.Millisecond)
 	w.check()
 	if c.Count() != 2 {
@@ -51,7 +49,7 @@ func TestWatchdogThresholdAndCooldown(t *testing.T) {
 func TestWatchdogStopIdempotent(t *testing.T) {
 	w := NewWatchdog(1000, 10*time.Millisecond)
 	w.Start()
-	// Stop multiple times shouldn't panic
+
 	w.Stop()
 	w.Stop()
 }

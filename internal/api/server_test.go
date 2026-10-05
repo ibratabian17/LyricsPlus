@@ -23,8 +23,6 @@ import (
 	"lyricsplus/backend/internal/storage"
 )
 
-// fakeSource stands in for a real provider so the full HTTP stack can be
-// exercised black-box without any upstream credentials.
 type fakeSource struct {
 	resp *domain.LyricsResponse
 	err  error
@@ -240,7 +238,6 @@ func TestLyricsGetRaw(t *testing.T) {
 		t.Fatalf("raw body mismatch: %q", rec.Body.String())
 	}
 
-	// Apple Music returns application/xml and Content-Disposition: inline
 	respApple := sampleWordLyrics()
 	respApple.Metadata.Source = "Apple"
 	respApple.RawData = raw
@@ -256,7 +253,6 @@ func TestLyricsGetRaw(t *testing.T) {
 		t.Fatalf("expected Content-Disposition=inline, got %q", cd)
 	}
 
-	// Deezer returns text/plain and Content-Disposition: inline
 	respDeezer := sampleWordLyrics()
 	respDeezer.Metadata.Source = "Deezer"
 	respDeezer.RawData = "[00:01.00] Hello"
@@ -276,7 +272,6 @@ func TestLyricsGetRaw(t *testing.T) {
 func TestRawNotFound(t *testing.T) {
 	h := buildTestRouter(t, baseTestConfig(), &fakeSource{resp: sampleWordLyrics()})
 
-	// RawData empty on otherwise valid lyrics => raw unavailable.
 	rec := doGet(t, h, "/v1/raw/get?title=Hello&artist=Adele&source=spotify")
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for missing raw, got %d: %s", rec.Code, rec.Body.String())
@@ -318,7 +313,6 @@ func TestHealthAndReady(t *testing.T) {
 		t.Fatalf("expected readyz ok, got %v", body)
 	}
 
-	// Closing the database makes readiness fail (503) while liveness stays 200.
 	if err := store.Close(); err != nil {
 		t.Fatalf("close store: %v", err)
 	}
@@ -353,7 +347,6 @@ func TestRateLimiting(t *testing.T) {
 		t.Fatalf("expected Retry-After header on 429")
 	}
 
-	// Health probes must never be throttled.
 	if rec := doGet(t, h, "/health"); rec.Code != http.StatusOK {
 		t.Fatalf("health should bypass rate limit, got %d", rec.Code)
 	}
@@ -458,7 +451,6 @@ func TestPowChallenge(t *testing.T) {
 	}
 }
 
-// TestPowSubmit exercises the full challenge -> solve -> submit flow over HTTP.
 func TestPowSubmit(t *testing.T) {
 	cfg := baseTestConfig()
 	h := buildTestRouter(t, cfg, &fakeSource{resp: sampleWordLyrics()})

@@ -1,5 +1,3 @@
-// Command account_manager edits provider and Google Drive credentials in
-// auth.json / config.json / .env from a flag-driven CLI or an interactive session.
 package main
 
 import (
@@ -20,7 +18,6 @@ import (
 	"lyricsplus/backend/internal/config"
 )
 
-// ANSI color codes
 const (
 	colorReset  = "\033[0m"
 	colorRed    = "\033[31m"
@@ -31,7 +28,6 @@ const (
 	colorBold   = "\033[1m"
 )
 
-// provider order for menus and tables
 var providerKinds = []string{"spotify", "apple", "musixmatch", "deezer", "gdrive"}
 
 var providerLabels = map[string]string{
@@ -142,10 +138,6 @@ Flags:
 `, strings.Join(providerKinds, ", "))
 }
 
-// ============================================================================
-// Account abstraction
-// ============================================================================
-
 type account struct {
 	kind    string
 	spotify *config.SpotifyAccount
@@ -189,8 +181,8 @@ func setName(a *account, v string) {
 type templateField struct {
 	key, label string
 	secret     bool
-	def        func(*account) string // default when adding (nil when none)
-	cond       func(*account) bool   // only offered when true (nil = always)
+	def        func(*account) string
+	cond       func(*account) bool
 	set        func(*account, string)
 }
 
@@ -451,14 +443,10 @@ func emptyOr(v, def string) string {
 	return v
 }
 
-// ============================================================================
-// App: shared state + table output
-// ============================================================================
-
 type app struct {
 	store    *accountmgr.Store
 	reader   io.Reader
-	statuses map[string]accountmgr.TestResult // live test results (interactive)
+	statuses map[string]accountmgr.TestResult
 }
 
 func (ap *app) header() {
@@ -614,10 +602,6 @@ func (ap *app) commit(msg string) error {
 	fmt.Printf("%s%s%s\n", colorGreen, msg, colorReset)
 	return nil
 }
-
-// ============================================================================
-// Interactive session
-// ============================================================================
 
 func (ap *app) run() {
 	for {
@@ -782,10 +766,6 @@ func (ap *app) testMenu() {
 	ap.test(strings.TrimSpace(provider), "")
 }
 
-// ============================================================================
-// Live credential testing (shared by interactive + CLI)
-// ============================================================================
-
 func (ap *app) test(provider, name string) {
 	provider = strings.ToLower(strings.TrimSpace(provider))
 	tester := accountmgr.NewTester()
@@ -883,10 +863,6 @@ func (ap *app) test(provider, name string) {
 	}
 	fmt.Println()
 }
-
-// ============================================================================
-// CLI subcommands (flag-driven, no hidden prompts)
-// ============================================================================
 
 func (ap *app) runCLI(args []string) error {
 	cmd := strings.ToLower(args[0])
@@ -1112,10 +1088,6 @@ func (ap *app) removeFromFlags(kind, name string) error {
 	ap.statuses = map[string]accountmgr.TestResult{}
 	return ap.commit(fmt.Sprintf("Removed %s account %q.", providerLabels[kind], name))
 }
-
-// ============================================================================
-// Prompt helpers
-// ============================================================================
 
 func (ap *app) readLine(promptStr string) (string, error) {
 	fd := int(os.Stdin.Fd())

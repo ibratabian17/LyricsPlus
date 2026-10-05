@@ -43,7 +43,6 @@ var spotifyUserAgents = []string{
 	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
 }
 
-// getRandomSpotifyUserAgent returns a random entry from the parity UA list.
 func getRandomSpotifyUserAgent() string {
 	return spotifyUserAgents[rand.Intn(len(spotifyUserAgents))]
 }
@@ -54,13 +53,10 @@ var fallbackSecrets = map[string][]int{
 	"12": {107, 81, 49, 57, 67, 93, 87, 81, 69, 67, 40, 93, 48, 50, 46, 91, 94, 113, 41, 108, 77, 107, 34},
 }
 
-// BestSecret returns the highest version fallback secret.
 func BestSecret() []int {
 	return fallbackSecrets["14"]
 }
 
-// SpotifyProvider fetches color lyrics from Spotify, rotating through a list
-// of accounts on 401/429.
 type SpotifyProvider struct {
 	client *proxy.Client
 	mgm    *AccountManager[config.SpotifyAccount]
@@ -107,7 +103,6 @@ func NewSpotifyWithConfig(client *proxy.Client, cfg config.Provider) *SpotifyPro
 	}
 }
 
-// SetLogger attaches a logger for debug output.
 func (p *SpotifyProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
 
 func (p *SpotifyProvider) debugf(format string, args ...any) {
@@ -329,7 +324,6 @@ func (p *SpotifyProvider) getWebToken(ctx context.Context, accountIdx int) (stri
 		if resp != nil {
 			_ = resp.Body.Close()
 		}
-		// Retry with reason=init
 		initEndpoint := fmt.Sprintf("https://open.spotify.com/api/token?reason=init&productType=web-player&totp=%s&totpServer=%s&totpVer=%s",
 			url.QueryEscape(totp), url.QueryEscape(totp), url.QueryEscape(strconv.Itoa(ver)))
 		resp, err = p.client.Get(ctx, initEndpoint, headers)
@@ -375,8 +369,7 @@ func (p *SpotifyProvider) getAPIToken(ctx context.Context, accountIdx int) (stri
 	if !ok {
 		return "", fmt.Errorf("spotify: no account available")
 	}
-	// Without CLIENT_ID/SECRET fall back to the web token flow (which also
-	// works for lyrics via API search results).
+
 	if acc.CLIENT_ID == "" || acc.CLIENT_SECRET == "" {
 		return p.getWebToken(ctx, accountIdx)
 	}
@@ -429,9 +422,6 @@ func (p *SpotifyProvider) getAPIToken(ctx context.Context, accountIdx int) (stri
 	return tok.token, nil
 }
 
-// doSpotifyRequest picks the current account, injects the right auth header
-// for the URL kind, rotates to the next account on 401/429 (up to
-// maxAccountRetries), and surfaces a structured error.
 func (p *SpotifyProvider) doSpotifyRequest(ctx context.Context, urlstr string, extra http.Header, retries, accountIdx int) (*http.Response, error) {
 	acc, ok := p.mgm.At(accountIdx)
 	if !ok {
@@ -518,8 +508,6 @@ func (p *SpotifyProvider) doSpotifyRequest(ctx context.Context, urlstr string, e
 	return resp, nil
 }
 
-// parseSpotifyErrorMessage extracts the error message from a Spotify response:
-// error.message -> error_description -> error -> raw text.
 func parseSpotifyErrorMessage(body []byte) string {
 	if len(body) == 0 {
 		return ""
@@ -580,8 +568,6 @@ func (p *SpotifyProvider) fetchColorLyrics(ctx context.Context, trackID string) 
 	return io.ReadAll(resp.Body)
 }
 
-// fetchSpotifySongwriters fetches credited writers for a track via the
-// track-credits view, overriding the converted songWriters list.
 func (p *SpotifyProvider) fetchSpotifySongwriters(ctx context.Context, trackID string) ([]string, error) {
 	reqURL := fmt.Sprintf("https://spclient.wg.spotify.com/track-credits-view/v0/experimental/%s/credits", trackID)
 	resp, err := p.doSpotifyRequest(ctx, reqURL, nil, 0, p.mgm.CurrentIndex())
@@ -682,13 +668,9 @@ func (p *SpotifyProvider) getSecrets(ctx context.Context) map[string][]int {
 		}
 	}
 
-	// On failure keep the last-good dict untouched, without stamping the time,
-	// so the next call retries the fetch instead of suppressing it for 4h.
 	return p.secretsDict
 }
 
-// DeriveSecretBytes transforms cipher bytes:
-// transformed[t] = e XOR ((t mod 33) + 9), stringified digits concatenated.
 func DeriveSecretBytes(cipherBytes []int) []byte {
 	var transformed []byte
 	for t, e := range cipherBytes {
@@ -698,7 +680,6 @@ func DeriveSecretBytes(cipherBytes []int) []byte {
 	return transformed
 }
 
-// GenerateTOTP computes an RFC 6238 HMAC-SHA1 OTP.
 func GenerateTOTP(secretBytes []byte, timestamp int64, digits int, interval int64) string {
 	counter := uint64(timestamp / interval)
 	buf := make([]byte, 8)
@@ -715,7 +696,6 @@ func GenerateTOTP(secretBytes []byte, timestamp int64, digits int, interval int6
 	return fmt.Sprintf("%0*d", digits, otp)
 }
 
-// NormalizeSong converts a Spotify Track into domain.SongCatalogItem.
 func (p *SpotifyProvider) NormalizeSong(track spotifyTrack) domain.SongCatalogItem {
 	var artistNames []string
 	for _, a := range track.Artists {
@@ -745,7 +725,6 @@ func (p *SpotifyProvider) NormalizeSong(track spotifyTrack) domain.SongCatalogIt
 	}
 }
 
-// SearchCatalog searches Spotify tracks and normalizes the top 10 results.
 func (p *SpotifyProvider) SearchCatalog(ctx context.Context, query string) ([]domain.SongCatalogItem, error) {
 	tracks, err := p.SearchTrack(ctx, query)
 	if err != nil {

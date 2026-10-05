@@ -162,7 +162,6 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 
 	s := &Service{Store: st}
 
-	// Requesting qq: should NOT hit the apple cache
 	qqQuery := domain.SearchQuery{
 		Title:   "Nyam Nyam Ketupat",
 		Artist:  "Dinda Dania",
@@ -172,7 +171,6 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 		t.Error("expected fromStore to return false when requesting source=qq but cache has apple")
 	}
 
-	// Requesting apple: should hit the cache
 	appleQuery := domain.SearchQuery{
 		Title:   "Nyam Nyam Ketupat",
 		Artist:  "Dinda Dania",
@@ -182,7 +180,6 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 		t.Error("expected fromStore to return true when requesting source=apple")
 	}
 
-	// Requesting default (no source filter): should hit the cache
 	defaultQuery := domain.SearchQuery{
 		Title:  "Nyam Nyam Ketupat",
 		Artist: "Dinda Dania",
@@ -191,8 +188,6 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 		t.Error("expected fromStore to return true when requesting without source filter")
 	}
 
-	// Requesting qq,apple when ONLY apple is cached:
-	// Top preference qq is not in cache, so it should return false to allow racing live
 	qqAppleQuery := domain.SearchQuery{
 		Title:   "Nyam Nyam Ketupat",
 		Artist:  "Dinda Dania",
@@ -202,8 +197,6 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 		t.Error("expected fromStore to return false when top preference qq is missing from cache")
 	}
 
-	// Requesting apple,qq when ONLY apple is cached:
-	// Top preference apple is in cache, so it should hit cache
 	appleQqQuery := domain.SearchQuery{
 		Title:   "Nyam Nyam Ketupat",
 		Artist:  "Dinda Dania",
@@ -213,7 +206,6 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 		t.Error("expected fromStore to return true when top preference apple is cached")
 	}
 
-	// Now also save a QQ record for the same song
 	storedQQ := &domain.LyricsResponse{
 		Type: domain.SyncTypeLine,
 		Metadata: domain.LyricsMetadata{
@@ -237,15 +229,12 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 		t.Fatalf("save qq: %v", err)
 	}
 
-	// Now both Apple and QQ exist in SQLite.
-	// When requesting source=qq,apple, it must pick QQ:
 	if resp, ok := s.fromStore(context.Background(), qqAppleQuery); !ok || resp == nil {
 		t.Fatal("expected cache hit for qq,apple")
 	} else if resp.Metadata.Source != "QQ Music" {
 		t.Errorf("expected winner QQ Music, got %q", resp.Metadata.Source)
 	}
 
-	// When requesting source=apple,qq, it must pick Apple:
 	if resp, ok := s.fromStore(context.Background(), appleQqQuery); !ok || resp == nil {
 		t.Fatal("expected cache hit for apple,qq")
 	} else if resp.Metadata.Source != "Apple" {
@@ -262,7 +251,6 @@ func TestFromStoreDuplicateTitleArtistDisambiguationByDurationAndAlbum(t *testin
 
 	ctx := context.Background()
 
-	// Version 1: Original Studio version (3m00s = 180000ms, Album: "Asylum")
 	respStudio := &domain.LyricsResponse{
 		Type: domain.SyncTypeLine,
 		Metadata: domain.LyricsMetadata{
@@ -286,7 +274,6 @@ func TestFromStoreDuplicateTitleArtistDisambiguationByDurationAndAlbum(t *testin
 		t.Fatalf("save studio: %v", err)
 	}
 
-	// Version 2: Live Extended version (5m10s = 310000ms, Album: "Live in London")
 	respLive := &domain.LyricsResponse{
 		Type: domain.SyncTypeLine,
 		Metadata: domain.LyricsMetadata{
@@ -312,12 +299,11 @@ func TestFromStoreDuplicateTitleArtistDisambiguationByDurationAndAlbum(t *testin
 
 	s := &Service{Store: st}
 
-	// 1. Query targeting Studio version by duration (~180s) and Album ("Asylum")
 	qStudio := domain.SearchQuery{
 		Title:    "Warrior",
 		Artist:   "Disturbed",
 		Album:    "Asylum",
-		Duration: 181000, // 181s (~1s difference)
+		Duration: 181000,
 	}
 	hitStudio, ok := s.fromStore(ctx, qStudio)
 	if !ok || hitStudio == nil {
@@ -327,12 +313,11 @@ func TestFromStoreDuplicateTitleArtistDisambiguationByDurationAndAlbum(t *testin
 		t.Fatalf("expected 'Studio Warrior', got %v", hitStudio.Lyrics)
 	}
 
-	// 2. Query targeting Live version by duration (~310s) and Album ("Live in London")
 	qLive := domain.SearchQuery{
 		Title:    "Warrior",
 		Artist:   "Disturbed",
 		Album:    "Live in London",
-		Duration: 309000, // 309s (~1s difference)
+		Duration: 309000,
 	}
 	hitLive, ok := s.fromStore(ctx, qLive)
 	if !ok || hitLive == nil {
@@ -342,8 +327,6 @@ func TestFromStoreDuplicateTitleArtistDisambiguationByDurationAndAlbum(t *testin
 		t.Fatalf("expected 'Live Warrior', got %v", hitLive.Lyrics)
 	}
 
-	// 3. Query with wild duration mismatch (e.g. 10 minutes = 600000ms)
-	// Must NOT falsely return an out-of-sync studio or live version
 	qMismatch := domain.SearchQuery{
 		Title:    "Warrior",
 		Artist:   "Disturbed",
@@ -364,7 +347,6 @@ func TestLyricsPlusProviderIgnoresCachedNonLyricsPlusRows(t *testing.T) {
 
 	ctx := context.Background()
 
-	// 1. Insert an Apple Music row into the cache
 	stored := &domain.LyricsResponse{
 		Type: domain.SyncTypeLine,
 		Metadata: domain.LyricsMetadata{
@@ -392,8 +374,6 @@ func TestLyricsPlusProviderIgnoresCachedNonLyricsPlusRows(t *testing.T) {
 	lp := providers.NewLyricsPlus(nil)
 	lp.SetStore(st)
 
-	// 2. Query LyricsPlusProvider for the same song
-	// It MUST NOT return the apple row or overwrite its source to Lyrics+
 	q := domain.SearchQuery{
 		Title:  "Anti-Hero",
 		Artist: "Taylor Swift",
@@ -407,7 +387,6 @@ func TestLyricsPlusProviderIgnoresCachedNonLyricsPlusRows(t *testing.T) {
 		t.Fatalf("expected nil from LyricsPlusProvider for apple cached row, got %+v", resp)
 	}
 
-	// 3. Now save a genuine user submission
 	userResp := &domain.LyricsResponse{
 		Type: domain.SyncTypeLine,
 		Metadata: domain.LyricsMetadata{
@@ -424,7 +403,6 @@ func TestLyricsPlusProviderIgnoresCachedNonLyricsPlusRows(t *testing.T) {
 		t.Fatalf("save user lyrics: %v", err)
 	}
 
-	// 4. LyricsPlusProvider should now find the genuine user submission
 	respUser, err := lp.FetchLyrics(ctx, q)
 	if err != nil {
 		t.Fatalf("unexpected error on user query: %v", err)
@@ -488,10 +466,8 @@ func TestQapleResultNotSavedToStore(t *testing.T) {
 		t.Fatalf("expected winnerSource qaple, got %+v", resp.ProcessingTime.WinnerSource)
 	}
 
-	// Wait briefly for any background routine to run
 	time.Sleep(100 * time.Millisecond)
 
-	// Verify nothing was saved to SQLite Store
 	if rows, ok := st.GetByTitleArtist(context.Background(), "Qaple Song", "Qaple Artist"); ok && len(rows) > 0 {
 		t.Fatalf("expected Qaple results NOT to be saved to Store, but found %d rows: %+v", len(rows), rows)
 	}

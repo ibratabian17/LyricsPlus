@@ -11,8 +11,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// blockingSource blocks until its context is cancelled and records that it
-// observed the cancellation.
 type blockingSource struct {
 	name     string
 	started  chan struct{}
@@ -38,27 +36,20 @@ func (b *blockingSource) FetchLyrics(ctx context.Context, _ domain.SearchQuery) 
 
 func (b *blockingSource) stoppedCount() int { return int(b.stopped.Load()) }
 
-// newBlockingRacer wires the blocking source under a real provider name,
-// because SourceOrder selects from a fixed list and Racer.has() gates on it.
 func newBlockingRacer(t *testing.T, src *blockingSource, timeout time.Duration) *Dedup {
 	t.Helper()
 	racer := NewRacer([]Source{src}, timeout, WithLimiter(NewLimiter(LimiterConfig{})))
 	return NewDedup(racer)
 }
 
-// testSourceName is first in the default SourceOrder, so it is always part of
-// phase 1 of the race.
 const testSourceName = "apple"
 
-// TestDedupCancelsWhenAllWaitersLeave verifies the shared scrape is cancelled
-// once every caller has abandoned it, instead of running out the full timeout.
 func TestDedupCancelsWhenAllWaitersLeave(t *testing.T) {
 	src := newBlockingSource(testSourceName)
 	dedup := newBlockingRacer(t, src, 10*time.Second)
 
 	q := domain.SearchQuery{Title: "Ghost Song", Artist: "Nobody"}
 
-	// Each caller joins the flight, waits for it to be running, then abandons it.
 	const callers = 2
 	ctxs := make([]context.CancelFunc, 0, callers)
 	var wg sync.WaitGroup
@@ -70,7 +61,7 @@ func TestDedupCancelsWhenAllWaitersLeave(t *testing.T) {
 			defer wg.Done()
 			_, _ = dedup.Get(ctx, q, nil)
 		}()
-		// Let this caller register as a waiter and let the flight start.
+
 		time.Sleep(120 * time.Millisecond)
 	}
 
@@ -83,14 +74,11 @@ func TestDedupCancelsWhenAllWaitersLeave(t *testing.T) {
 		t.Fatalf("scrape ended early with %d cancellations before waiters left", got)
 	}
 
-	// Both callers give up.
 	for _, c := range ctxs {
 		c()
 	}
 	wg.Wait()
 
-	// The flight must observe cancellation promptly rather than lingering for
-	// the full 10s timeout.
 	deadline := time.After(2 * time.Second)
 	for src.sawClose.Load() == 0 {
 		select {
@@ -101,14 +89,11 @@ func TestDedupCancelsWhenAllWaitersLeave(t *testing.T) {
 	}
 }
 
-// TestDedupKeepsFlightWhileWaiterRemains verifies that one caller giving up does
-// not cancel the scrape for a caller still waiting.
 func TestDedupKeepsFlightWhileWaiterRemains(t *testing.T) {
 	src := newBlockingSource(testSourceName)
 	dedup := newBlockingRacer(t, src, 10*time.Second)
 	q := domain.SearchQuery{Title: "Popular Song", Artist: "Someone"}
 
-	// A long-lived waiter keeps the flight alive.
 	stayCtx, stayCancel := context.WithCancel(context.Background())
 	defer stayCancel()
 	stayed := make(chan struct{})
@@ -117,7 +102,6 @@ func TestDedupKeepsFlightWhileWaiterRemains(t *testing.T) {
 		_, _ = dedup.Get(stayCtx, q, nil)
 	}()
 
-	// A short-lived caller for the same key.
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
@@ -130,13 +114,11 @@ func TestDedupKeepsFlightWhileWaiterRemains(t *testing.T) {
 		t.Fatal("shared scrape never started")
 	}
 
-	// Let the short caller expire.
 	time.Sleep(400 * time.Millisecond)
 	if got := src.sawClose.Load(); got != 0 {
 		t.Fatalf("scrape was cancelled while a waiter remained (cancellations=%d)", got)
 	}
 
-	// Now release the remaining waiter and confirm cancellation happens.
 	stayCancel()
 	select {
 	case <-stayed:
@@ -145,8 +127,6 @@ func TestDedupKeepsFlightWhileWaiterRemains(t *testing.T) {
 	}
 }
 
-// TestDedupAllCallersCancelReturns verifies callers get their context error
-// promptly instead of blocking on a flight nobody is waiting for.
 func TestDedupAllCallersCancelReturns(t *testing.T) {
 	src := newBlockingSource(testSourceName)
 	dedup := newBlockingRacer(t, src, 30*time.Second)
@@ -169,8 +149,6 @@ func TestDedupAllCallersCancelReturns(t *testing.T) {
 	}
 }
 
-// TestLimiterRejectsWhenSaturated verifies overload is rejected immediately
-// rather than queued, which is what keeps goroutine and memory bounded.
 func TestLimiterRejectsWhenSaturated(t *testing.T) {
 	l := NewLimiter(LimiterConfig{Global: 2, PerSource: 2, Wait: 10 * time.Millisecond})
 
@@ -190,7 +168,6 @@ func TestLimiterRejectsWhenSaturated(t *testing.T) {
 		t.Fatalf("rejection took %s; it must fail fast", elapsed)
 	}
 
-	// Per-provider cap must bite even while global capacity remains.
 	l2 := NewLimiter(LimiterConfig{Global: 10, PerSource: 1, Wait: time.Millisecond})
 	ra, _ := l2.TryAcquire("same")
 	if ra == nil {
@@ -201,7 +178,6 @@ func TestLimiterRejectsWhenSaturated(t *testing.T) {
 	}
 	ra()
 
-	// After release, capacity returns.
 	if rel, ok := l2.TryAcquire("same"); !ok {
 		t.Fatal("capacity should be reusable after release")
 	} else {
@@ -212,8 +188,6 @@ func TestLimiterRejectsWhenSaturated(t *testing.T) {
 	r2()
 }
 
-// TestLimiterBoundedConcurrentFetches verifies the limiter actually caps
-// concurrent provider work under a fan-out heavier than the cap.
 func TestLimiterBoundedConcurrentFetches(t *testing.T) {
 	const (
 		limit   = 4

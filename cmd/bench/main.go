@@ -148,9 +148,6 @@ func main() {
 		return
 	}
 
-	// -------------------------------------------------------------
-	// PART 1: In-Process Service & Storage Engine (Testing 120K req/s)
-	// -------------------------------------------------------------
 	if !*skipDirect {
 		fmt.Println("==================================================================")
 		fmt.Println("TEST 1: In-Process Service & Storage Engine Stress Test")
@@ -178,7 +175,6 @@ func main() {
 			MemCache: memCache,
 		}
 
-		// Warm up cache with first 500 songs
 		warmupCtx := context.Background()
 		for i := 0; i < 500 && i < len(songs); i++ {
 			_, _ = svc.FetchLyrics(warmupCtx, domain.SearchQuery{Title: songs[i].Title, Artist: songs[i].Artist}, nil, false)
@@ -187,9 +183,6 @@ func main() {
 		testDirectService(svc, songs, 10*time.Second, 1000)
 	}
 
-	// -------------------------------------------------------------
-	// PART 2: HTTP Network Load Test (Across Diverse Songs)
-	// -------------------------------------------------------------
 	if !*skipHTTP {
 		fmt.Println("\n==================================================================")
 		fmt.Println("TEST 2: HTTP Endpoint Network Load Test (/v2/lyrics/get)")
@@ -298,7 +291,6 @@ func testHTTPEndpoint(songs []SongPair, baseURL string, duration time.Duration, 
 	}
 	client := &http.Client{Transport: tr, Timeout: timeout}
 
-	// Verify server is reachable
 	resp, err := client.Get(strings.TrimRight(baseURL, "/") + "/health")
 	if err != nil {
 		fmt.Printf("HTTP server not running on port 3000 (%v). Skipping HTTP test.\n", err)

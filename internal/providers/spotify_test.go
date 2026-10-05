@@ -15,7 +15,7 @@ func TestDeriveSecretBytes(t *testing.T) {
 	if !strings.EqualFold(string(secret), string(DeriveSecretBytes(cipher))) {
 		t.Error("derivation must be deterministic")
 	}
-	// Spot check first byte: e[0] ^ (0 + 9) -> stringified.
+
 	want := []byte(itoa(int(cipher[0] ^ 9)))
 	if secret[0] != want[0] {
 		t.Errorf("first derived byte = %d, want %d", secret[0], want[0])

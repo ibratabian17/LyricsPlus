@@ -9,8 +9,7 @@ import (
 
 func TestSign(t *testing.T) {
 	sig := Sign(`{"songmid":123}`)
-	// part1 = indices [23,14,6,36,16,7,19] (40 filtered out) => 7 chars; part2 => 8 chars.
-	// len = 3 + 7 + b64(20 bytes => 27 chars minus /+=) + 8 => 44 or 45.
+
 	if !strings.HasPrefix(sig, "zzc") {
 		t.Errorf("signature must start with zzc: %q", sig)
 	}
@@ -68,20 +67,18 @@ func TestIsQQMid(t *testing.T) {
 }
 
 func TestProcessLyric(t *testing.T) {
-	// Empty content
+
 	res, err := processLyric("")
 	if err != nil || res != "" {
 		t.Errorf("expected empty result, got %q (err=%v)", res, err)
 	}
 
-	// Plain LRC wrapping
 	plainLRC := "[00:01.00]hello world"
 	res, err = processLyric(plainLRC)
 	if err != nil || !strings.Contains(res, "<QrcInfos>") {
 		t.Errorf("expected wrapped XML, got %q (err=%v)", res, err)
 	}
 
-	// Already wrapped XML
 	wrappedXML := "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<QrcInfos><LyricInfo></LyricInfo></QrcInfos>"
 	res, err = processLyric(wrappedXML)
 	if err != nil || res != wrappedXML {

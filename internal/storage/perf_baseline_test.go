@@ -9,8 +9,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// BenchmarkStoreHitPath measures allocations for a warm title+artist lookup
-// followed by a content fetch. This is the dominant read path in production.
 func BenchmarkStoreHitPath(b *testing.B) {
 	dbPath := filepath.Join(b.TempDir(), "perf.db")
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 512})
@@ -30,7 +28,6 @@ func BenchmarkStoreHitPath(b *testing.B) {
 		b.Fatalf("SaveUserLyrics: %v", err)
 	}
 
-	// Warm the LRUs so we measure the steady-state hit path, not cold misses.
 	if _, ok := st.GetByTitleArtist(ctx, "Bohemian Rhapsody", "Queen"); !ok {
 		b.Fatal("expected warm hit")
 	}
@@ -48,8 +45,6 @@ func BenchmarkStoreHitPath(b *testing.B) {
 	}
 }
 
-// BenchmarkStoreMissPath measures the repeat-miss path. Without negative
-// caching this re-queries SQLite on every single request.
 func BenchmarkStoreMissPath(b *testing.B) {
 	dbPath := filepath.Join(b.TempDir(), "perfmiss.db")
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 512})

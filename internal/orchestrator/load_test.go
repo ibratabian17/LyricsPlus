@@ -11,8 +11,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// countingSource simulates a provider that occupies a slot for a fixed time,
-// then returns lyrics, so races take a predictable amount of wall time.
 type countingSource struct {
 	name    string
 	delay   time.Duration
@@ -52,7 +50,6 @@ func (c *countingSource) FetchLyrics(ctx context.Context, _ domain.SearchQuery) 
 	}, nil
 }
 
-// allSourceNames is the default SourceOrder, so every racing slot is populated.
 var allSourceNames = []string{"apple", "lyricsplus", "deezer", "qq", "musixmatch-word", "musixmatch"}
 
 func buildRacer(t *testing.T, limiter *Limiter, delay time.Duration, respond bool) (*Racer, []*countingSource) {
@@ -71,7 +68,6 @@ func buildRacer(t *testing.T, limiter *Limiter, delay time.Duration, respond boo
 	return NewRacer(sources, 2*time.Second, opts...), made
 }
 
-// peakGoroutines samples the goroutine count while fn runs.
 func peakGoroutines(t *testing.T, d time.Duration, fn func()) int {
 	t.Helper()
 	stop := make(chan struct{})
@@ -98,13 +94,6 @@ func peakGoroutines(t *testing.T, d time.Duration, fn func()) int {
 	return int(peak)
 }
 
-// TestRaceBoundedGoroutinesUnderLoad is the core memory-safety guarantee: peak
-// concurrent provider fetches must stay at the limiter's global capacity rather
-// than scaling with requests * sources.
-//
-// Without admission control, every request spawns one goroutine per source that
-// lives for the full provider delay, so in-flight provider work grows linearly
-// with request count.
 func TestRaceBoundedGoroutinesUnderLoad(t *testing.T) {
 	const (
 		requests    = 400
@@ -131,9 +120,6 @@ func TestRaceBoundedGoroutinesUnderLoad(t *testing.T) {
 		}()
 	}
 
-	// Sample the total number of provider fetches in flight. This is the
-	// quantity the limiter bounds, and it is independent of the test's own
-	// request-driver goroutines.
 	var peakFetches atomic.Int64
 	stop := make(chan struct{})
 	var sampler sync.WaitGroup
@@ -167,15 +153,11 @@ func TestRaceBoundedGoroutinesUnderLoad(t *testing.T) {
 	close(stop)
 	sampler.Wait()
 
-	// The hard invariant: in-flight provider fetches never exceed the global cap.
 	if peakFetches.Load() > providerCap {
 		t.Fatalf("peak concurrent provider fetches %d exceeded global cap %d (unbounded would reach ~%d)",
 			peakFetches.Load(), providerCap, requests*len(allSourceNames))
 	}
 
-	// Secondary check: total goroutines must not scale with the fan-out. The
-	// test itself holds `requests` driver goroutines, so the allowance is
-	// requests + cap + slack; unbounded fan-out would need requests*sources.
 	goroutineCeiling := requests + providerCap + 64
 	if peakG > goroutineCeiling {
 		t.Fatalf("peak goroutines %d exceeded %d (requests %d + cap %d + slack; unbounded fan-out would need ~%d)",
@@ -186,8 +168,6 @@ func TestRaceBoundedGoroutinesUnderLoad(t *testing.T) {
 		peakFetches.Load(), providerCap, peakG, goroutineCeiling, requests*len(allSourceNames))
 }
 
-// TestRacePerSourceCapIsEnforced verifies the per-provider cap holds under a
-// fan-out much wider than the cap.
 func TestRacePerSourceCapIsEnforced(t *testing.T) {
 	const (
 		requests = 200
@@ -218,9 +198,6 @@ func TestRacePerSourceCapIsEnforced(t *testing.T) {
 	t.Logf("per-provider peak concurrency stayed within cap %d across %d requests", perSrc, requests)
 }
 
-// TestRaceRejectionsRecordedAsSkip verifies overload is reported as a skip
-// (admission rejection) rather than an upstream RTO, so capacity problems stay
-// distinguishable in metrics.
 func TestRaceRejectionsRecordedAsSkip(t *testing.T) {
 	limiter := NewLimiter(LimiterConfig{Global: 1, PerSource: 1, Wait: time.Millisecond})
 	racer, _ := buildRacer(t, limiter, 80*time.Millisecond, true)

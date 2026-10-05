@@ -2,8 +2,6 @@ package storage
 
 import "testing"
 
-// realisticPayload approximates a stored LyricsResponse: mostly repetitive
-// lyric text, which is the compression-friendly shape of real content.
 func realisticPayload() []byte {
 	buf := make([]byte, 0, 96<<10)
 	for i := 0; len(buf) < 96<<10; i++ {

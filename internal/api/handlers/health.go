@@ -9,24 +9,20 @@ import (
 	"lyricsplus/backend/internal/version"
 )
 
-// StorePinger is the minimal store surface the health handler needs.
 type StorePinger interface {
 	Ping(ctx context.Context) error
 }
 
-// Health serves /health (liveness) and /readyz (readiness).
 type Health struct {
 	Store   StorePinger
 	Started time.Time
 	Version string
 }
 
-// Handle reports liveness: always 200 while the process is running.
 func (h *Health) Handle(w http.ResponseWriter, r *http.Request) {
 	h.write(w, r, false)
 }
 
-// Ready reports readiness: 200 when the backing cache is reachable, else 503.
 func (h *Health) Ready(w http.ResponseWriter, r *http.Request) {
 	h.write(w, r, true)
 }

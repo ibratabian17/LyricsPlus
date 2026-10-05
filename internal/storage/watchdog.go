@@ -7,8 +7,6 @@ import (
 	"time"
 )
 
-// Watchdog sheds in-memory caches when process RSS memory exceeds the
-// threshold, checked every interval with a cooldown period.
 type Watchdog struct {
 	limitBytes int64
 	interval   time.Duration
@@ -29,12 +27,10 @@ func NewWatchdog(limitBytes int64, interval time.Duration, caches ...interface{ 
 	}
 }
 
-// SetCooldown customizes the minimum time between cache shedding events.
 func (w *Watchdog) SetCooldown(d time.Duration) {
 	w.cooldown = d
 }
 
-// Start begins periodic RSS monitoring.
 func (w *Watchdog) Start() {
 	go func() {
 		t := time.NewTicker(w.interval)

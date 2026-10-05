@@ -12,15 +12,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// TestPooledConnectionsCarryTheirOwnPageCache pins the reason the reader pool
-// is small.
-//
-// PRAGMA cache_size is per connection, not per database, and the DSN applies it
-// to every connection the driver opens. A large MaxOpenConns therefore
-// multiplies the page-cache budget: the previous pool of 100 connections at
-// cache_size=-16384 budgeted 1.6 GiB of page cache before serving a single
-// query. If this test fails, the pool has been widened without accounting for
-// that multiplier.
 func TestPooledConnectionsCarryTheirOwnPageCache(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "pool.db")
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 8, ReadConns: 4})
@@ -31,7 +22,6 @@ func TestPooledConnectionsCarryTheirOwnPageCache(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Pin several distinct pooled connections so each can be inspected.
 	pinned := make([]*sql.Conn, 0, 4)
 	defer func() {
 		for _, c := range pinned {
@@ -65,7 +55,7 @@ func TestPooledConnectionsCarryTheirOwnPageCache(t *testing.T) {
 		if err != nil {
 			t.Fatalf("conn %d cache_size %q unparseable: %v", i, cacheSize, err)
 		}
-		// Negative values are a KiB budget, so -16384 means 16 MiB.
+
 		perConnKB := size
 		if perConnKB < 0 {
 			perConnKB = -perConnKB
@@ -77,8 +67,6 @@ func TestPooledConnectionsCarryTheirOwnPageCache(t *testing.T) {
 	}
 }
 
-// TestReaderPoolIsBounded guards the pool size itself, which is the multiplier
-// on both memory and writer contention.
 func TestReaderPoolIsBounded(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "bounded.db")
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 8, ReadConns: 6})
@@ -91,16 +79,12 @@ func TestReaderPoolIsBounded(t *testing.T) {
 	if stats.MaxOpenConnections != 6 {
 		t.Errorf("reader pool MaxOpenConnections = %d, want 6", stats.MaxOpenConnections)
 	}
-	// One writer connection serializes writes in Go, so they never contend on
-	// the SQLite writer lock and never stall a reader behind busy_timeout.
+
 	if got := st.wdb.Stats().MaxOpenConnections; got != 1 {
 		t.Errorf("writer pool MaxOpenConnections = %d, want 1", got)
 	}
 }
 
-// TestMissMemoCollapsesDuplicateLookups verifies that repeated misses stop
-// issuing SQLite queries, which is what prevents a cache stampede from
-// amplifying into a query storm.
 func TestMissMemoCollapsesDuplicateLookups(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "memo.db")
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 8, NegativeTTL: time.Minute})
@@ -117,7 +101,6 @@ func TestMissMemoCollapsesDuplicateLookups(t *testing.T) {
 		}
 	}
 
-	// The first lookup queries SQLite; the rest are answered from the memo.
 	if memoized := st.wasMiss("ta::ghost song::nobody"); !memoized {
 		t.Fatal("expected the miss to be memoized")
 	}
@@ -126,8 +109,6 @@ func TestMissMemoCollapsesDuplicateLookups(t *testing.T) {
 	}
 }
 
-// TestSaveClearsMissMemo verifies a newly written song becomes visible
-// immediately instead of being hidden by its own earlier miss.
 func TestSaveClearsMissMemo(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "memo2.db")
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 8, NegativeTTL: time.Minute})
@@ -151,8 +132,6 @@ func TestSaveClearsMissMemo(t *testing.T) {
 	}
 }
 
-// TestSaveLyricsEvictsStaleContent verifies re-saving a row cannot keep serving
-// the previous content from the ID-keyed content LRU.
 func TestSaveLyricsEvictsStaleContent(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "stale.db")
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 8})

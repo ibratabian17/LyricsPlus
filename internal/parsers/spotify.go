@@ -34,7 +34,6 @@ type spotifyPayload struct {
 	Lyrics *spotifyLyrics `json:"lyrics"`
 }
 
-// ConvertSpotifyToJSON converts a Spotify color-lyrics payload into V2.
 func ConvertSpotifyToJSON(spotifyPayloadData []byte) (*domain.LyricsResponse, error) {
 	var outer spotifyPayload
 	if err := json.Unmarshal(spotifyPayloadData, &outer); err != nil {
@@ -163,7 +162,6 @@ func ConvertSpotifyToJSON(spotifyPayloadData []byte) (*domain.LyricsResponse, er
 	return result, nil
 }
 
-// jsNumber parses a number-like JSON value, defaulting to 0 for empty/null/missing values.
 func jsNumber(raw json.RawMessage) float64 {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || s == "null" {
@@ -220,7 +218,6 @@ func durationFromEnd(startTimeMs, endTimeMs json.RawMessage, fallback float64) i
 	return int(math.Max(0, math.Round(duration)))
 }
 
-// detectSongPart classifies a line as a known song part from its words.
 func detectSongPart(line spotifyLine) string {
 	text := strings.ToLower(line.Words)
 	if strings.Contains(text, "[verse]") || strings.Contains(text, "verse") {
@@ -247,7 +244,6 @@ var (
 	rePunctStart = regexp.MustCompile(`^[.,!?]`)
 )
 
-// shouldAddSpace decides whether a word gap belongs between syllables.
 func shouldAddSpace(syllables []spotifySyllable, currentIndex int) bool {
 	if currentIndex >= len(syllables)-1 {
 		return false

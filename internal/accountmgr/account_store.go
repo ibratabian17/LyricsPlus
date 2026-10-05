@@ -1,4 +1,3 @@
-// Package accountmgr manages provider and Google Drive accounts in auth.json or config.json.
 package accountmgr
 
 import (
@@ -12,35 +11,27 @@ import (
 	"lyricsplus/backend/internal/config"
 )
 
-// Store manages provider accounts and preserves arbitrary JSON keys in the config file.
 type Store struct {
 	filePath string
 	rawDoc   map[string]json.RawMessage
 
-	// For .env files: preserved lines (comments + unrelated keys stay intact),
-	// plus provider accounts / QQ cookie / GDrive accounts.
 	envLines []envLine
 
-	// Provider accounts
 	SpotifyAccounts    []config.SpotifyAccount
 	AppleAccounts      []config.AppleAccount
 	MusixmatchAccounts []config.MusixmatchAccount
 	DeezerAccounts     []config.DeezerAccount
 	QQCookie           string
 
-	// Google Drive accounts
 	GDriveAccounts []config.GDriveAccount
 }
 
-// envLine is a single preserved .env line. raw stays byte-for-byte identical
-// unless the key is updated, so comments and formatting survive round-trips.
 type envLine struct {
 	raw string
 	key string
 	val string
 }
 
-// FindConfigFile attempts to locate the default auth/config file.
 func FindConfigFile(customPath string) string {
 	if customPath != "" {
 		return customPath
@@ -59,15 +50,11 @@ func FindConfigFile(customPath string) string {
 	return "auth.json"
 }
 
-// IsEnvPath reports whether the path looks like a dotenv file (.env, .env.local, ...).
 func IsEnvPath(path string) bool {
 	base := strings.ToLower(filepath.Base(path))
 	return base == ".env" || strings.HasPrefix(base, ".env.")
 }
 
-// LoadStore reads and parses the configuration file. If the file does not exist,
-// it initializes an empty Store for that path. Both JSON auth/config files and
-// .env files (provider + GDrive credential keys) are supported.
 func LoadStore(path string) (*Store, error) {
 	st := &Store{
 		filePath: path,
@@ -103,7 +90,6 @@ func LoadStore(path string) (*Store, error) {
 }
 
 func (s *Store) loadGDrive() {
-	// 1. Check structured gdrive.accounts
 	if raw, ok := s.rawDoc["gdrive"]; ok {
 		var gd struct {
 			Accounts []config.GDriveAccount `json:"accounts"`
@@ -114,7 +100,6 @@ func (s *Store) loadGDrive() {
 		}
 	}
 
-	// 2. Check root-level accounts array
 	if raw, ok := s.rawDoc["gdrive_accounts"]; ok {
 		var accs []config.GDriveAccount
 		if err := json.Unmarshal(raw, &accs); err == nil && len(accs) > 0 {
@@ -123,7 +108,6 @@ func (s *Store) loadGDrive() {
 		}
 	}
 
-	// 3. Fallback to root-level scalar credentials
 	var rootCreds struct {
 		ClientID     string `json:"client_id"`
 		ClientSecret string `json:"client_secret"`
@@ -153,7 +137,6 @@ func (s *Store) loadProviders() {
 		return
 	}
 
-	// Spotify accounts
 	if raw, ok := provMap["spotify_accounts"]; ok {
 		_ = json.Unmarshal(raw, &s.SpotifyAccounts)
 	}
@@ -172,7 +155,6 @@ func (s *Store) loadProviders() {
 		}
 	}
 
-	// Apple Music accounts
 	if raw, ok := provMap["apple_music_accounts"]; ok {
 		_ = json.Unmarshal(raw, &s.AppleAccounts)
 	} else if raw, ok := provMap["apple_accounts"]; ok {
@@ -208,7 +190,6 @@ func (s *Store) loadProviders() {
 		}
 	}
 
-	// Musixmatch accounts
 	if raw, ok := provMap["musixmatch_accounts"]; ok {
 		_ = json.Unmarshal(raw, &s.MusixmatchAccounts)
 	}
@@ -237,7 +218,6 @@ func (s *Store) loadProviders() {
 		}
 	}
 
-	// Deezer accounts
 	if raw, ok := provMap["deezer_accounts"]; ok {
 		_ = json.Unmarshal(raw, &s.DeezerAccounts)
 	}
@@ -254,13 +234,11 @@ func (s *Store) loadProviders() {
 		}
 	}
 
-	// QQ Music cookie
 	if raw, ok := provMap["qq_cookie"]; ok {
 		_ = json.Unmarshal(raw, &s.QQCookie)
 	}
 }
 
-// Save serializes the updated accounts back to the file, preserving all other fields.
 func (s *Store) Save() error {
 	if s.filePath == "" {
 		return fmt.Errorf("no file path specified")
@@ -269,7 +247,6 @@ func (s *Store) Save() error {
 		return s.saveEnv()
 	}
 
-	// 1. Prepare provider object
 	var provMap map[string]json.RawMessage
 	if raw, ok := s.rawDoc["provider"]; ok {
 		_ = json.Unmarshal(raw, &provMap)
@@ -278,7 +255,6 @@ func (s *Store) Save() error {
 		provMap = make(map[string]json.RawMessage)
 	}
 
-	// Sync Spotify
 	provMap["spotify_accounts"] = mustMarshalJSON(s.SpotifyAccounts)
 	switch len(s.SpotifyAccounts) {
 	case 1:
@@ -292,7 +268,6 @@ func (s *Store) Save() error {
 		delete(provMap, "spotify_client_secret")
 	}
 
-	// Sync Apple Music
 	provMap["apple_music_accounts"] = mustMarshalJSON(s.AppleAccounts)
 	switch len(s.AppleAccounts) {
 	case 1:
@@ -316,7 +291,6 @@ func (s *Store) Save() error {
 		delete(provMap, "apple_music_storefront")
 	}
 
-	// Sync Musixmatch
 	provMap["musixmatch_accounts"] = mustMarshalJSON(s.MusixmatchAccounts)
 	switch len(s.MusixmatchAccounts) {
 	case 1:
@@ -335,7 +309,6 @@ func (s *Store) Save() error {
 		delete(provMap, "musixmatch_user_agent")
 	}
 
-	// Sync Deezer
 	provMap["deezer_accounts"] = mustMarshalJSON(s.DeezerAccounts)
 	switch len(s.DeezerAccounts) {
 	case 1:
@@ -347,14 +320,12 @@ func (s *Store) Save() error {
 		delete(provMap, "deezer_refresh_token")
 	}
 
-	// Sync QQ Music
 	if s.QQCookie != "" {
 		provMap["qq_cookie"] = mustMarshalJSON(s.QQCookie)
 	}
 
 	s.rawDoc["provider"] = mustMarshalJSON(provMap)
 
-	// 2. Prepare GDrive
 	gdMap := make(map[string]json.RawMessage)
 	if raw, ok := s.rawDoc["gdrive"]; ok {
 		if err := json.Unmarshal(raw, &gdMap); err != nil || gdMap == nil {
@@ -383,7 +354,6 @@ func (s *Store) Save() error {
 		delete(s.rawDoc, "root")
 	}
 
-	// 3. Write formatted JSON to file
 	dir := filepath.Dir(s.filePath)
 	if dir != "" && dir != "." {
 		_ = os.MkdirAll(dir, 0755)
@@ -402,12 +372,6 @@ func (s *Store) Save() error {
 	return nil
 }
 
-// ============================================================================
-// .env support
-// ============================================================================
-
-// loadFromEnv parses the dotenv content into ordered lines and fills the
-// provider / GDrive accounts from the credential keys it understands.
 func (s *Store) loadFromEnv(content string) {
 	vals := map[string]string{}
 	s.envLines = s.envLines[:0]
@@ -439,7 +403,6 @@ func (s *Store) loadGDriveEnv(vals map[string]string) {
 }
 
 func (s *Store) loadProvidersEnv(vals map[string]string) {
-	// Spotify
 	if accs, ok := parseAccounts[config.SpotifyAccount](vals["SPOTIFY_ACCOUNTS"]); ok {
 		s.SpotifyAccounts = accs
 	} else if vals["SPOTIFY_COOKIE"] != "" || vals["SPOTIFY_CLIENT_ID"] != "" {
@@ -451,7 +414,6 @@ func (s *Store) loadProvidersEnv(vals map[string]string) {
 		})
 	}
 
-	// Apple Music
 	if accs, ok := parseAccounts[config.AppleAccount](vals["APPLE_MUSIC_ACCOUNTS"]); ok {
 		s.AppleAccounts = accs
 	} else {
@@ -476,7 +438,6 @@ func (s *Store) loadProvidersEnv(vals map[string]string) {
 		}
 	}
 
-	// Musixmatch
 	if accs, ok := parseAccounts[config.MusixmatchAccount](vals["MUSIXMATCH_ACCOUNTS"]); ok {
 		s.MusixmatchAccounts = accs
 	} else {
@@ -498,7 +459,6 @@ func (s *Store) loadProvidersEnv(vals map[string]string) {
 		}
 	}
 
-	// Deezer
 	if accs, ok := parseAccounts[config.DeezerAccount](vals["DEEZER_ACCOUNTS"]); ok {
 		s.DeezerAccounts = accs
 	} else if vals["DEEZER_ARL"] != "" || vals["DEEZER_REFRESH_TOKEN"] != "" {
@@ -512,8 +472,6 @@ func (s *Store) loadProvidersEnv(vals map[string]string) {
 	s.QQCookie = vals["QQ_COOKIE"]
 }
 
-// envArray marshals an account slice for a .env value, normalizing nil slices
-// to "[]" instead of "null" so the line reads cleanly.
 func envArray(v any) string {
 	b, _ := json.Marshal(v)
 	if string(b) == "null" {
@@ -522,10 +480,7 @@ func envArray(v any) string {
 	return string(b)
 }
 
-// saveEnv writes the provider and GDrive credential keys back into the .env
-// file in place, preserving comments and unrelated keys.
 func (s *Store) saveEnv() error {
-	// Spotify
 	s.envSet("SPOTIFY_ACCOUNTS", envArray(s.SpotifyAccounts))
 	switch len(s.SpotifyAccounts) {
 	case 1:
@@ -538,7 +493,6 @@ func (s *Store) saveEnv() error {
 		s.envSet("SPOTIFY_CLIENT_SECRET", "")
 	}
 
-	// Apple Music
 	s.envSet("APPLE_MUSIC_ACCOUNTS", envArray(s.AppleAccounts))
 	switch len(s.AppleAccounts) {
 	case 1:
@@ -562,7 +516,6 @@ func (s *Store) saveEnv() error {
 		s.envSet("APPLE_MUSIC_STOREFRONT", "")
 	}
 
-	// Musixmatch
 	s.envSet("MUSIXMATCH_ACCOUNTS", envArray(s.MusixmatchAccounts))
 	switch len(s.MusixmatchAccounts) {
 	case 1:
@@ -581,7 +534,6 @@ func (s *Store) saveEnv() error {
 		s.envSet("MUSIXMATCH_ANDROID_PASSWORD", "")
 	}
 
-	// Deezer
 	s.envSet("DEEZER_ACCOUNTS", envArray(s.DeezerAccounts))
 	switch len(s.DeezerAccounts) {
 	case 1:
@@ -592,10 +544,8 @@ func (s *Store) saveEnv() error {
 		s.envSet("DEEZER_REFRESH_TOKEN", "")
 	}
 
-	// QQ Music
 	s.envSet("QQ_COOKIE", s.QQCookie)
 
-	// Google Drive
 	s.envSet("GDRIVE_ACCOUNTS", envArray(s.GDriveAccounts))
 	switch len(s.GDriveAccounts) {
 	case 1:
@@ -626,9 +576,6 @@ func (s *Store) saveEnv() error {
 	return nil
 }
 
-// envSet updates an existing key in place, or appends a new line at the end.
-// It always rewrites the line, so values that contain spaces / # / quotes get
-// safely double-quoted for reliable re-parsing.
 func (s *Store) envSet(key, val string) {
 	for i := range s.envLines {
 		if strings.EqualFold(s.envLines[i].key, key) {
@@ -641,8 +588,6 @@ func (s *Store) envSet(key, val string) {
 	s.envLines = append(s.envLines, envLine{key: key, val: val, raw: key + "=" + encodeEnvValue(val)})
 }
 
-// parseEnvLine parses a single .env line into key/value using the same rules as
-// the server's dotenv loader: export prefix, optional quotes, inline comments.
 func parseEnvLine(raw string) (key, val string, ok bool) {
 	line := strings.TrimSpace(raw)
 	if line == "" || strings.HasPrefix(line, "#") {
@@ -708,8 +653,6 @@ func encodeEnvValue(v string) string {
 	return v
 }
 
-// parseAccounts decodes a JSON array of provider accounts, normalizing keys to
-// UPPERCASE so lowercase / JS-style credentials still load reliably.
 func parseAccounts[T any](raw string) ([]T, bool) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, false
@@ -740,17 +683,14 @@ func parseAccounts[T any](raw string) ([]T, bool) {
 	return out, true
 }
 
-// FilePath returns the file path of the store.
 func (s *Store) FilePath() string {
 	return s.filePath
 }
 
-// SetFilePath updates the target file path.
 func (s *Store) SetFilePath(p string) {
 	s.filePath = p
 }
 
-// MaskCredential returns a visually masked version of a token/cookie.
 func MaskCredential(val string) string {
 	trimmed := strings.TrimSpace(val)
 	if trimmed == "" {
@@ -764,7 +704,6 @@ func MaskCredential(val string) string {
 	return fmt.Sprintf("%s...%s (%d chars)", prefix, suffix, len(trimmed))
 }
 
-// CleanCookie removes surrounding quotes, extra whitespace, or standardizes cookie strings.
 func CleanCookie(val string) string {
 	s := strings.TrimSpace(val)
 	s = strings.TrimPrefix(s, "Cookie: ")
@@ -773,7 +712,6 @@ func CleanCookie(val string) string {
 	return strings.TrimSpace(s)
 }
 
-// ExtractSpDc extracts the sp_dc value from a full Cookie header if present.
 func ExtractSpDc(cookieHeader string) string {
 	cleaned := CleanCookie(cookieHeader)
 	for _, part := range strings.Split(cleaned, ";") {
@@ -795,7 +733,6 @@ func mustMarshalJSON(v any) json.RawMessage {
 	return b
 }
 
-// ConvertEnvToJSON reads configuration from a .env file and writes a structured JSON configuration file.
 func ConvertEnvToJSON(envPath, jsonPath string) error {
 	if envPath == "" {
 		envPath = ".env"

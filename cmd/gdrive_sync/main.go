@@ -100,7 +100,6 @@ func main() {
 		log.Fatalf("Failed to init SQLite schema: %v", err)
 	}
 
-	// Load existing (source::filename) into an in-memory index for O(1) deduplication
 	existingMap := make(map[string]struct{})
 	var existingMu sync.RWMutex
 	rows, err := db.Query("SELECT filename, source FROM lyrics")
@@ -211,7 +210,6 @@ func main() {
 					return
 				}
 
-				// Check again if already saved
 				existingMu.RLock()
 				_, alreadyExists := existingMap[job.source+"::"+job.item.Name]
 				existingMu.RUnlock()
@@ -220,7 +218,6 @@ func main() {
 					continue
 				}
 
-				// Download with retry & backoff
 				var content []byte
 				var downloadErr error
 				for attempt := 0; attempt < 5; attempt++ {
@@ -404,7 +401,6 @@ func main() {
 	close(jobQueue)
 	workerWg.Wait()
 
-	// Second pass: retry failed downloads with relaxed concurrency
 	failedMu.Lock()
 	numFailed := len(failedJobs)
 	failedMu.Unlock()
@@ -451,7 +447,7 @@ func main() {
 					}
 
 					totalDownloaded.Add(1)
-					totalErrors.Add(-1) // recovered!
+					totalErrors.Add(-1)
 
 					parsed := storage.ParseFilename(job.item.Name)
 					contentToStore := content
@@ -507,7 +503,6 @@ func main() {
 	if err := createIndexes(db); err != nil {
 		log.Printf("Failed to create indexes: %v", err)
 	}
-	// Fold the WAL into the main DB file and reclaim free pages.
 	if _, err := db.Exec("PRAGMA wal_checkpoint(TRUNCATE);"); err != nil {
 		log.Printf("wal checkpoint failed: %v", err)
 	}
@@ -538,8 +533,8 @@ func initSchema(db *sql.DB) error {
 		"PRAGMA synchronous = OFF;",
 		"PRAGMA busy_timeout = 10000;",
 		"PRAGMA temp_store = MEMORY;",
-		"PRAGMA cache_size = -262144;",   // 256MB memory page cache
-		"PRAGMA wal_autocheckpoint = 0;", // defer checkpoints; done manually at the end
+		"PRAGMA cache_size = -262144;",
+		"PRAGMA wal_autocheckpoint = 0;",
 	}
 	for _, p := range pragmas {
 		if _, err := db.Exec(p); err != nil {

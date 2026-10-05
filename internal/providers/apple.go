@@ -1,4 +1,3 @@
-// Package providers implements upstream lyric sources behind the Source interface.
 package providers
 
 import (
@@ -25,8 +24,6 @@ import (
 	"lyricsplus/backend/internal/similarity"
 )
 
-// appleAPIError carries the HTTP status of a failed Apple Music request so
-// callers can distinguish a 404 (no lyrics) from other failures.
 type appleAPIError struct {
 	StatusCode int
 	Msg        string
@@ -34,7 +31,6 @@ type appleAPIError struct {
 
 func (e *appleAPIError) Error() string { return e.Msg }
 
-// isNotFound reports whether err is an Apple Music 404.
 func isAppleStatus(err error, status int) bool {
 	var apiErr *appleAPIError
 	return errors.As(err, &apiErr) && apiErr.StatusCode == status
@@ -57,9 +53,6 @@ type appleISRCCacheEntry struct {
 	created time.Time
 }
 
-// AppleMusicProvider fetches TTML or syllable lyrics from Apple Music,
-// rotating through a list of android/web accounts on 401/429 (503 rate-limits
-// reuse the same account).
 type AppleMusicProvider struct {
 	client *proxy.Client
 	mgm    *AccountManager[config.AppleAccount]
@@ -116,7 +109,6 @@ func NewAppleMusicWithConfig(client *proxy.Client, cfg config.Provider) *AppleMu
 	}
 }
 
-// SetLogger attaches a logger for debug output.
 func (p *AppleMusicProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
 
 func (p *AppleMusicProvider) debugf(format string, args ...any) {
@@ -357,8 +349,6 @@ func (p *AppleMusicProvider) getAuthHeaders(ctx context.Context, accountIdx int)
 	return h, nil
 }
 
-// resetCaches clears cached auth state on account rotation so the next attempt
-// re-fetches the web token and storefront.
 func (p *AppleMusicProvider) resetCaches() {
 	p.tokenMu.Lock()
 	p.cachedWebToken = ""
@@ -368,10 +358,6 @@ func (p *AppleMusicProvider) resetCaches() {
 	p.storefrontMu.Unlock()
 }
 
-// makeAppleMusicRequest:
-// - 503 (rate limit): retry the SAME account after 500–2000ms jitter.
-// - 401/429 (auth): rotate to the NEXT account, resetting cached auth state.
-// Both retries are bounded by maxAccountRetries.
 func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr string, extra http.Header, retries, rateLimitRetries, accountIdx int) (*http.Response, error) {
 	headers, err := p.getAuthHeaders(ctx, accountIdx)
 	if err != nil {
@@ -431,7 +417,6 @@ func (p *AppleMusicProvider) getWebToken(ctx context.Context) (string, error) {
 		return p.cachedWebToken, nil
 	}
 
-	// Dynamic scrape from music.apple.com
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://music.apple.com/", nil)
 	if err != nil {
 		return "", err
@@ -692,7 +677,6 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 	queries := buildSearchQueries(title, artist, album)
 	var candidates []appleSong
 
-	// 1. Suggestion queries in parallel (reversed: simplest first)
 	reversed := make([]string, len(queries))
 	for i, q := range queries {
 		reversed[len(queries)-1-i] = q
@@ -731,7 +715,6 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 		}
 	}
 
-	// 2. Fallback to standard catalog search sequentially
 	for _, q := range queries {
 		songs, err := p.SearchSong(ctx, q, storefront)
 		if err == nil && len(songs) > 0 {
@@ -780,8 +763,6 @@ func buildSearchQueries(title, artist, album string) []string {
 	a := strings.TrimSpace(artist)
 	al := strings.TrimSpace(album)
 
-	// Query variants, most specific first: [title, artist, album],
-	// [title, artist], artist + ' ' + title, title.
 	var full []string
 	if t != "" {
 		full = append(full, t)
@@ -818,7 +799,6 @@ func buildSearchQueries(title, artist, album string) []string {
 	return queries
 }
 
-// NormalizeSong converts an appleSong into domain.SongCatalogItem.
 func (p *AppleMusicProvider) NormalizeSong(track appleSong) domain.SongCatalogItem {
 	attrs := track.Attributes
 	writers := attrs.SongwriterNames
@@ -853,7 +833,6 @@ func (p *AppleMusicProvider) NormalizeSong(track appleSong) domain.SongCatalogIt
 	}
 }
 
-// SearchCatalog searches songs on Apple Music and normalizes the top 10 results.
 func (p *AppleMusicProvider) SearchCatalog(ctx context.Context, query string) ([]domain.SongCatalogItem, error) {
 	storefront, err := p.GetStorefront(ctx)
 	if err != nil || storefront == "" {
@@ -874,7 +853,6 @@ func (p *AppleMusicProvider) SearchCatalog(ctx context.Context, query string) ([
 	return items, nil
 }
 
-// GetMetadata searches Apple Music across prioritized queries and returns filtered metadata attributes.
 func (p *AppleMusicProvider) GetMetadata(ctx context.Context, title, artist, album string, durationSec float64) (map[string]interface{}, error) {
 	storefront, err := p.GetStorefront(ctx)
 	if err != nil || storefront == "" {

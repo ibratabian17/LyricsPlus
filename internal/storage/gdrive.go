@@ -27,7 +27,6 @@ var (
 	ErrCircuitBreakerOpen = errors.New("google drive circuit breaker is open")
 )
 
-// FileItem represents a Google Drive file descriptor.
 type FileItem struct {
 	ID           string    `json:"id"`
 	Name         string    `json:"name"`
@@ -36,7 +35,6 @@ type FileItem struct {
 	ModifiedTime time.Time `json:"modifiedTime,omitempty"`
 }
 
-// FileListResponse is the paginated response from Google Drive files.list.
 type FileListResponse struct {
 	Files         []FileItem `json:"files"`
 	NextPageToken string     `json:"nextPageToken,omitempty"`
@@ -47,7 +45,6 @@ type tokenEntry struct {
 	expiresAt   time.Time
 }
 
-// GDriveClient provides resilient, multi-account Google Drive file operations.
 type GDriveClient struct {
 	cfg        config.GDrive
 	accounts   []config.GDriveAccount
@@ -64,7 +61,6 @@ type GDriveClient struct {
 	searchCache *lru.Cache[string, []FileItem]
 }
 
-// NewGDriveClient constructs a Google Drive client.
 func NewGDriveClient(cfg config.GDrive, httpClient *http.Client) *GDriveClient {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -82,7 +78,6 @@ func NewGDriveClient(cfg config.GDrive, httpClient *http.Client) *GDriveClient {
 	}
 }
 
-// IsConfigured checks if credentials exist.
 func (g *GDriveClient) IsConfigured() bool {
 	if len(g.accounts) == 0 {
 		return false
@@ -91,7 +86,6 @@ func (g *GDriveClient) IsConfigured() bool {
 	return acc.ClientID != "" && acc.RefreshToken != ""
 }
 
-// Config exposes the underlying GDrive config.
 func (g *GDriveClient) Config() config.GDrive {
 	return g.cfg
 }
@@ -119,7 +113,6 @@ func (g *GDriveClient) recordRateLimitError() {
 	}
 }
 
-// ResetCircuitBreaker clears any tripped circuit breaker state.
 func (g *GDriveClient) ResetCircuitBreaker() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -127,7 +120,6 @@ func (g *GDriveClient) ResetCircuitBreaker() {
 	g.consecutiveErrors = 0
 }
 
-// CircuitBreakerRemaining returns remaining duration if breaker is open, or 0.
 func (g *GDriveClient) CircuitBreakerRemaining() time.Duration {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -141,7 +133,6 @@ func (g *GDriveClient) CircuitBreakerRemaining() time.Duration {
 	return rem
 }
 
-// DisableCircuitBreaker disables the circuit breaker mechanism.
 func (g *GDriveClient) DisableCircuitBreaker() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -174,7 +165,6 @@ func (g *GDriveClient) rotateAccount() {
 	}
 }
 
-// Authenticate returns a valid Google OAuth2 access token, refreshing if needed.
 func (g *GDriveClient) Authenticate(ctx context.Context, forceRefresh bool) (string, error) {
 	if g.isCircuitOpen() {
 		return "", ErrCircuitBreakerOpen
@@ -195,7 +185,6 @@ func (g *GDriveClient) Authenticate(ctx context.Context, forceRefresh bool) (str
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Double check after lock
 	idx = g.accountIdx % len(g.accounts)
 	cached = g.tokens[idx]
 	if !forceRefresh && cached != nil && time.Now().Add(60*time.Second).Before(cached.expiresAt) {
@@ -257,7 +246,6 @@ func escapeQueryLiteral(s string) string {
 	return s
 }
 
-// SearchFiles queries Google Drive files.list.
 func (g *GDriveClient) SearchFiles(ctx context.Context, folderIDs []string, query string, pageSize int, pageToken string) (*FileListResponse, error) {
 	if g.isCircuitOpen() {
 		return nil, ErrCircuitBreakerOpen
@@ -342,7 +330,6 @@ func (g *GDriveClient) SearchFiles(ctx context.Context, folderIDs []string, quer
 	return &res, nil
 }
 
-// FetchFile downloads the file content from Google Drive (alt=media).
 func (g *GDriveClient) FetchFile(ctx context.Context, fileID string) ([]byte, error) {
 	if g.isCircuitOpen() {
 		return nil, ErrCircuitBreakerOpen
@@ -388,7 +375,6 @@ func (g *GDriveClient) FetchFile(ctx context.Context, fileID string) ([]byte, er
 	return body, nil
 }
 
-// UploadFile uploads a file with multi-folder quota overflow fallback.
 func (g *GDriveClient) UploadFile(ctx context.Context, folderIDs []string, fileName, mimeType string, data []byte) (*FileItem, error) {
 	if g.isCircuitOpen() {
 		return nil, ErrCircuitBreakerOpen
@@ -406,7 +392,7 @@ func (g *GDriveClient) UploadFile(ctx context.Context, folderIDs []string, fileN
 			return res, nil
 		}
 		lastErr = err
-		// If quota or permission error on folder, continue to next folder in overflow list
+
 		if isQuotaOrFolderFull(err) {
 			continue
 		}
@@ -436,7 +422,6 @@ func (g *GDriveClient) doUploadMultipart(ctx context.Context, folderID, fileName
 	body := &bytes.Buffer{}
 	writer := multipart.NewWriter(body)
 
-	// Part 1: metadata
 	metaHeader := make(textproto.MIMEHeader)
 	metaHeader.Set("Content-Type", "application/json; charset=UTF-8")
 	metaPart, err := writer.CreatePart(metaHeader)
@@ -454,7 +439,6 @@ func (g *GDriveClient) doUploadMultipart(ctx context.Context, folderID, fileName
 	metaBytes, _ := json.Marshal(metaObj)
 	_, _ = metaPart.Write(metaBytes)
 
-	// Part 2: file content
 	mediaHeader := make(textproto.MIMEHeader)
 	mediaHeader.Set("Content-Type", mimeType)
 	mediaPart, err := writer.CreatePart(mediaHeader)
@@ -501,7 +485,6 @@ func (g *GDriveClient) doUploadMultipart(ctx context.Context, folderID, fileName
 	return &item, nil
 }
 
-// FindExactMatchByIds searches GDrive for a file matching the song's ISRC or Platform ID.
 func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []string, isrc, platformID, mimeType string) (*FileItem, error) {
 	if isrc == "" && platformID == "" {
 		return nil, nil
@@ -549,7 +532,6 @@ func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []stri
 	return nil, nil
 }
 
-// FindExistingFile searches GDrive for a file matching metadata keywords using similarity scoring.
 func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string, title, artist, album string, durationSec float64, isrc, platformID, mimeType string) (*FileItem, error) {
 	if title == "" && artist == "" {
 		return g.FindExactMatchByIds(ctx, folderIDs, isrc, platformID, mimeType)
@@ -605,13 +587,11 @@ func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string,
 	return &res.Files[idx], nil
 }
 
-// UploadUserLyrics uploads user-submitted lyrics into the USERTML_JSON folder.
 func (g *GDriveClient) UploadUserLyrics(ctx context.Context, fileName string, data []byte) (*FileItem, error) {
 	folders := g.cfg.FolderUserTML
 	return g.UploadFile(ctx, folders, fileName, "application/json", data)
 }
 
-// UploadBackupFile uploads a database backup file to the backup folder.
 func (g *GDriveClient) UploadBackupFile(ctx context.Context, fileName string, data []byte) (*FileItem, error) {
 	folders := g.cfg.FolderBackup
 	if len(folders) == 0 {

@@ -1,4 +1,3 @@
-// Package parsers converts foreign lyric formats to and from the canonical V2 payload.
 package parsers
 
 import (
@@ -60,8 +59,6 @@ type deezerPayload struct {
 	} `json:"track"`
 }
 
-// NormalizeDeezerLyrics normalizes the Deezer lyric payload into V2. Returns
-// nil when the track or lyrics are missing.
 func NormalizeDeezerLyrics(data []byte) (*domain.LyricsResponse, error) {
 	var p deezerPayload
 	if err := json.Unmarshal(data, &p); err != nil {

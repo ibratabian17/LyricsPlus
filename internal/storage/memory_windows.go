@@ -26,7 +26,6 @@ var (
 	procGetProcessMemoryInfo = modPsapi.NewProc("GetProcessMemoryInfo")
 )
 
-// rssBytes returns the process Working Set (physical RSS) on Windows.
 func rssBytes() uint64 {
 	handle, err := syscall.GetCurrentProcess()
 	if err == nil && procGetProcessMemoryInfo.Find() == nil {
@@ -42,7 +41,6 @@ func rssBytes() uint64 {
 		}
 	}
 
-	// Fallback to active in-use memory
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 	return m.HeapInuse + m.StackInuse + m.MSpanInuse + m.MCacheInuse

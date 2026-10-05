@@ -11,7 +11,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// TestWriteQueueDrainsOnClose verifies accepted writes complete during shutdown.
 func TestWriteQueueDrainsOnClose(t *testing.T) {
 	q := newWriteQueue(2, 128)
 	var done atomic.Int64
@@ -27,8 +26,6 @@ func TestWriteQueueDrainsOnClose(t *testing.T) {
 	}
 }
 
-// TestWriteQueueBoundsConcurrency verifies the pool never exceeds its worker
-// count, which is what caps retained memory under a write burst.
 func TestWriteQueueBoundsConcurrency(t *testing.T) {
 	const workers = 3
 	q := newWriteQueue(workers, 512)
@@ -60,13 +57,11 @@ func TestWriteQueueBoundsConcurrency(t *testing.T) {
 	}
 }
 
-// TestWriteQueueShedsInsteadOfBlocking verifies saturation sheds work rather
-// than growing an unbounded backlog.
 func TestWriteQueueShedsInsteadOfBlocking(t *testing.T) {
 	q := newWriteQueue(1, 8)
 
 	block := make(chan struct{})
-	// Occupy the single worker so nothing drains.
+
 	q.Submit(context.Background(), func(context.Context) { <-block })
 
 	var completed atomic.Int64
@@ -85,14 +80,13 @@ func TestWriteQueueShedsInsteadOfBlocking(t *testing.T) {
 	if shed == 0 {
 		t.Fatalf("expected shed jobs under saturation, got %d (completed %d)", shed, completed.Load())
 	}
-	// The queue must not have executed every job.
+
 	if completed.Load() == 500 {
 		t.Fatal("expected shedding to drop some jobs, but all 500 ran")
 	}
 	t.Logf("shed %d jobs, completed %d of 500 offered", shed, completed.Load())
 }
 
-// TestWriteQueueRecoversPanic verifies one bad job does not kill the worker.
 func TestWriteQueueRecoversPanic(t *testing.T) {
 	q := newWriteQueue(1, 16)
 	var ran atomic.Int64
@@ -105,8 +99,6 @@ func TestWriteQueueRecoversPanic(t *testing.T) {
 	}
 }
 
-// TestWriteQueueSubmitAfterClose verifies late submissions are dropped, not
-// sent on a closed channel.
 func TestWriteQueueSubmitAfterClose(t *testing.T) {
 	q := newWriteQueue(1, 8)
 	q.Close()
@@ -125,8 +117,6 @@ func TestWriteQueueSubmitAfterClose(t *testing.T) {
 	}
 }
 
-// TestSaveUserLyricsAsyncPersists verifies the deferred write actually lands in
-// SQLite and that the caller may reuse its buffer immediately.
 func TestSaveUserLyricsAsyncPersists(t *testing.T) {
 	dbPath := t.TempDir() + "/async.db"
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 32})
@@ -141,10 +131,8 @@ func TestSaveUserLyricsAsyncPersists(t *testing.T) {
 		Artist: "Queue",
 	}, content, 5*time.Second)
 
-	// Scribble over the caller's buffer; the queue must own its own copy.
 	copy(content, []byte("XXXXXXXXXXXXXXXXXXXXXXXX"))
 
-	// Close drains the queue, guaranteeing the row is committed.
 	if err := st.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -180,8 +168,6 @@ func bytesEqual(a, b []byte) bool {
 	return true
 }
 
-// TestStoreClosesIdempotently verifies double Close is safe, since shutdown can
-// reach it via more than one path.
 func TestStoreClosesIdempotently(t *testing.T) {
 	st, err := NewStore(config.Storage{DBPath: t.TempDir() + "/idem.db", LRUSize: 8})
 	if err != nil {

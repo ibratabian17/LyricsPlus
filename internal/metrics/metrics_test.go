@@ -7,22 +7,18 @@ import (
 func TestMetricsCollector(t *testing.T) {
 	c := NewCollector()
 
-	// Register dummy platforms
 	c.RegisterPlatform("apple", "Apple Music", func() bool { return true }, "test")
 	c.RegisterPlatform("spotify", "Spotify", func() bool { return false }, "test")
 
-	// Record HTTP requests
 	c.RecordHTTPRequest(200)
 	c.RecordHTTPRequest(200)
 	c.RecordHTTPRequest(404)
 	c.RecordHTTPRequest(500)
 
-	// Record Lyrics Lookups
 	c.RecordLyricsLookup("spotify", "none", true)
 	c.RecordLyricsLookup("apple", "database", true)
 	c.RecordLyricsLookup("", "", false)
 
-	// Record Provider Calls
 	c.RecordProviderCall("apple", "OK", 50)
 	c.RecordProviderCall("apple", "OK", 60)
 	c.RecordProviderCall("spotify", "BAD", 100)

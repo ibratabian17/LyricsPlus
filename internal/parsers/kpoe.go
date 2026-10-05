@@ -6,7 +6,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// IsFlatLyrics reports whether lyrics are in flat V1 format (marked by isLineEnding).
 func IsFlatLyrics(lyrics []domain.Line) bool {
 	if len(lyrics) == 0 {
 		return false
@@ -19,8 +18,6 @@ func IsFlatLyrics(lyrics []domain.Line) bool {
 	return false
 }
 
-// NestFlatLyrics groups flat V1-style lines into nested V2 lines with syllable arrays,
-// delimited strictly by isLineEnding == 1.
 func NestFlatLyrics(lyrics []domain.Line) []domain.Line {
 	var nested []domain.Line
 	var current *domain.Line
@@ -80,9 +77,6 @@ func NestFlatLyrics(lyrics []domain.Line) []domain.Line {
 	return nested
 }
 
-// NormalizeV2 migrates flat lyrics to nested V2 lines and line elements using a
-// legacy songPart string to a songPartIndex pointing into metadata.songParts,
-// deriving time/duration for the newly created parts.
 func NormalizeV2(resp *domain.LyricsResponse) *domain.LyricsResponse {
 	if resp == nil {
 		return nil
@@ -173,9 +167,6 @@ func NormalizeV2(resp *domain.LyricsResponse) *domain.LyricsResponse {
 	return resp
 }
 
-// V1ToV2 groups consecutive flat V1 segments into V2 Lines, then normalizes the
-// result. Line-synced segments map one-to-one (with empty syllabus); syllable
-// segments accumulate until isLineEnding == 1 and then finalize the group.
 func V1ToV2(v1 *domain.V1Response) *domain.LyricsResponse {
 	if v1 == nil {
 		return nil
@@ -276,10 +267,6 @@ func V1ToV2(v1 *domain.V1Response) *domain.LyricsResponse {
 	return NormalizeV2(result)
 }
 
-// V2ToV1 explodes each V2 Line into flat V1 segments. Line-synced data maps to a
-// single segment with isLineEnding 1; word-synced data emits one segment per
-// syllable with isLineEnding set on the terminal syllable. songPart strings are
-// resolved from metadata.songParts.
 func V2ToV1(v2 *domain.LyricsResponse) *domain.V1Response {
 	if v2 == nil {
 		return nil

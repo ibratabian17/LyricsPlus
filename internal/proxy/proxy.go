@@ -1,4 +1,3 @@
-// Package proxy provides the SSRF-safe outbound HTTP proxy pipeline.
 package proxy
 
 import (
@@ -19,8 +18,6 @@ import (
 	"lyricsplus/backend/internal/config"
 )
 
-// dnsCache caches successful IP lookups to avoid per-request blocking DNS on
-// the validate() hot path. Entries expire after dnsCacheTTL.
 const dnsCacheTTL = 60 * time.Second
 
 type dnsCacheEntry struct {
@@ -49,7 +46,7 @@ func lookupIPCached(host string) ([]net.IP, error) {
 	}
 
 	dnsMu.Lock()
-	// Prune stale entries if the map grows too large.
+
 	if len(dnsStore) > 512 {
 		for k, v := range dnsStore {
 			if now.After(v.expiry) {
@@ -62,7 +59,6 @@ func lookupIPCached(host string) ([]net.IP, error) {
 	return ips, nil
 }
 
-// hopByHopHeaders are stripped per RFC 7230 when forwarding.
 var hopByHopHeaders = []string{
 	"Connection", "Keep-Alive", "Proxy-Authenticate", "Proxy-Authorization",
 	"TE", "Trailer", "Transfer-Encoding", "Upgrade",
@@ -70,11 +66,8 @@ var hopByHopHeaders = []string{
 
 var errSSRFBlocked = errors.New("ssrf: request blocked")
 
-// defaultRequestTimeout is applied to any outbound request that does not
-// already carry a context deadline.
 const defaultRequestTimeout = 15 * time.Second
 
-// Client wraps the shared HTTP transport plus optional forward-proxy rewrite.
 type Client struct {
 	http *http.Client
 	cfg  config.Proxy
@@ -100,12 +93,10 @@ func New(cfg config.Server) *Client {
 	}
 }
 
-// MustDial reports a critical misconfiguration upfront (e.g. mapping to itself).
 func (c *Client) MustDial() error {
 	return nil
 }
 
-// Get performs a GET through the proxy pipeline with SSRF protection.
 func (c *Client) Get(ctx context.Context, urlstr string, header http.Header) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlstr, nil)
 	if err != nil {
@@ -119,7 +110,6 @@ func (c *Client) Get(ctx context.Context, urlstr string, header http.Header) (*h
 	return c.Do(req)
 }
 
-// Post performs a POST through the proxy pipeline.
 func (c *Client) Post(ctx context.Context, urlstr string, header http.Header, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, urlstr, bytes.NewReader(body))
 	if err != nil {
@@ -136,8 +126,6 @@ func (c *Client) Post(ctx context.Context, urlstr string, header http.Header, bo
 	return c.Do(req)
 }
 
-// Do validates URL safety and performs the request, optionally routing
-// through the configured forward proxy (picking randomly from the URL list).
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	u := req.URL
 	if err := c.validate(u); err != nil {
@@ -173,8 +161,7 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 				}
 				internal.Header.Set(tokenHeader, c.cfg.Token)
 			}
-			// Advertise Connection: keep-alive to the proxy so the upstream
-			// TCP socket is reused across worker requests.
+
 			if internal.Header.Get("Connection") == "" || internal.Header.Get("Connection") == "close" {
 				internal.Header.Set("Connection", "keep-alive")
 			}
@@ -199,8 +186,6 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return wrapCancelBody(decompressIfNeeded(resp), cancel), nil
 }
 
-// wrapCancelBody attaches the cancel func to the response body so it is called
-// when the caller closes the body, releasing context timer resources promptly.
 func wrapCancelBody(resp *http.Response, cancel context.CancelFunc) *http.Response {
 	if resp == nil || resp.Body == nil {
 		cancel()
@@ -210,8 +195,6 @@ func wrapCancelBody(resp *http.Response, cancel context.CancelFunc) *http.Respon
 	return resp
 }
 
-// pickProxyURL returns a randomly selected proxy URL from the configured list.
-// Falls back to the legacy single SERVER_PROXY_URL value.
 func (c *Client) pickProxyURL() string {
 	raw := c.cfg.URLs
 	if len(raw) == 0 && c.cfg.URL != "" {
@@ -223,8 +206,6 @@ func (c *Client) pickProxyURL() string {
 	return raw[rand.Intn(len(raw))]
 }
 
-// shouldProxy never routes localhost / loopback / mDNS (.local) hosts through
-// the forward proxy.
 func shouldProxy(u *url.URL) bool {
 	host := strings.ToLower(u.Hostname())
 	if host == "localhost" || host == "127.0.0.1" || strings.HasSuffix(host, ".local") ||
@@ -237,8 +218,6 @@ func shouldProxy(u *url.URL) bool {
 	return true
 }
 
-// cancelBody wraps a ReadCloser and calls cancel when closed, releasing the
-// context resources as soon as the response body is drained or discarded.
 type cancelBody struct {
 	io.ReadCloser
 	cancel context.CancelFunc
@@ -250,9 +229,6 @@ func (b *cancelBody) Close() error {
 	return err
 }
 
-// withDefaultDeadline applies the JS-equivalent 15s per-request timeout when
-// the caller did not provide a context deadline of its own.
-// The returned cancel is wired to the response body so it fires on Close().
 func withDefaultDeadline(req *http.Request) (*http.Request, context.CancelFunc) {
 	if _, ok := req.Context().Deadline(); ok {
 		return req, func() {}
@@ -286,7 +262,7 @@ func decompressIfNeeded(resp *http.Response) *http.Response {
 
 func (c *Client) validate(u *url.URL) error {
 	host := u.Hostname()
-	// Block IP literal and weird shadowing.
+
 	if host == "" {
 		return errSSRFBlocked
 	}
@@ -296,7 +272,7 @@ func (c *Client) validate(u *url.URL) error {
 		}
 		return nil
 	}
-	// Pin DNS resolution verbatim to prevent rebinding.
+
 	ips, err := lookupIPCached(host)
 	if err != nil {
 		return fmt.Errorf("dns lookup failed: %w", err)
@@ -354,7 +330,6 @@ func dedupeErr(err error) error {
 	return err
 }
 
-// ReadAll is a convenience for bounded body reads.
 func ReadAll(r io.Reader, limit int64) ([]byte, error) {
 	lr := &io.LimitedReader{R: r, N: limit + 1}
 	data, err := io.ReadAll(lr)

@@ -8,7 +8,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// ExactMetadata carries the exact-match metadata for a QQ query.
 type ExactMetadata struct {
 	Title      string
 	Artist     string
@@ -18,9 +17,6 @@ type ExactMetadata struct {
 	PlatformID string
 }
 
-// ParseQQQRC converts a QRC string (XML containing a LyricContent="..." attr,
-// or a raw QRC/LRC text) into a V2 JSON payload. Returns nil when no QRC is
-// detected or no lyric lines parse.
 func ParseQQQRC(qrcString string, exactMetadata ExactMetadata) *domain.LyricsResponse {
 	if qrcString == "" || (!strings.Contains(qrcString, "<QrcInfos>") && !strings.Contains(qrcString, "LyricContent=")) {
 		return nil
@@ -56,7 +52,6 @@ func decodeEntities(s string) string {
 	return repl.Replace(s)
 }
 
-// parseLineTime parses a [startMs,durationMs] line-level header.
 func parseLineTime(src string) (startTime, duration int, rest string, ok bool) {
 	if len(src) == 0 || src[0] != '[' {
 		return 0, 0, "", false
@@ -77,7 +72,6 @@ func parseLineTime(src string) (startTime, duration int, rest string, ok bool) {
 	return startTime, duration, src[closeIdx+1:], true
 }
 
-// parseWordTime parses a (startMs,durationMs) word-level token.
 func parseWordTime(src string) (startTime, duration, tokenLen int, ok bool) {
 	if len(src) == 0 || src[0] != '(' {
 		return 0, 0, 0, false
@@ -98,8 +92,6 @@ func parseWordTime(src string) (startTime, duration, tokenLen int, ok bool) {
 	return startTime, duration, closeIdx + 1, true
 }
 
-// parseWords extracts timed syllables, taking the text chunk BEFORE each
-// (startMs,durationMs) token as the syllable text and dropping any tail.
 func parseWords(src string) []domain.Syllable {
 	var words []domain.Syllable
 	pos := 0
@@ -135,8 +127,6 @@ type parsedLine struct {
 	Element  domain.LineElement
 }
 
-// parseLine returns a parsed line or nil for metadata tags / bad headers.
-// Element.Key is intentionally left empty here.
 func parseLine(src string) *parsedLine {
 	if tagRe.MatchString(src) {
 		return nil
@@ -188,7 +178,6 @@ type agentsCtx struct {
 	currentSinger string
 }
 
-// isMetadataPrefix reports whether a name is a production credit label.
 func isMetadataPrefix(name string) bool {
 	n := strings.ToLower(stripAllSpace(name))
 	known := []string{
@@ -219,8 +208,6 @@ var (
 	splitMatchRe = regexp.MustCompile(`^([^:：]+)\s*[:：]\s*(.+)?$`)
 )
 
-// extractSinger handles "Name: lyrics..." prefixes, assigns agent metadata and
-// strips the prefix. Returns false to drop the line entirely.
 func extractSinger(parsed *parsedLine, ctx *agentsCtx, exactMetadata ExactMetadata, isFirstFewLines bool) bool {
 	if len(parsed.Syllabus) == 0 {
 		if ctx.currentSinger != "" {
@@ -229,7 +216,6 @@ func extractSinger(parsed *parsedLine, ctx *agentsCtx, exactMetadata ExactMetada
 		return true
 	}
 
-	// Drop lines near the start that just echo the track title or artist name.
 	if isFirstFewLines && (exactMetadata.Title != "" || exactMetadata.Artist != "") {
 		text := normalizedEcho(parsed.Text)
 		title := normalizedEcho(exactMetadata.Title)
@@ -260,7 +246,6 @@ func extractSinger(parsed *parsedLine, ctx *agentsCtx, exactMetadata ExactMetada
 		}
 	}
 
-	// Case A: the entire accumulated text is "Name:" with nothing after the colon.
 	if m := fullMatchRe.FindStringSubmatch(accText); m != nil {
 		singerName := strings.TrimSpace(m[1])
 		if isMetadataPrefix(singerName) {
@@ -277,7 +262,6 @@ func extractSinger(parsed *parsedLine, ctx *agentsCtx, exactMetadata ExactMetada
 		return true
 	}
 
-	// Case B: "Name: lyrics..." packed into the first syllable.
 	if len(parsed.Syllabus) > 0 {
 		if m := splitMatchRe.FindStringSubmatch(parsed.Syllabus[0].Text); m != nil && len([]rune(m[1])) < 20 {
 			singerName := strings.TrimSpace(m[1])

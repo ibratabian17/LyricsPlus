@@ -16,7 +16,6 @@ import (
 	"lyricsplus/backend/internal/logger"
 )
 
-// Dumper manages scheduled SQLite database backups and uploads to Google Drive.
 type Dumper struct {
 	dbPath    string
 	dumpDir   string
@@ -29,7 +28,6 @@ type Dumper struct {
 	isRunning bool
 }
 
-// NewDumper constructs a database backup manager.
 func NewDumper(cfg config.Config, store *Store, gdrive *GDriveClient, logger *logger.Logger) *Dumper {
 	dumpDir := cfg.GDrive.DailyDumpDir
 	if dumpDir == "" {
@@ -51,7 +49,6 @@ func NewDumper(cfg config.Config, store *Store, gdrive *GDriveClient, logger *lo
 	}
 }
 
-// Start launches the daily backup background worker.
 func (d *Dumper) Start() {
 	d.mu.Lock()
 	if d.isRunning {
@@ -64,7 +61,6 @@ func (d *Dumper) Start() {
 	go d.loop()
 }
 
-// Stop cleanly terminates the backup worker.
 func (d *Dumper) Stop() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -96,7 +92,6 @@ func (d *Dumper) loop() {
 	}
 }
 
-// DumpOnce creates an online snapshot of SQLite and optionally uploads to Google Drive.
 func (d *Dumper) DumpOnce(ctx context.Context) error {
 	if err := os.MkdirAll(d.dumpDir, 0755); err != nil {
 		return fmt.Errorf("create dump dir: %w", err)
@@ -106,24 +101,21 @@ func (d *Dumper) DumpOnce(ctx context.Context) error {
 	tempDBPath := filepath.Join(d.dumpDir, fmt.Sprintf("lyricsplus_%s.tmp.db", timestamp))
 	gzPath := filepath.Join(d.dumpDir, fmt.Sprintf("lyricsplus_backup_%s.db.gz", timestamp))
 
-	// 1. Snapshot SQLite using VACUUM INTO (crash-consistent, lock-free)
 	vacuumSQL := fmt.Sprintf("VACUUM INTO '%s'", tempDBPath)
 	if _, err := d.store.db.ExecContext(ctx, vacuumSQL); err != nil {
-		// Fallback to manual file copy if VACUUM INTO fails (e.g. older SQLite)
+
 		if copyErr := copyFile(d.dbPath, tempDBPath); copyErr != nil {
 			return fmt.Errorf("vacuum into failed: %v, copy failed: %w", err, copyErr)
 		}
 	}
 	defer func() { _ = os.Remove(tempDBPath) }()
 
-	// 2. Compress the snapshot with gzip
 	if err := compressToGz(tempDBPath, gzPath); err != nil {
 		return fmt.Errorf("gzip dump: %w", err)
 	}
 
 	d.logf("local database snapshot created: %s", gzPath)
 
-	// 3. Upload to Google Drive if configured
 	if d.gdrive != nil && d.gdrive.IsConfigured() {
 		gzBytes, err := os.ReadFile(gzPath)
 		if err != nil {
@@ -139,7 +131,6 @@ func (d *Dumper) DumpOnce(ctx context.Context) error {
 		}
 	}
 
-	// 4. Prune local backups older than 7 days
 	d.pruneOldBackups(7 * 24 * time.Hour)
 
 	return nil
@@ -206,7 +197,6 @@ func (d *Dumper) logf(format string, args ...interface{}) {
 	}
 }
 
-// GetDB exposes underlying db for vacuum operations.
 func (s *Store) GetDB() *sql.DB {
 	return s.db
 }

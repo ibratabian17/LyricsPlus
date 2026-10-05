@@ -15,7 +15,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// ttml namespaces used by Apple Music.
 const (
 	nsTT           = "http://www.w3.org/ns/ttml"
 	nsITunesInt    = "http://music.apple.com/lyric-ttml-internal"
@@ -27,11 +26,9 @@ const (
 	ttmlLeadingSil = "0.000"
 )
 
-// txmlNode is a minimal DOM node exposing document-traversal semantics
-// (getElementsByTagName, textContent, sibling text nodes, attribute lookup by namespace).
 type txmlNode struct {
-	local    string // local name
-	space    string // namespace URI
+	local    string
+	space    string
 	attrs    []xml.Attr
 	parent   *txmlNode
 	children []*txmlNode
@@ -39,7 +36,6 @@ type txmlNode struct {
 	data     string
 }
 
-// buildTTMLDOM parses an XML document into a lightweight DOM tree.
 func buildTTMLDOM(data []byte) (*txmlNode, error) {
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	root := &txmlNode{}
@@ -81,7 +77,6 @@ func buildTTMLDOM(data []byte) (*txmlNode, error) {
 	return nil, fmt.Errorf("ttml: no root element")
 }
 
-// descendants returns all descendant elements (in document order) whose local
 func descendants(n *txmlNode, local string) []*txmlNode {
 	var out []*txmlNode
 	var walk func(*txmlNode)
@@ -100,8 +95,6 @@ func descendants(n *txmlNode, local string) []*txmlNode {
 	return out
 }
 
-// getAttrValue does a namespace-scoped lookup first, then a plain local-name
-// fallback. Returns "" when absent.
 func getAttrValue(n *txmlNode, nsURI, local string) (string, bool) {
 	if n == nil {
 		return "", false
@@ -126,7 +119,6 @@ func getAttr(n *txmlNode, nsURI, local string) string {
 	return v
 }
 
-// textContent concatenates the text of every descendant text node.
 func textContent(n *txmlNode) string {
 	if n == nil {
 		return ""
@@ -149,7 +141,6 @@ func textContent(n *txmlNode) string {
 	return sb.String()
 }
 
-// directText returns the concatenation of a node's immediate text children.
 func directText(n *txmlNode) string {
 	if n == nil {
 		return ""
@@ -163,7 +154,6 @@ func directText(n *txmlNode) string {
 	return sb.String()
 }
 
-// tailText collects following text-node siblings.
 func tailText(n *txmlNode) string {
 	if n == nil || n.parent == nil {
 		return ""
@@ -189,8 +179,6 @@ func tailText(n *txmlNode) string {
 	return sb.String()
 }
 
-// insideBackgroundWrapper walks ancestors (up to, excluding, paragraph) and
-// returns true if any has ttm:role="x-bg".
 func insideBackgroundWrapper(node, paragraph *txmlNode) bool {
 	cur := node.parent
 	for cur != nil && cur != paragraph {
@@ -202,7 +190,6 @@ func insideBackgroundWrapper(node, paragraph *txmlNode) bool {
 	return false
 }
 
-// parseTTMLTime parses "hh:mm:ss.mmm", "mm:ss.mmm" or "ss.mmm" into ms.
 func parseTTMLTime(s string) (int, bool) {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -248,8 +235,6 @@ func parseTTMLTime(s string) (int, bool) {
 	return (hh*3600+mm*60+sec)*1000 + milli, true
 }
 
-// ttmlTimeToMs parses TTML time expressions (e.g. "hh:mm:ss.mmm", "mm:ss.mmm", "ss.mmm",
-// or offset times like "14.333s", "500ms", "1.5m", "1h", "14.333") into milliseconds.
 func ttmlTimeToMs(timeStr string) int {
 	timeStr = strings.TrimSpace(timeStr)
 	if timeStr == "" {
@@ -293,7 +278,6 @@ func ttmlTimeToMs(timeStr string) int {
 		return int(math.Round(val * 1000))
 	}
 
-	// Clock-time format: [hh:]mm:ss[.mmm][s]
 	parts := strings.Split(timeStr, ":")
 	var totalMs float64
 	switch len(parts) {
@@ -321,16 +305,12 @@ func ttmlTimeToMs(timeStr string) int {
 	return int(math.Round(totalMs))
 }
 
-// TTMLToJSON converts an Apple Music TTML XML document into V2 JSON.
 func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 	doc, err := buildTTMLDOM(xmlData)
 	if err != nil {
 		return nil, err
 	}
 
-	// The iTunes namespace switches between internal and external depending on
-	// what the root declares. encoding/xml resolves prefixes, so detect by
-	// scanning for any attribute carrying the external URI.
 	itunesNS := nsITunesInt
 	var scanNS func(*txmlNode)
 	scanNS = func(n *txmlNode) {
@@ -399,7 +379,6 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 		}
 	}
 
-	// Agents.
 	if headEl != nil {
 		for _, a := range descendants(headEl, "agent") {
 			agentID := getAttr(a, nsXML, "id")
@@ -422,9 +401,6 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 		}
 	}
 
-	// Title & songwriters. iTunesMetadata is preferred when present; the
-	// head-level <metadata> is used as the fallback container so the
-	// generator's own output (title in <metadata>) round-trips.
 	containers := []*txmlNode{}
 	if itunesMetaEl != nil {
 		containers = append(containers, itunesMetaEl)
@@ -482,7 +458,6 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 		}
 	}
 
-	// Translations / transliterations keyed by <text for="KEY">.
 	translationMap := map[string]*domain.Translation{}
 	transliterationMap := map[string]*domain.Transliteration{}
 	if itunesMetaEl != nil {
@@ -745,7 +720,6 @@ func TTMLToJSON(xmlData []byte) (*domain.LyricsResponse, error) {
 	}, nil
 }
 
-// JSONToTTML serializes V2 JSON back into Apple Music compatible TTML XML.
 func JSONToTTML(resp *domain.LyricsResponse) ([]byte, error) {
 	if resp == nil {
 		return nil, fmt.Errorf("ttml: nil response")

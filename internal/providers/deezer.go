@@ -31,17 +31,12 @@ const (
 
 const deezerDefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
-// deezerAccountCredentials holds the per-account token cache: the JWT plus the
-// refresh token returned by the auth API.
 type deezerAccountCredentials struct {
 	jwt      string
 	refToken string
 	expires  time.Time
 }
 
-// DeezerProvider fetches word-by-word or synchronized lyrics from Deezer
-// GraphQL. Authentication uses the current account and a failure rotates to
-// the next account, each account keeping its own JWT.
 type DeezerProvider struct {
 	client     *proxy.Client
 	mgm        *AccountManager[config.DeezerAccount]
@@ -91,7 +86,6 @@ func NewDeezerWithConfig(client *proxy.Client, cfg config.Provider) *DeezerProvi
 	}
 }
 
-// SetLogger attaches a logger for debug output.
 func (p *DeezerProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
 
 func (p *DeezerProvider) debugf(format string, args ...any) {
@@ -112,8 +106,6 @@ func (p *DeezerProvider) Configured() bool {
 	return false
 }
 
-// credentials returns the cached JWT for the given account index, or nil if
-// none is cached yet.
 func (p *DeezerProvider) cachedCredentials(accountIdx int) (*deezerAccountCredentials, bool) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
@@ -285,10 +277,6 @@ func (p *DeezerProvider) SearchTrack(ctx context.Context, query string, limit in
 	return res.Data, nil
 }
 
-// authenticate obtains a JWT for the given account index via the Deezer auth
-// API. Refresh-token is preferred; an ARL is sent as an arl=<token> cookie, and
-// the response's refresh_token rotation is cached. A failed auth (empty JWT)
-// returns an error which the caller uses to rotate to the next account.
 func (p *DeezerProvider) authenticate(ctx context.Context, accountIdx int) (string, error) {
 	acc, ok := p.mgm.At(accountIdx)
 	if !ok {
@@ -417,10 +405,6 @@ fragment SynchronizedLines on Lyrics {
   __typename
 }`
 
-// getLyrics fetches lyrics with a valid JWT. retryCount tracks retries across
-// accounts: on an auth error (GraphQL token error or a bad JWT) the current
-// account's credentials are cleared and the next account is tried (up to
-// maxAccountRetries).
 func (p *DeezerProvider) getLyrics(ctx context.Context, trackID string, retryCount int) ([]byte, error) {
 	accountIdx := 0
 	return p.getLyricsWithAccount(ctx, trackID, accountIdx, retryCount)
@@ -508,7 +492,6 @@ func (p *DeezerProvider) graphQLLyrics(ctx context.Context, trackID, jwtToken st
 	return parsed.Data, nil
 }
 
-// NormalizeSong converts Deezer Track into domain.SongCatalogItem.
 func (p *DeezerProvider) NormalizeSong(t deezerTrack) domain.SongCatalogItem {
 	artURL := t.Album.CoverXL
 	if artURL == "" {

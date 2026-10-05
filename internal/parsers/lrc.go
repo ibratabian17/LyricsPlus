@@ -11,8 +11,6 @@ import (
 
 var lrcLineRe = regexp.MustCompile(`^\[(\d+):(\d+)\.(\d+)\]\s*(.*)$`)
 
-// ConvertLRCLIBtoJSON parses a synced LRC string into a V2 line payload;
-// durationSec is the track duration in seconds used for the final line's duration.
 func ConvertLRCLIBtoJSON(syncedLyrics string, durationSec float64) *domain.LyricsResponse {
 	durationMs := int(durationSec * 1000)
 

@@ -1,4 +1,3 @@
-// Package similarity provides string similarity scoring for lyric matching.
 package similarity
 
 import (
@@ -35,7 +34,6 @@ func getNGrams(str string, size int) map[string]bool {
 	return set
 }
 
-// SorensenDice returns the set-based bigram overlap coefficient.
 func SorensenDice(str1, str2 string) float64 {
 	if str1 == "" && str2 == "" {
 		return 1.0
@@ -101,7 +99,6 @@ func minInt(a, b int) int {
 	return b
 }
 
-// LevenshteinNorm returns 1 - Levenshtein/max(len).
 func LevenshteinNorm(str1, str2 string) float64 {
 	r1 := []rune(str1)
 	r2 := []rune(str2)
@@ -112,7 +109,6 @@ func LevenshteinNorm(str1, str2 string) float64 {
 	return 1.0 - float64(levenshteinDistance(str1, str2))/maxLen
 }
 
-// Analysis is the result of AnalyzeTitle.
 type Analysis struct {
 	BaseTitle       string
 	Tags            map[string]bool
@@ -194,8 +190,6 @@ func isBracketByte(b byte) bool {
 	return b == '(' || b == '[' || b == ']' || b == '{' || b == '}'
 }
 
-// extractFeatPat greedily finds "(feat|ft|featuring|with) <artists>" segments
-// whose captured artists are followed by whitespace + a bracket or end of string.
 func extractFeatPat(s string) ([]string, string) {
 	var artists []string
 	rest := s
@@ -248,7 +242,6 @@ func extractFeatPat(s string) ([]string, string) {
 	return artists, rest
 }
 
-// AnalyzeTitle splits a title into its base, tags, feature artists, and bracket contents.
 func AnalyzeTitle(title string) Analysis {
 	if strings.TrimSpace(title) == "" {
 		return Analysis{Tags: map[string]bool{}, FeatArtists: []string{}, BracketContents: []string{}}
@@ -304,7 +297,6 @@ func AnalyzeTitle(title string) Analysis {
 	return Analysis{BaseTitle: cleanTitle, Tags: tags, FeatArtists: featArtists, BracketContents: bracketContents}
 }
 
-// normalizeArtistName normalizes an artist name for comparison.
 func normalizeArtistName(artist string) string {
 	if artist == "" {
 		return ""
@@ -366,7 +358,6 @@ func containsNonASCII(s string) bool {
 	return false
 }
 
-// TitleSimilarity scores how closely two titles match.
 func TitleSimilarity(title1, title2 string) float64 {
 	computeScore := func(t1, t2 string) float64 {
 		if t1 == "" || t2 == "" {
@@ -443,7 +434,6 @@ func TitleSimilarity(title1, title2 string) float64 {
 	return math.Max(scoreOriginal, computeScore(translit(title1), translit(title2)))
 }
 
-// ArtistSimilarity scores how closely two artists match.
 func ArtistSimilarity(artist1, artist2 string, analysis1, analysis2 *Analysis) float64 {
 	computeScore := func(a1, a2 string, feats1, feats2 []string) float64 {
 		if a1 == "" || a2 == "" {
@@ -549,7 +539,6 @@ func unidecodeSlice(xs []string) []string {
 	return out
 }
 
-// DurationScore returns the tiered decay for an absolute duration difference in SECONDS.
 func DurationScore(diff float64) float64 {
 	switch {
 	case diff == 0:
@@ -575,7 +564,6 @@ func DurationScore(diff float64) float64 {
 	}
 }
 
-// DurationSimilarity scores two durations in seconds; missing/<=0 values score 0.7.
 func DurationSimilarity(d1, d2 float64) float64 {
 	if d1 <= 0 || d2 <= 0 {
 		return 0.7
@@ -583,7 +571,6 @@ func DurationSimilarity(d1, d2 float64) float64 {
 	return DurationScore(math.Abs(d1 - d2))
 }
 
-// AlbumSimilarity scores how closely two albums match.
 func AlbumSimilarity(album1, album2 string) float64 {
 	if album1 == "" || album2 == "" {
 		return 0.5
@@ -608,7 +595,6 @@ func AlbumSimilarity(album1, album2 string) float64 {
 	return dice
 }
 
-// Components holds the per-criterion similarity scores.
 type Components struct {
 	TitleScore    float64
 	ArtistScore   float64
@@ -616,7 +602,6 @@ type Components struct {
 	DurationScore float64
 }
 
-// Weights holds the per-criterion weights.
 type Weights struct {
 	Title    float64
 	Artist   float64
@@ -624,7 +609,6 @@ type Weights struct {
 	Duration float64
 }
 
-// ScoreInfo is the full result of SongSimilarity.
 type ScoreInfo struct {
 	Score      float64
 	Reason     string
@@ -634,7 +618,6 @@ type ScoreInfo struct {
 	CandDur    float64
 }
 
-// SongSimilarity scores a candidate track against a query. Durations are in seconds.
 func SongSimilarity(candTitle, candArtist, candAlbum string, candDur float64,
 	queryTitle, queryArtist, queryAlbum string, queryDur float64) ScoreInfo {
 
@@ -733,7 +716,6 @@ func SongSimilarity(candTitle, candArtist, candAlbum string, candDur float64,
 	}
 }
 
-// MatchScore is the ms-based convenience wrapper used by the cache tier.
 func MatchScore(queryTitle, queryArtist, queryAlbum string, queryMs int,
 	candTitle, candArtist, candAlbum string, candMs int, _, _ bool) float64 {
 	info := SongSimilarity(candTitle, candArtist, candAlbum, float64(candMs)/1000,
@@ -741,7 +723,6 @@ func MatchScore(queryTitle, queryArtist, queryAlbum string, queryMs int,
 	return info.Score
 }
 
-// SongCandidate represents a candidate track from search results.
 type SongCandidate struct {
 	Title      string
 	Artist     string
@@ -752,13 +733,11 @@ type SongCandidate struct {
 	Data       interface{}
 }
 
-// BestMatchResult encapsulates the winning candidate and its score information.
 type BestMatchResult struct {
 	Candidate SongCandidate
 	ScoreInfo ScoreInfo
 }
 
-// FindBestSongMatch evaluates candidates against the query metadata, returning the best match if above 0.70 threshold.
 func FindBestSongMatch(candidates []SongCandidate, queryTitle, queryArtist, queryAlbum string, queryDurationSec float64, songISRC, songPlatformID string) *BestMatchResult {
 	if len(candidates) == 0 || queryTitle == "" {
 		return nil

@@ -67,7 +67,6 @@ type lyricsParams struct {
 	forceReload bool
 }
 
-// Lyrics serves the /v1/lyrics/get, /v2/lyrics/get, /v1/ttml/get and /v1/raw/get endpoints.
 type Lyrics struct {
 	Service  *service.Service
 	Logger   *logger.Logger
@@ -149,7 +148,6 @@ func (h *Lyrics) ensureKpoe(resp *domain.LyricsResponse) {
 	}
 }
 
-// GetV2 returns the canonical V2 payload.
 func (h *Lyrics) GetV2(w http.ResponseWriter, r *http.Request) {
 	p, err := h.parseParams(r)
 	if err != nil {
@@ -181,7 +179,6 @@ func (h *Lyrics) GetV2(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// GetV1 returns the flat V1 (syllable segment) format.
 func (h *Lyrics) GetV1(w http.ResponseWriter, r *http.Request) {
 	p, err := h.parseParams(r)
 	if err != nil {
@@ -227,7 +224,6 @@ func (h *Lyrics) GetV1(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, v1)
 }
 
-// GetTTML returns the payload serialized as Apple Music TTML inside a JSON envelope.
 func (h *Lyrics) GetTTML(w http.ResponseWriter, r *http.Request) {
 	p, err := h.parseParams(r)
 	if err != nil {
@@ -270,7 +266,6 @@ func (h *Lyrics) GetTTML(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GetRaw returns the raw source payload verbatim.
 func (h *Lyrics) GetRaw(w http.ResponseWriter, r *http.Request) {
 	p, err := h.parseParams(r)
 	if err != nil {
@@ -346,7 +341,6 @@ func resolveRawContentType(source, raw string) string {
 	return "text/plain"
 }
 
-// logFetch reports the outcome and returns true when err is non-nil.
 func (h *Lyrics) logFetch(r *http.Request, format string, q domain.SearchQuery, start time.Time, resp *domain.LyricsResponse, err error) bool {
 	if err != nil {
 		h.logErrf("lyrics fetch error format=%s artist=%q title=%q: %v", format, q.Artist, q.Title, err)

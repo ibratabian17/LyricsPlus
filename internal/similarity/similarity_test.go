@@ -30,11 +30,11 @@ func TestLevenshteinNorm(t *testing.T) {
 }
 
 func TestTitleSimilarity(t *testing.T) {
-	// Live vs acoustic: different critical tags on equal base => 0.65.
+
 	if got := TitleSimilarity("Song Name (Live)", "Song Name (Acoustic)"); math.Abs(got-0.65) > 1e-9 {
 		t.Errorf("live/acoustic conflict should be 0.65, got %f", got)
 	}
-	// Same critical tag on one side only => 0.72.
+
 	if got := TitleSimilarity("Song Name", "Song Name (Live)"); math.Abs(got-0.72) > 1e-9 {
 		t.Errorf("one-sided critical should be 0.72, got %f", got)
 	}
@@ -94,7 +94,7 @@ func TestAnalyzeTitleFeatured(t *testing.T) {
 }
 
 func TestSongSimilarityWeights(t *testing.T) {
-	// hasAlbum && hasDuration -> .30/.30/.20/.20
+
 	info := SongSimilarity("Shape of You", "Ed Sheeran", "÷", 233,
 		"Shape of You", "Ed Sheeran", "÷", 233)
 	if info.Score < 0.95 {
@@ -104,7 +104,6 @@ func TestSongSimilarityWeights(t *testing.T) {
 		t.Errorf("unexpected weights for album+duration: %+v", info.Weights)
 	}
 
-	// Neither album nor duration -> .52/.42/.06/0.00
 	info2 := SongSimilarity("Shape of You", "Ed Sheeran", "", 0,
 		"Shape of You", "Ed Sheeran", "", 0)
 	if info2.Weights.Album != 0.06 || info2.Reason == "" {

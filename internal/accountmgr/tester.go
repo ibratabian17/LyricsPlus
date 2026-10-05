@@ -17,21 +17,18 @@ import (
 	"lyricsplus/backend/internal/config"
 )
 
-// TestResult holds the outcome of testing a single account credential.
 type TestResult struct {
 	Provider string
 	NameID   string
-	Status   string // "OK", "ERROR", "EXPIRED", "UNAUTHORIZED", "SKIPPED"
+	Status   string
 	Message  string
 	Duration time.Duration
 }
 
-// CredentialTester handles live verification of provider credentials.
 type CredentialTester struct {
 	client *http.Client
 }
 
-// NewTester creates a new CredentialTester.
 func NewTester() *CredentialTester {
 	return &CredentialTester{
 		client: &http.Client{
@@ -40,7 +37,6 @@ func NewTester() *CredentialTester {
 	}
 }
 
-// TestSpotify verifies a Spotify account's cookie and/or client credentials.
 func (t *CredentialTester) TestSpotify(ctx context.Context, acc config.SpotifyAccount) TestResult {
 	start := time.Now()
 	res := TestResult{
@@ -53,7 +49,6 @@ func (t *CredentialTester) TestSpotify(ctx context.Context, acc config.SpotifyAc
 		cookie = "sp_dc=" + cookie
 	}
 
-	// 1. Test Web Player cookie
 	if cookie != "" {
 		reqURL := "https://open.spotify.com/get_access_token?reason=transport&productType=web_player"
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -104,7 +99,6 @@ func (t *CredentialTester) TestSpotify(ctx context.Context, acc config.SpotifyAc
 		return res
 	}
 
-	// 2. Test Client ID & Secret
 	if acc.CLIENT_ID != "" && acc.CLIENT_SECRET != "" {
 		data := url.Values{"grant_type": {"client_credentials"}}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://accounts.spotify.com/api/token", strings.NewReader(data.Encode()))
@@ -145,7 +139,6 @@ func (t *CredentialTester) TestSpotify(ctx context.Context, acc config.SpotifyAc
 	return res
 }
 
-// TestApple verifies an Apple Music account.
 func (t *CredentialTester) TestApple(ctx context.Context, acc config.AppleAccount) TestResult {
 	start := time.Now()
 	res := TestResult{
@@ -223,7 +216,6 @@ func (t *CredentialTester) TestApple(ctx context.Context, acc config.AppleAccoun
 	return res
 }
 
-// TestMusixmatch verifies a Musixmatch account.
 func (t *CredentialTester) TestMusixmatch(ctx context.Context, acc config.MusixmatchAccount) TestResult {
 	start := time.Now()
 	res := TestResult{
@@ -239,7 +231,6 @@ func (t *CredentialTester) TestMusixmatch(ctx context.Context, acc config.Musixm
 			return res
 		}
 
-		// 1. Get token
 		tokenURL := "https://apic-desktop.musixmatch.com/ws/1.1/token.get?app_id=android-player-v1.0&format=json"
 		tokenReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, tokenURL, nil)
 		tokenReq.Header.Set("User-Agent", "Dalvik/2.1.0 (Linux; U; Android 16; Pixel 8 Pro)")
@@ -269,7 +260,6 @@ func (t *CredentialTester) TestMusixmatch(ctx context.Context, acc config.Musixm
 			return res
 		}
 
-		// 2. credential.post login
 		now := time.Now().UTC()
 		sigTarget := "credential.post" + fmt.Sprintf("%04d%02d%02d", now.Year(), int(now.Month()), now.Day())
 		mac := hmac.New(sha1.New, []byte("MusixmatchSecretKey2015"))
@@ -324,7 +314,6 @@ func (t *CredentialTester) TestMusixmatch(ctx context.Context, acc config.Musixm
 		return res
 	}
 
-	// Web token/cookie test
 	reqURL := "https://apic-desktop.musixmatch.com/ws/1.1/token.get?app_id=web-desktop-app-v1.0"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -375,7 +364,6 @@ func (t *CredentialTester) TestMusixmatch(ctx context.Context, acc config.Musixm
 	return res
 }
 
-// TestDeezer verifies a Deezer account's ARL or refresh token.
 func (t *CredentialTester) TestDeezer(ctx context.Context, acc config.DeezerAccount) TestResult {
 	start := time.Now()
 	res := TestResult{
@@ -440,7 +428,6 @@ func (t *CredentialTester) TestDeezer(ctx context.Context, acc config.DeezerAcco
 	return res
 }
 
-// TestGDrive verifies a Google Drive OAuth2 credential.
 func (t *CredentialTester) TestGDrive(ctx context.Context, acc config.GDriveAccount) TestResult {
 	start := time.Now()
 	res := TestResult{

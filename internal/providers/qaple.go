@@ -37,7 +37,6 @@ type LineSource interface {
 	FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error)
 }
 
-// QapleService orchestrates the Qaple merge between QQ word sync and Apple/Musixmatch line sync.
 type QapleService struct {
 	qqSource LineSource
 	apple    LineSource
@@ -74,7 +73,6 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 		qqCh <- fetchResult{resp: resp, source: "QQ", err: err}
 	}()
 
-	// Fetch Line sync (Apple, fallback to Musixmatch)
 	go func() {
 		if s.apple != nil {
 			resp, err := s.apple.FetchLyrics(qapleCtx, q)
@@ -123,7 +121,6 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 	return merged, nil
 }
 
-// detectQQMode checks whether QQ lyrics are syllable or word level.
 func detectQQMode(wordSyncData *domain.LyricsResponse) string {
 	if wordSyncData == nil || len(wordSyncData.Lyrics) == 0 {
 		return "word"
@@ -427,7 +424,7 @@ func collectCandidates(appleLines []domain.Line, qqPool []qqPoolToken, lineOffse
 }
 
 type dpOp struct {
-	opType string // "match", "skip_apple", "skip_qq"
+	opType string
 	da     int
 	dq     int
 }
@@ -505,7 +502,7 @@ func alignTokensToQQ(appleTokens []appleToken, qqTokens []qqPoolToken, lineStart
 			}
 
 			if a < A {
-				// 1 Apple : 1..maxQQMerge QQ tokens
+
 				for dq := 1; dq <= maxQQMerge && q+dq <= Q; dq++ {
 					var combined strings.Builder
 					tPenalty := 0.0
@@ -523,7 +520,6 @@ func alignTokensToQQ(appleTokens []appleToken, qqTokens []qqPoolToken, lineStart
 					}
 				}
 
-				// N Apple tokens : 1 QQ token
 				if q < Q {
 					for da := 2; a+da <= A; da++ {
 						var combined strings.Builder
@@ -553,7 +549,6 @@ func alignTokensToQQ(appleTokens []appleToken, qqTokens []qqPoolToken, lineStart
 					}
 				}
 
-				// Skip Apple
 				ca := cur + gapApple
 				if ca < dp[a+1][q] {
 					dp[a+1][q] = ca
@@ -561,7 +556,6 @@ func alignTokensToQQ(appleTokens []appleToken, qqTokens []qqPoolToken, lineStart
 				}
 			}
 
-			// Skip QQ
 			if q < Q {
 				cq := cur + gapQQ
 				if cq < dp[a][q+1] {
@@ -870,7 +864,6 @@ func buildSyllabus(appleTokens []appleToken, matches []*matchItem, residuals []q
 		}
 	}
 
-	// Enforce monotonicity
 	for idx := 1; idx < len(result); idx++ {
 		if result[idx].Time < result[idx-1].Time {
 			result[idx].Time = result[idx-1].Time + result[idx-1].Duration
@@ -907,7 +900,6 @@ func transferBackground(appleLine domain.Line, outLine *domain.Line) {
 	}
 }
 
-// RetimeAppleLinesFromQQ retimes Apple lines if they lack timestamps.
 func RetimeAppleLinesFromQQ(appleLines, wordLines []domain.Line) []domain.Line {
 	var timedQQ []domain.Line
 	for _, l := range wordLines {
@@ -1026,7 +1018,6 @@ func RetimeAppleLinesFromQQ(appleLines, wordLines []domain.Line) []domain.Line {
 	return result
 }
 
-// MergeAppleMetadataIntoWordSync merges Apple Line sync with QQ Word sync
 func MergeAppleMetadataIntoWordSync(appleData, wordSyncData *domain.LyricsResponse) *domain.LyricsResponse {
 	if appleData == nil || wordSyncData == nil {
 		if wordSyncData != nil {

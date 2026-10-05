@@ -1,4 +1,3 @@
-// Package handlers contains the HTTP handlers implementing the LyricsPlus API.
 package handlers
 
 import (
@@ -19,7 +18,6 @@ func contextWithTimeout(r *http.Request, d time.Duration) (context.Context, cont
 	return context.WithTimeout(r.Context(), d)
 }
 
-// Catalog serves /v1/songlist/search and /v1/metadata/get.
 type Catalog struct {
 	AppleMusic *providers.AppleMusicProvider
 	Spotify    *providers.SpotifyProvider
@@ -27,7 +25,6 @@ type Catalog struct {
 	Logger     *logger.Logger
 }
 
-// Search aggregates song catalog results from Apple, Spotify and Musixmatch.
 func (h *Catalog) Search(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
@@ -79,10 +76,6 @@ func (h *Catalog) Search(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// mergeCatalogResults deduplicates catalog items the same way the JS
-// songCatalog.service merges: sort by preferred source order (Apple, Spotify,
-// Musixmatch), then key on ISRC (falling back to title/artist/album) and union
-// the secondary fields into the first occurrence.
 func mergeCatalogResults(results []domain.SongCatalogItem) []domain.SongCatalogItem {
 	sourceOrder := map[string]int{"Apple Music": 1, "Spotify": 2, "Musixmatch": 3}
 	rank := func(item domain.SongCatalogItem) int {
@@ -155,7 +148,6 @@ func unionStrings(a, b []string) []string {
 	return out
 }
 
-// Metadata returns detailed Apple Music metadata for a track.
 func (h *Catalog) Metadata(w http.ResponseWriter, r *http.Request) {
 	title := strings.TrimSpace(r.URL.Query().Get("title"))
 	artist := strings.TrimSpace(r.URL.Query().Get("artist"))

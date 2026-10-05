@@ -1,4 +1,3 @@
-// Package domain defines the canonical shared types across LyricsPlus services.
 package domain
 
 import (
@@ -6,7 +5,6 @@ import (
 	"strings"
 )
 
-// SongCatalogItem is one aggregated search result from /v1/songlist/search.
 type SongCatalogItem struct {
 	ID           map[string]string `json:"id"`
 	SourceID     string            `json:"sourceId"`
@@ -21,7 +19,6 @@ type SongCatalogItem struct {
 	ExternalURLs map[string]string `json:"externalUrls"`
 }
 
-// SearchQuery is the normalized, deduplicated key used for caching and racing.
 type SearchQuery struct {
 	Title       string
 	Artist      string
@@ -33,12 +30,10 @@ type SearchQuery struct {
 	ForceReload bool
 }
 
-// IDOnly reports whether the query carries only identifiers (isrc/platformId).
 func (q SearchQuery) IDOnly() bool {
 	return (q.ISRC != "" || q.PlatformID != "") && q.Title == "" && q.Artist == ""
 }
 
-// NormalizeKey builds the deduplication key used by singleflight.
 func (q SearchQuery) NormalizeKey() string {
 	sources := "default"
 	if len(q.Sources) > 0 {

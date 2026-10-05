@@ -9,7 +9,6 @@ import (
 	"lyricsplus/backend/internal/config"
 )
 
-// CacheEntry is a stored HTTP response.
 type CacheEntry struct {
 	Body     []byte
 	Header   map[string][]string
@@ -18,7 +17,6 @@ type CacheEntry struct {
 	TTL      time.Duration
 }
 
-// MemoryCache emulates the Web Cache API with byte-budget shedding.
 type MemoryCache struct {
 	mu       sync.Mutex
 	entries  *lru.Cache[string, *CacheEntry]
@@ -38,7 +36,6 @@ func NewMemoryCache(cfg config.Cache) *MemoryCache {
 	}
 }
 
-// Get returns a cached entry if fresh.
 func (c *MemoryCache) Get(key string) (*CacheEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -54,7 +51,6 @@ func (c *MemoryCache) Get(key string) (*CacheEntry, bool) {
 	return e, true
 }
 
-// Set stores a body with max-size enforcement and total-budget shedding.
 func (c *MemoryCache) Set(key string, entry *CacheEntry) {
 	if int64(len(entry.Body)) > c.maxBody {
 		return
@@ -74,14 +70,12 @@ func (c *MemoryCache) Set(key string, entry *CacheEntry) {
 	c.bytes += int64(len(entry.Body))
 }
 
-// Len returns the number of cached keys.
 func (c *MemoryCache) Len() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.entries.Len()
 }
 
-// Shed evicts the oldest 50% of entries (invoked by the memory watchdog) to relieve memory without causing a full cache stampede.
 func (c *MemoryCache) Shed() {
 	c.mu.Lock()
 	defer c.mu.Unlock()

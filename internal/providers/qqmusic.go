@@ -25,7 +25,6 @@ const qqmusicName = "qq"
 
 const qqAPIEndpoint = "https://u.y.qq.com/cgi-bin/musics.fcg"
 
-// QQMusicProvider fetches lyrics from QQ Music.
 type QQMusicProvider struct {
 	client *proxy.Client
 	cookie string
@@ -36,7 +35,6 @@ func NewQQMusic(client *proxy.Client, cookie string) *QQMusicProvider {
 	return &QQMusicProvider{client: client, cookie: cookie}
 }
 
-// SetLogger attaches a logger for debug output.
 func (p *QQMusicProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
 
 func (p *QQMusicProvider) debugf(format string, args ...any) {
@@ -273,7 +271,6 @@ func processLyric(content string) (string, error) {
 		return "", nil
 	}
 
-	// Plain LRC: wrap in QrcInfos XML if needed
 	if strings.HasPrefix(content, "[") {
 		if !strings.Contains(content, "<QrcInfos>") {
 			escaped := strings.NewReplacer("&", "&amp;", "\"", "&quot;", "<", "&lt;", ">", "&gt;").Replace(content)
@@ -282,7 +279,6 @@ func processLyric(content string) (string, error) {
 		return content, nil
 	}
 
-	// Hex-encoded 3DES string
 	if len(content)%2 == 0 && isHexString(content) {
 		dec, err := DecryptQRC(content)
 		if err == nil && dec != "" {
@@ -401,10 +397,8 @@ func getGUID() string {
 	return b.String()
 }
 
-// xorScrambleBytes is the 20-byte XOR mask from the signing algorithm.
 var xorScrambleBytes = []byte{89, 39, 179, 150, 218, 82, 58, 252, 177, 52, 186, 123, 120, 64, 242, 133, 143, 161, 121, 179}
 
-// Sign builds a zzc${part1}${b64}${part2} request signature.
 func Sign(payload string) string {
 	hash := sha1.Sum([]byte(payload))
 	hashHex := hex.EncodeToString(hash[:])
@@ -418,7 +412,6 @@ func Sign(payload string) string {
 	}
 	part2 := stringAt(hashHex, []int{16, 1, 32, 12, 19, 27, 8, 5})
 
-	// XOR the last 20 raw hash bytes (hex char pairs) against the scramble values.
 	scrambled := make([]byte, len(xorScrambleBytes))
 	for i := 0; i < len(xorScrambleBytes); i++ {
 		pair, err := strconv.ParseUint(hashHex[i*2:i*2+2], 16, 8)
@@ -442,7 +435,6 @@ func stringAt(s string, idx []int) string {
 	return b.String()
 }
 
-// ParseQRC is exposed for tests.
 func ParseQRC(xmlText, defTitle, defArtist string) *domain.LyricsResponse {
 	resp := parsers.ParseQQQRC(xmlText, parsers.ExactMetadata{Title: defTitle, Artist: defArtist})
 	if resp == nil {

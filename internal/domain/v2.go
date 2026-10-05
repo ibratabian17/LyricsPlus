@@ -1,16 +1,14 @@
 package domain
 
-// SyncType describes the synchronization fidelity of a lyrics payload.
 type SyncType string
 
 const (
 	SyncTypeWord     SyncType = "Word"
 	SyncTypeLine     SyncType = "Line"
 	SyncTypeNone     SyncType = "None"
-	SyncTypeSyllable SyncType = "syllable" // legacy alias
+	SyncTypeSyllable SyncType = "syllable"
 )
 
-// CacheLevel records where the response was served from.
 type CacheLevel string
 
 const (
@@ -20,7 +18,6 @@ const (
 	CacheUserJSON CacheLevel = "UserJSON"
 )
 
-// LyricsResponse is the canonical V2 payload returned by /v2/lyrics/get.
 type LyricsResponse struct {
 	Type               SyncType       `json:"type"`
 	KpoeTools          string         `json:"KpoeTools"`
@@ -32,7 +29,6 @@ type LyricsResponse struct {
 	RawData            string         `json:"-"`
 }
 
-// LyricsMetadata carries track and credit information.
 type LyricsMetadata struct {
 	Source         string           `json:"source"`
 	Title          string           `json:"title,omitempty"`
@@ -50,77 +46,67 @@ type LyricsMetadata struct {
 	Licence        string           `json:"licence,omitempty"`
 }
 
-// Agent models a credited performer or group used as a voice identity.
 type Agent struct {
-	Type  string `json:"type"`  // "person" or "group"
-	Name  string `json:"name"`  // e.g. "Taylor Swift"
-	Alias string `json:"alias"` // e.g. "v1", "v2"
+	Type  string `json:"type"`
+	Name  string `json:"name"`
+	Alias string `json:"alias"`
 }
 
-// SongPart describes a structural section of the track.
 type SongPart struct {
-	Name     string `json:"name"`               // "Verse", "Chorus", ...
-	Time     *int   `json:"time,omitempty"`     // Start offset in ms
-	Duration *int   `json:"duration,omitempty"` // Duration in ms
-	DivIndex *int   `json:"divIndex,omitempty"` // For TTML mapping
+	Name     string `json:"name"`
+	Time     *int   `json:"time,omitempty"`
+	Duration *int   `json:"duration,omitempty"`
+	DivIndex *int   `json:"divIndex,omitempty"`
 }
 
-// AudioMetadata carries audio stream hints.
 type AudioMetadata struct {
 	LyricOffset string `json:"lyricOffset,omitempty"`
 	Role        string `json:"role,omitempty"`
 }
 
-// Line is a synchronized line of lyrics.
 type Line struct {
-	Time            int              `json:"time"`     // ms from track start
-	Duration        int              `json:"duration"` // ms
+	Time            int              `json:"time"`
+	Duration        int              `json:"duration"`
 	Text            string           `json:"text"`
-	IsLineEnding    *int             `json:"isLineEnding,omitempty"` // legacy V1 line terminal flag
-	Syllabus        []Syllable       `json:"syllabus,omitempty"`     // populated for word sync
+	IsLineEnding    *int             `json:"isLineEnding,omitempty"`
+	Syllabus        []Syllable       `json:"syllabus,omitempty"`
 	Element         LineElement      `json:"element"`
 	Translation     *Translation     `json:"translation,omitempty"`
 	Transliteration *Transliteration `json:"transliteration,omitempty"`
 }
 
-// Syllable is a word/word-segment with a timestamp.
 type Syllable struct {
-	Time         int    `json:"time"`     // ms
-	Duration     int    `json:"duration"` // ms
-	Text         string `json:"text"`     // token string (trailing space if appropriate)
+	Time         int    `json:"time"`
+	Duration     int    `json:"duration"`
+	Text         string `json:"text"`
 	IsBackground bool   `json:"isBackground,omitempty"`
-	Synthetic    bool   `json:"synthetic,omitempty"` // true if interpolated by alignment
+	Synthetic    bool   `json:"synthetic,omitempty"`
 }
 
-// LineElement links a line to its key, singer and song part.
 type LineElement struct {
-	Key           string `json:"key"`                     // "L1", "v1", ...
-	Singer        string `json:"singer,omitempty"`        // agent alias
-	SongPartIndex *int   `json:"songPartIndex,omitempty"` // index into Metadata.SongParts
-	SongPart      string `json:"songPart,omitempty"`      // deprecated V1 string name
+	Key           string `json:"key"`
+	Singer        string `json:"singer,omitempty"`
+	SongPartIndex *int   `json:"songPartIndex,omitempty"`
+	SongPart      string `json:"songPart,omitempty"`
 	IsBackground  bool   `json:"isBackground,omitempty"`
 }
 
-// Translation is a localized subtitle for a line.
 type Translation struct {
 	Lang string `json:"lang"`
 	Text string `json:"text"`
 }
 
-// Transliteration is a romanized/transliterated form of a line.
 type Transliteration struct {
 	Lang     string     `json:"lang"`
 	Text     string     `json:"text"`
 	Syllabus []Syllable `json:"syllabus,omitempty"`
 }
 
-// SourceStatus records a provider's outcome in the diagnostics.
 type SourceStatus struct {
-	Status    string `json:"status"` // "OK", "BAD", "RTO", "SKIP"
+	Status    string `json:"status"`
 	ElapsedMs *int64 `json:"elapsedMs,omitempty"`
 }
 
-// PickedSongMetadata identifies the song the pipeline resolved for the query.
 type PickedSongMetadata struct {
 	Source         string   `json:"source"`
 	Title          string   `json:"title,omitempty"`
@@ -131,8 +117,6 @@ type PickedSongMetadata struct {
 	SongPlatformID string   `json:"songPlatformId,omitempty"`
 }
 
-// ProcessTiming measures server-side processing windows and carries the
-// orchestration diagnostics for the request.
 type ProcessTiming struct {
 	TimeElapsed          int64                   `json:"timeElapsed"`
 	LastProcessed        int64                   `json:"lastProcessed"`

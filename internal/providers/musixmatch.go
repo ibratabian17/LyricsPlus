@@ -37,9 +37,6 @@ const (
 	mxmTokenExpiry      = 10 * time.Minute
 )
 
-// MusixmatchProvider fetches RichSync or subtitle lyrics from Musixmatch.
-// Accounts are rotated through on request failure, and each pass routes by the
-// account AUTH_TYPE ("web" vs "android").
 type MusixmatchProvider struct {
 	client *proxy.Client
 	name   string
@@ -53,13 +50,11 @@ type MusixmatchProvider struct {
 	android   map[int]*mxmAndroidState
 }
 
-// cachedWebToken holds a fetched web user-token for an account index.
 type cachedWebToken struct {
 	token   string
 	expires time.Time
 }
 
-// mxmAndroidState holds the per-account android client state.
 type mxmAndroidState struct {
 	currentToken string
 	isLoggedIn   bool
@@ -97,7 +92,6 @@ func NewMusixmatchWithConfig(client *proxy.Client, cfg config.Provider, pname st
 	return p
 }
 
-// SetLogger attaches a logger for debug output.
 func (p *MusixmatchProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
 
 func (p *MusixmatchProvider) debugf(format string, args ...any) {
@@ -247,8 +241,6 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 	return converted, nil
 }
 
-// mxmWriterList is the writer_list payload, which the API returns as an array
-// of objects ({writer_name}) but can also be a plain array of strings.
 type mxmWriterList []string
 
 func (w *mxmWriterList) UnmarshalJSON(data []byte) error {
@@ -307,8 +299,6 @@ func (p *MusixmatchProvider) isAndroid(accountIdx int) bool {
 	return strings.EqualFold(acc.AUTH_TYPE, "android")
 }
 
-// getUserToken returns a per-account web token from the cache, refreshed every
-// hour. Android accounts have no web token.
 func (p *MusixmatchProvider) getUserToken(ctx context.Context, accountIdx int) (string, error) {
 	if p.isAndroid(accountIdx) {
 		return "", nil
@@ -357,9 +347,6 @@ func (p *MusixmatchProvider) getUserToken(ctx context.Context, accountIdx int) (
 	return tok, nil
 }
 
-// makeWebRequest issues a GET to the web API with the account's UA/Cookie and
-// auth query params, failing when the HTTP call errors or the JSON header
-// status_code is not 200.
 func (p *MusixmatchProvider) makeWebRequest(ctx context.Context, endpoint string, params url.Values, accountIdx int) (json.RawMessage, error) {
 	raw, err := p.webRawRequest(ctx, endpoint, params, accountIdx)
 	if err != nil {
@@ -390,7 +377,7 @@ func (p *MusixmatchProvider) webRawRequest(ctx context.Context, endpoint string,
 	if params == nil {
 		params = url.Values{}
 	}
-	// _makeWebRequest always injects app_id; usertoken only when available.
+
 	params.Set("app_id", "web-desktop-app-v1.0")
 
 	reqURL := fmt.Sprintf("%s/%s?%s", mxmWebBaseURL, strings.TrimPrefix(endpoint, "/"), params.Encode())
@@ -414,8 +401,6 @@ func (p *MusixmatchProvider) webRawRequest(ctx context.Context, endpoint string,
 	return io.ReadAll(resp.Body)
 }
 
-// webTrackSearch is the web flavor of track.search (used when the account is
-// web AUTH_TYPE).
 func (p *MusixmatchProvider) webTrackSearch(ctx context.Context, query string, accountIdx int) ([]mxmTrack, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, nil
@@ -455,7 +440,6 @@ func (p *MusixmatchProvider) webTrackSearch(ctx context.Context, query string, a
 	return out, nil
 }
 
-// searchMatcher is the advanced track search for both web and android.
 func (p *MusixmatchProvider) searchMatcher(ctx context.Context, params url.Values, accountIdx int) (*mxmTrack, error) {
 	if p.isAndroid(accountIdx) {
 		defaults := url.Values{
@@ -673,7 +657,6 @@ func (p *MusixmatchProvider) fetchSubtitle(ctx context.Context, params url.Value
 	return p.makeWebRequest(ctx, "track.subtitle.get", params, accountIdx)
 }
 
-// androidState returns (creating if needed) the client state for an account.
 func (p *MusixmatchProvider) androidState(accountIdx int) *mxmAndroidState {
 	p.androidMu.Lock()
 	defer p.androidMu.Unlock()
@@ -685,15 +668,12 @@ func (p *MusixmatchProvider) androidState(accountIdx int) *mxmAndroidState {
 	return st
 }
 
-// newAndroidGuid returns a 32-hex-char GUID (vector of hex like a UUID sans
-// dashes).
 func newAndroidGuid() string {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
 
-// getApiSignature computes a day-scoped HMAC-SHA1 signature.
 func getApiSignature(endpoint string, dateTime time.Time) string {
 	formattedDate := fmt.Sprintf("%04d%02d%02d",
 		dateTime.UTC().Year(), int(dateTime.UTC().Month()), dateTime.UTC().Day())
@@ -707,8 +687,6 @@ func getApiSignature(endpoint string, dateTime time.Time) string {
 	return sig
 }
 
-// buildAndroidSignedParams returns params enriched with the app signature,
-// and (for token.get) a timestamp and fresh GUID.
 func buildAndroidSignedParams(endpoint string, params url.Values, currentToken string) url.Values {
 	sig := getApiSignature(endpoint, time.Now())
 
@@ -729,7 +707,6 @@ func buildAndroidSignedParams(endpoint string, params url.Values, currentToken s
 	return out
 }
 
-// makeAndroidRequest performs the raw android HTTP call (GET or POST).
 func (p *MusixmatchProvider) makeAndroidRequest(ctx context.Context, endpoint string, params url.Values, body []byte) (json.RawMessage, error) {
 	reqURL := mxmAndroidBaseURL + endpoint
 
@@ -765,8 +742,6 @@ func (p *MusixmatchProvider) makeAndroidRequest(ctx context.Context, endpoint st
 	return data, nil
 }
 
-// initializeAndroid fetches a fresh android token, then logs in via
-// credential.post.
 func (p *MusixmatchProvider) initializeAndroid(ctx context.Context, accountIdx int, st *mxmAndroidState) error {
 	acc, err := p.account(accountIdx)
 	if err != nil {
@@ -785,7 +760,6 @@ func (p *MusixmatchProvider) initializeAndroid(ctx context.Context, accountIdx i
 	st.expiresAt = time.Now().Add(mxmTokenExpiry)
 	st.isLoggedIn = false
 
-	// Fresh tokens require a credential.post login (loginNeeded=true).
 	return p.androidLogin(ctx, acc.EMAIL, acc.PASSWORD, st)
 }
 
@@ -835,12 +809,10 @@ func (p *MusixmatchProvider) fetchAndroidToken(ctx context.Context, accountIdx i
 	return data.Message.Body.UserToken, nil
 }
 
-// createUserLoginBody builds the credential.post payload for email/password login.
 func createUserLoginBody(email, password string) []byte {
 	return emailLoginBody(email, password)
 }
 
-// androidLogin runs credential.post and marks the state logged in.
 func (p *MusixmatchProvider) androidLogin(ctx context.Context, email, password string, st *mxmAndroidState) error {
 	params := buildAndroidSignedParams("credential.post", url.Values{}, st.currentToken)
 	body := emailLoginBody(email, password)
@@ -866,7 +838,6 @@ func (p *MusixmatchProvider) androidLogin(ctx context.Context, email, password s
 	return nil
 }
 
-// ensureLoggedIn initializes (and logs in) the android client state once.
 func (p *MusixmatchProvider) ensureLoggedIn(ctx context.Context, accountIdx int) error {
 	st := p.androidState(accountIdx)
 
@@ -880,8 +851,6 @@ func (p *MusixmatchProvider) ensureLoggedIn(ctx context.Context, accountIdx int)
 	return err
 }
 
-// androidRequest signs params with the current token, makes the call, and
-// refreshes + retries once on 401.
 func (p *MusixmatchProvider) androidRequest(ctx context.Context, endpoint string, params url.Values, body []byte, accountIdx int) (json.RawMessage, error) {
 	if err := p.ensureLoggedIn(ctx, accountIdx); err != nil {
 		return nil, err
@@ -898,13 +867,12 @@ func (p *MusixmatchProvider) androidRequest(ctx context.Context, endpoint string
 				} `json:"header"`
 			} `json:"message"`
 		}
-		// A 401 status_code means the token expired and we must re-login.
+
 		if json.Unmarshal(raw, &data) == nil && data.Message.Header.StatusCode != 401 {
 			return raw, nil
 		}
 	}
 
-	// Token expired or invalid (401): refresh and retry once.
 	p.androidMu.Lock()
 	st.currentToken = ""
 	st.isLoggedIn = false
@@ -917,19 +885,17 @@ func (p *MusixmatchProvider) androidRequest(ctx context.Context, endpoint string
 	return p.makeAndroidRequest(ctx, endpoint, signed, body)
 }
 
-// Signature computes base64url(HMAC-SHA1(key, endpoint+YYYYMMDD)) for Android.
 func Signature(endpoint string, now time.Time) string {
 	return getApiSignature(endpoint, now)
 }
 
-// SignedURL appends the required signature query parameters for Android.
 func SignedURL(endpoint string) string {
-	// Endpoint includes a query string already (e.g. ".../track.richsync.get?track_id=1").
+
 	sep := "?"
 	if strings.Contains(endpoint, "?") {
 		sep = "&"
 	}
-	// Sign the endpoint after the Android base URL (e.g. "track.richsync.get").
+
 	signTarget := endpoint
 	if strings.HasPrefix(endpoint, mxmAndroidBaseURL) {
 		signTarget = strings.TrimPrefix(endpoint, mxmAndroidBaseURL)
@@ -940,7 +906,6 @@ func SignedURL(endpoint string) string {
 	return endpoint + sep + "signature=" + Signature(signTarget, time.Now()) + "&signature_protocol=sha1"
 }
 
-// NormalizeSong converts a Musixmatch Track into domain.SongCatalogItem.
 func (p *MusixmatchProvider) NormalizeSong(track mxmTrack) domain.SongCatalogItem {
 	var isrc *string
 	if track.TrackISRC != "" {
@@ -965,7 +930,6 @@ func (p *MusixmatchProvider) NormalizeSong(track mxmTrack) domain.SongCatalogIte
 	}
 }
 
-// SearchCatalog searches Musixmatch tracks and normalizes the top 10 results.
 func (p *MusixmatchProvider) SearchCatalog(ctx context.Context, query string) ([]domain.SongCatalogItem, error) {
 	tracks, err := p.SearchTrack(ctx, query)
 	if err != nil {

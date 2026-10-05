@@ -6,7 +6,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// Priority grades a lyrics payload per the sync fidelity table.
 const (
 	PriorityFailed = 0
 	PriorityUnsync = 1
@@ -14,7 +13,6 @@ const (
 	PriorityWord   = 3
 )
 
-// HasSyllableSync reports whether the payload carries word/syllable sync.
 func HasSyllableSync(resp *domain.LyricsResponse) bool {
 	if resp == nil {
 		return false
@@ -31,7 +29,6 @@ func HasSyllableSync(resp *domain.LyricsResponse) bool {
 	return false
 }
 
-// Grade evaluates a payload and returns its sync priority (0-3).
 func Grade(resp *domain.LyricsResponse, source string) int {
 	if resp == nil || len(resp.Lyrics) == 0 {
 		return PriorityFailed
@@ -57,7 +54,6 @@ func Grade(resp *domain.LyricsResponse, source string) int {
 	return PriorityUnsync
 }
 
-// SourceOrder returns the source list per the id-only rule.
 func SourceOrder(query domain.SearchQuery, preferred []string) []string {
 	if len(preferred) > 0 {
 		return preferred

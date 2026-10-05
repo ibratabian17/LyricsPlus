@@ -9,20 +9,17 @@ import (
 	"lyricsplus/backend/internal/storage"
 )
 
-// ErrNotConfigured indicates missing credentials for a provider.
 var ErrNotConfigured = errNotConfigured("provider not configured")
 
 type errNotConfigured string
 
 func (e errNotConfigured) Error() string { return string(e) }
 
-// Source is implemented by every lyrics provider.
 type Source interface {
 	orchestrator.Source
 	Configured() bool
 }
 
-// Factory assembles the provider set available to the racer.
 type Factory struct {
 	Client *proxy.Client
 	Store  *storage.Store
@@ -31,7 +28,6 @@ type Factory struct {
 	Logger *logger.Logger
 }
 
-// Set holds typed references to each configured provider and the ordered source slice.
 type Set struct {
 	Sources    []Source
 	AppleMusic *AppleMusicProvider
@@ -42,12 +38,10 @@ type Set struct {
 	LyricsPlus *LyricsPlusProvider
 }
 
-// BuildSet returns all providers as a typed Set.
 func (f *Factory) BuildSet() (*Set, error) {
 	return buildAll(f.Client, f.Store, f.GDrive, f.Config, f.Logger)
 }
 
-// Build returns all provider sources.
 func (f *Factory) Build() ([]Source, error) {
 	set, err := f.BuildSet()
 	if err != nil {
@@ -113,10 +107,8 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 	}, nil
 }
 
-// ProvidePlugin is a hook reserved for custom source registrations.
 func ProvidePlugin(_ *proxy.Client, _ map[string]orchestrator.Source) {}
 
-// Empty marks an empty response as a miss.
 func Empty(resp *domain.LyricsResponse) bool {
 	return resp == nil || len(resp.Lyrics) == 0
 }

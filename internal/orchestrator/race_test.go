@@ -47,7 +47,7 @@ func TestGrade(t *testing.T) {
 	if Grade(lineResp("deezer"), "deezer") != PriorityLine {
 		t.Error("line should be priority 2")
 	}
-	// A line-typed payload with actual syllable content grades as word sync.
+
 	apple := lineResp("apple")
 	apple.Lyrics[0].Syllabus = []domain.Syllable{{Time: 0, Duration: 500, Text: "x "}}
 	if Grade(apple, "apple") != PriorityWord {
@@ -65,8 +65,6 @@ func TestRacerWordSyncWinsImmediately(t *testing.T) {
 		&stubSource{name: "deezer", resp: nil},
 	}, 2*time.Second)
 
-	// If lyricsplus (phase1 index 1) returns P3, apple's pending P2 always loses.
-	// Both phase-1 sources are instant; lyricsplus wins by priority.
 	res := racer.Race(context.Background(), domain.SearchQuery{Title: "t", Artist: "a"}, nil)
 	if res == nil || res.Source != "lyricsplus" || res.Priority != PriorityWord {
 		t.Fatalf("expected lyricsplus P3 winner, got %+v", res)
@@ -80,7 +78,7 @@ func TestRacerPhases(t *testing.T) {
 		&stubSource{name: "deezer", resp: wordResp("deezer")},
 		&stubSource{name: "qq", resp: nil},
 	}, 2*time.Second)
-	// Phase1 yields P2 from apple -> Phase2 should upgrade to deezer P3.
+
 	res := racer.Race(context.Background(), domain.SearchQuery{Title: "t", Artist: "a"}, nil)
 	if res == nil || res.Source != "deezer" || res.Priority != PriorityWord {
 		t.Fatalf("expected deezer P3 phase-2 upgrade, got %+v", res)

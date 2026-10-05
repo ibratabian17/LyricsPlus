@@ -18,7 +18,6 @@ func jsonUnmarshal(data []byte, v interface{}) error {
 	return json.Unmarshal(replaceEmoji(data), v)
 }
 
-// replaceEmoji guards against invalid UTF-8 bytes in cached payloads.
 func replaceEmoji(data []byte) []byte {
 	if !utf8Valid(data) {
 		cleaned := make([]byte, 0, len(data))
@@ -43,13 +42,11 @@ func utf8Valid(b []byte) bool {
 	return true
 }
 
-// hash32 computes a 32-bit content hash for debounce dedup.
 func hash32(data []byte) uint32 {
 	h := sha256.Sum256(data)
 	return (uint32(h[0]) << 24) | (uint32(h[1]) << 16) | (uint32(h[2]) << 8) | uint32(h[3])
 }
 
-// debounce deduplicates identical writes within the configured window.
 type debounce struct {
 	mu     sync.Mutex
 	seen   map[uint32]time.Time
@@ -76,14 +73,12 @@ func (d *debounce) allowed(content []byte) bool {
 	return true
 }
 
-// recentlySaved hooks the 60-second debounce for google drive writes.
 func (s *Store) recentlySaved(row *Row) bool { return false }
 
 func dirOf(path string) string {
 	return filepath.Dir(path)
 }
 
-// hexString of hash for cache keys used by the GDrive layer.
 func hexOf(data []byte) string {
 	return hex.EncodeToString(data)[:16]
 }

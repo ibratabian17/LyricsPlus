@@ -8,8 +8,6 @@ import (
 	"strings"
 )
 
-// CanonicalFilename is the exact on-disk naming convention.
-// {Artist} - {Title} [ {Album} ] ( {DurationSec.2f} ) < {ISRC}::{PlatformID} >.{ext}
 func CanonicalFilename(artist, title, album string, durationMs int, isrc, platformID, ext string) string {
 	var b strings.Builder
 	b.WriteString(cleanup(artist))
@@ -38,7 +36,6 @@ func CanonicalFilename(artist, title, album string, durationMs int, isrc, platfo
 	return b.String()
 }
 
-// cleanup strips illegal chars and collapses whitespace.
 func cleanup(s string) string {
 	s = strings.Map(func(r rune) rune {
 		switch r {
@@ -57,7 +54,6 @@ var (
 	reArtistTitle  = regexp.MustCompile(`^(.+?)\s*-\s*(.+)$`)
 )
 
-// ParsedFilename is the decomposed form of a canonical filename.
 type ParsedFilename struct {
 	Artist     string
 	Title      string
@@ -67,7 +63,6 @@ type ParsedFilename struct {
 	PlatformID string
 }
 
-// ParseFilename decomposes a canonical filename.
 func ParseFilename(name string) ParsedFilename {
 	p := ParsedFilename{}
 
@@ -113,7 +108,6 @@ func ParseFilename(name string) ParsedFilename {
 	return p
 }
 
-// stopWords are stripped during keyword extraction.
 var stopWords = map[string]bool{
 	"the": true, "and": true, "for": true, "with": true, "feat": true,
 	"ft": true, "featuring": true, "from": true, "this": true, "that": true,
@@ -140,7 +134,6 @@ func hasCJK(s string) bool {
 	return false
 }
 
-// ExtractKeywords pulls up to 2 meaningful search keywords.
 func ExtractKeywords(s string) []string {
 	cleaned := strings.TrimSpace(reStripPunct.ReplaceAllString(s, " "))
 	cleaned = strings.Join(strings.Fields(cleaned), " ")

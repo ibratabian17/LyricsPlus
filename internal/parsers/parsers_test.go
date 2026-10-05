@@ -101,7 +101,6 @@ func TestTTMLToJSONRoundtrip(t *testing.T) {
 		t.Errorf("translation not attached: %+v", line.Translation)
 	}
 
-	// Serialize back to TTML and re-parse.
 	xmlOut, err := JSONToTTML(resp)
 	if err != nil {
 		t.Fatalf("JSONToTTML: %v", err)
@@ -341,7 +340,6 @@ func TestNormalizeV2FlatV1ToNestedV2(t *testing.T) {
 		t.Errorf("metadata songParts = %+v", nested.Metadata.SongParts)
 	}
 
-	// Test V2ToV1 roundtrip
 	v1 := V2ToV1(nested)
 	if v1.Type != "syllable" {
 		t.Errorf("v1.Type = %q, want 'syllable'", v1.Type)
@@ -412,7 +410,7 @@ func TestParseQQQRC(t *testing.T) {
 	if resp.Metadata.Source != "QQ Music" {
 		t.Errorf("source = %q", resp.Metadata.Source)
 	}
-	// Line 1: syllable text = the chunk BEFORE each (st,dur) token.
+
 	if len(resp.Lyrics) != 1 {
 		t.Fatalf("lines = %d", len(resp.Lyrics))
 	}
@@ -432,12 +430,11 @@ func TestParseQQQRC(t *testing.T) {
 	if line.Text != "想你" {
 		t.Errorf("line text = %q", line.Text)
 	}
-	// The line header timing is used when no singer prefix was matched.
+
 	if line.Time != 1000 || line.Duration != 2000 {
 		t.Errorf("line timing = %d/%d", line.Time, line.Duration)
 	}
-	// Credits line has no timed syllables and should be dropped when no
-	// current singer context exists.
+
 }
 
 func TestParseQQRCWithSinger(t *testing.T) {
@@ -447,21 +444,21 @@ func TestParseQQRCWithSinger(t *testing.T) {
 		t.Fatalf("no lines parsed")
 	}
 	line := resp.Lyrics[0]
-	// Singer prefix split: syllabus[0].text becomes the lyrics remainder.
+
 	if line.Element.Singer != "v1" {
 		t.Errorf("singer alias = %q", line.Element.Singer)
 	}
 	if resp.Metadata.Agents["voice1"].Name != "周杰伦" {
 		t.Errorf("agent name = %q", resp.Metadata.Agents["voice1"].Name)
 	}
-	// Remaining syllables: 想 你 (tail "啦" after the last token is dropped).
+
 	if len(line.Syllabus) != 2 {
 		t.Fatalf("syllabus after singer split = %d", len(line.Syllabus))
 	}
 	if line.Syllabus[0].Text != "想" {
 		t.Errorf("first lyric syllable = %q", line.Syllabus[0].Text)
 	}
-	// Timing recomputed from remaining syllabus.
+
 	if line.Time != 800 {
 		t.Errorf("recomputed time = %d", line.Time)
 	}
@@ -485,7 +482,7 @@ func TestLRCParse(t *testing.T) {
 	if resp.Type != "line" || resp.KpoeTools != "2.0-LPlusBcknd" {
 		t.Errorf("type/kpoe = %q/%q", resp.Type, resp.KpoeTools)
 	}
-	// Empty-text line is filtered out before duration assignment.
+
 	if len(resp.Lyrics) != 2 {
 		t.Fatalf("lines = %d", len(resp.Lyrics))
 	}
@@ -495,8 +492,7 @@ func TestLRCParse(t *testing.T) {
 	if resp.Lyrics[0].Duration != 3500 {
 		t.Errorf("first duration = %d", resp.Lyrics[0].Duration)
 	}
-	// Durations are computed over ALL matched lines before empty-text filtering:
-	// the empty line at 7s still contributes 7000-5000=2000.
+
 	if resp.Lyrics[1].Time != 5000 || resp.Lyrics[1].Duration != 2000 {
 		t.Errorf("second = %d/%d", resp.Lyrics[1].Time, resp.Lyrics[1].Duration)
 	}
@@ -504,12 +500,11 @@ func TestLRCParse(t *testing.T) {
 		t.Errorf("keys = %q/%q", resp.Lyrics[0].Element.Key, resp.Lyrics[1].Element.Key)
 	}
 
-	// One-digit fraction scales by 10^len: [00:00.5] => 500ms.
 	s := ConvertLRCLIBtoJSON("[00:00.5]a", 1.0)
 	if s.Lyrics[0].Time != 500 {
 		t.Errorf("0.5 time = %d", s.Lyrics[0].Time)
 	}
-	// Non-matching lines (no [mm:ss.x] prefix) are skipped.
+
 	s = ConvertLRCLIBtoJSON("plain line\n[00:01.00]ok", 5.0)
 	if len(s.Lyrics) != 1 || s.Lyrics[0].Text != "ok" {
 		t.Errorf("skip non-matching: %+v", s.Lyrics)
@@ -540,11 +535,11 @@ func TestConvertMusixmatchRichSync(t *testing.T) {
 	if l.Time != 1100 {
 		t.Errorf("line time = %d", l.Time)
 	}
-	// naturalDuration = (lastWord.time+duration) - line.time  (no next line => no +2s pad)
+
 	if l.Duration != (2000+200)-1100 {
 		t.Errorf("line duration = %d", l.Duration)
 	}
-	// whitespace word merged into "hello" with <100ms rule intact (500ms != 0 case keeps text)
+
 	if len(l.Syllabus) != 2 {
 		t.Fatalf("syllables = %d", len(l.Syllabus))
 	}
@@ -569,7 +564,7 @@ func TestConvertMusixmatchSubtitle(t *testing.T) {
 	if resp.Type != "Line" {
 		t.Errorf("type = %q", resp.Type)
 	}
-	// subtitle requires subtitle lines only; word sync unavailable.
+
 	if len(resp.Lyrics) != 2 {
 		t.Fatalf("lines = %d", len(resp.Lyrics))
 	}
@@ -579,7 +574,7 @@ func TestConvertMusixmatchSubtitle(t *testing.T) {
 	if resp.Lyrics[1].Time != 5500 || resp.Lyrics[1].Duration != 3000 {
 		t.Errorf("line1 (last default 3000) = %d/%d", resp.Lyrics[1].Time, resp.Lyrics[1].Duration)
 	}
-	// Empty-text lines filtered after processing.
+
 	data2 := []byte(`{"lyrics":{"message":{"body":{"subtitle":{"subtitle_body":"[00:01.00]\n[00:02.00]ok","lyrics_copyright":""}}}}}`)
 	resp2, err := ConvertMusixmatchToJSON(data2, false)
 	if err != nil {
@@ -588,12 +583,11 @@ func TestConvertMusixmatchSubtitle(t *testing.T) {
 	if len(resp2.Lyrics) != 1 || resp2.Lyrics[0].Text != "ok" {
 		t.Errorf("filter empty: %+v", resp2.Lyrics)
 	}
-	// The empty line at 1s is filtered out AFTER durations are computed, but the
-	// empty line is still consumed when computing the delta; "ok" is last => 3000.
+
 	if resp2.Lyrics[0].Duration != 3000 {
 		t.Errorf("duration = %d", resp2.Lyrics[0].Duration)
 	}
-	// No body -> nil.
+
 	resp3, err := ConvertMusixmatchToJSON([]byte(`{"lyrics":{"message":{"body":{}}}}`), false)
 	if err != nil || resp3 != nil {
 		t.Errorf("empty body: %v / %+v", err, resp3)
@@ -628,7 +622,7 @@ func TestConvertSpotifyToJSON(t *testing.T) {
 	if len(resp.Metadata.SongWriters) != 2 {
 		t.Errorf("songWriters = %v", resp.Metadata.SongWriters)
 	}
-	// 200ms gap > 100ms => trailing space added on "Hello".
+
 	if len(resp.Lyrics[0].Syllabus) != 2 {
 		t.Fatalf("syllables = %d", len(resp.Lyrics[0].Syllabus))
 	}
@@ -662,20 +656,20 @@ func TestSpotifyLineModeAndSongPart(t *testing.T) {
 	if resp.Type != domain.SyncTypeLine {
 		t.Errorf("type = %q", resp.Type)
 	}
-	// "♪" lines are filtered out in line mode.
+
 	if len(resp.Lyrics) != 2 {
 		t.Fatalf("lines = %d", len(resp.Lyrics))
 	}
-	if resp.Lyrics[0].Duration != 2000 { // endTimeMs given
+	if resp.Lyrics[0].Duration != 2000 {
 		t.Errorf("line0 duration = %d", resp.Lyrics[0].Duration)
 	}
-	if resp.Lyrics[1].Duration != 0 { // no end, last line => fallback NaN => 0
+	if resp.Lyrics[1].Duration != 0 {
 		t.Errorf("line1 duration = %d", resp.Lyrics[1].Duration)
 	}
 	if resp.Lyrics[0].Element.SongPart != "Verse" || resp.Lyrics[1].Element.SongPart != "Chorus" {
 		t.Errorf("songParts = %q/%q", resp.Lyrics[0].Element.SongPart, resp.Lyrics[1].Element.SongPart)
 	}
-	// Line mode keeps empty syllabus and singer "".
+
 	if len(resp.Lyrics[0].Syllabus) != 0 || resp.Lyrics[0].Element.Singer != "" {
 		t.Errorf("line mode element = %+v", resp.Lyrics[0].Element)
 	}

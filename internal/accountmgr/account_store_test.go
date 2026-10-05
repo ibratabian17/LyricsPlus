@@ -40,7 +40,6 @@ func TestAccountStore_LoadSaveRoundTrip(t *testing.T) {
 		t.Fatalf("LoadStore failed: %v", err)
 	}
 
-	// Verify initial loading from scalar fields
 	if len(st.SpotifyAccounts) != 1 {
 		t.Fatalf("expected 1 spotify account, got %d", len(st.SpotifyAccounts))
 	}
@@ -51,7 +50,6 @@ func TestAccountStore_LoadSaveRoundTrip(t *testing.T) {
 		t.Errorf("expected deezer arl initial-arl-token, got %+v", st.DeezerAccounts)
 	}
 
-	// Add new accounts
 	st.SpotifyAccounts = append(st.SpotifyAccounts, config.SpotifyAccount{
 		NAMEID: "spotify-secondary",
 		COOKIE: "sp_dc=second-cookie-value",
@@ -79,7 +77,6 @@ func TestAccountStore_LoadSaveRoundTrip(t *testing.T) {
 		t.Fatalf("Save failed: %v", err)
 	}
 
-	// Reload from file and verify
 	reloaded, err := LoadStore(confPath)
 	if err != nil {
 		t.Fatalf("Reload failed: %v", err)
@@ -98,7 +95,6 @@ func TestAccountStore_LoadSaveRoundTrip(t *testing.T) {
 		t.Errorf("expected 1 gdrive account, got %d", len(reloaded.GDriveAccounts))
 	}
 
-	// Verify unmanaged fields were preserved!
 	data, err := os.ReadFile(confPath)
 	if err != nil {
 		t.Fatalf("failed to read reloaded file: %v", err)
@@ -170,7 +166,6 @@ QQ_COOKIE="qq=cookie value"
 		t.Errorf("gdrive env load wrong: %+v", st.GDriveAccounts)
 	}
 
-	// Add a second spotify account and a web apple account, then save.
 	st.SpotifyAccounts = append(st.SpotifyAccounts, config.SpotifyAccount{
 		NAMEID: "spotify-2",
 		COOKIE: "another cookie with = and spaces",
@@ -202,7 +197,6 @@ QQ_COOKIE="qq=cookie value"
 		t.Errorf("apple web account lost: %+v", reloaded.AppleAccounts)
 	}
 
-	// Unrelated keys + comments must be preserved.
 	data, _ := os.ReadFile(envPath)
 	content := string(data)
 	for _, wanted := range []string{
@@ -216,12 +210,11 @@ QQ_COOKIE="qq=cookie value"
 			t.Errorf(".env lost line %q after save:\n%s", wanted, content)
 		}
 	}
-	// Array line should be present and quoted (contains spaces/quotes).
+
 	if !strings.Contains(content, "SPOTIFY_ACCOUNTS=") {
 		t.Errorf(".env missing SPOTIFY_ACCOUNTS after save:\n%s", content)
 	}
 
-	// Removing the last spotify account must not resurrect a scalar-created one.
 	st.SpotifyAccounts = nil
 	if err := st.Save(); err != nil {
 		t.Fatalf("save after removal: %v", err)
@@ -245,7 +238,7 @@ func TestMaskCredential(t *testing.T) {
 	long := "123456abcdefghijklmn7890"
 	masked := MaskCredential(long)
 	if !filepath.HasPrefix(masked, "123456...") && !filepath.HasPrefix(masked, "123456...") {
-		// check prefix and suffix
+
 		if masked != "123456...7890 (24 chars)" {
 			t.Errorf("expected '123456...7890 (24 chars)', got %q", masked)
 		}
@@ -283,7 +276,6 @@ APPLE_MUSIC_ACCOUNTS='[{"NAMEID":"apple-converted","AUTH_TYPE":"android","ANDROI
 		t.Fatalf("ConvertEnvToJSON failed: %v", err)
 	}
 
-	// Verify the output JSON file
 	data, err := os.ReadFile(jsonPath)
 	if err != nil {
 		t.Fatalf("read converted json: %v", err)

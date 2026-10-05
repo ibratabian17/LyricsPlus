@@ -11,7 +11,6 @@ import (
 	"lyricsplus/backend/internal/domain"
 )
 
-// mxmEnvelope is { track, ...lyricsResult } where lyricsResult = { lyrics: { message: { body } } }.
 type mxmEnvelope struct {
 	Lyrics struct {
 		Message struct {
@@ -36,8 +35,6 @@ type mxmRawLine struct {
 	syllabus []domain.Syllable
 }
 
-// ConvertMusixmatchToJSON converts a Musixmatch richsync/subtitle payload into
-// V2. Returns nil when there is no convertible lyrics body.
 func ConvertMusixmatchToJSON(data []byte, requireWordSync bool) (*domain.LyricsResponse, error) {
 	var env mxmEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
@@ -262,8 +259,6 @@ func processWordSyncLines(lines []mxmRawLine) ([]domain.Line, []domain.SongPart)
 
 var mxmSpaceRe = regexp.MustCompile(`^\s+$`)
 
-// mergeSpacesAndFixDurations merges whitespace-only tokens into the preceding
-// syllable, absorbing their duration only when it is under 100ms.
 func mergeSpacesAndFixDurations(rawSyllabus []domain.Syllable) []domain.Syllable {
 	var merged []domain.Syllable
 	for i := 0; i < len(rawSyllabus); i++ {
@@ -286,7 +281,6 @@ func mergeSpacesAndFixDurations(rawSyllabus []domain.Syllable) []domain.Syllable
 
 var wsRx = regexp.MustCompile(`Writer\(s\):\s*([^\n]+)`)
 
-// extractSongwriters parses songwriters out of the lyrics copyright line.
 func extractSongwriters(copyrightString string) []string {
 	if copyrightString == "" {
 		return nil

@@ -1,4 +1,3 @@
-// Package middleware provides request processing middleware for the API server.
 package middleware
 
 import (
@@ -27,9 +26,6 @@ const (
 	ctxStartTime
 )
 
-// IsHealthPath reports whether the request targets a health probe.
-// Health paths are exempt from request throttling so deployment probes are
-// never starved by client traffic.
 func IsHealthPath(r *http.Request) bool {
 	switch r.URL.Path {
 	case "/health", "/readyz":
@@ -38,14 +34,12 @@ func IsHealthPath(r *http.Request) bool {
 	return false
 }
 
-// writeJSON encodes v as JSON with the given status code.
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// RequestID reads the 8-character request id from the context.
 func RequestID(ctx context.Context) string {
 	if v, ok := ctx.Value(ctxReqID).(string); ok {
 		return v
@@ -53,8 +47,6 @@ func RequestID(ctx context.Context) string {
 	return ""
 }
 
-// Tracing generates an 8-character hex request ID, attaches it to the context,
-// and logs a structured completion line with correlation ID.
 func Tracing(l *logger.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -94,7 +86,6 @@ func (w *statusWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(code)
 }
 
-// PanicRecovery catches unhandled panics, logs the stack, and returns a 500 JSON error.
 func PanicRecovery(l *logger.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +108,6 @@ func PanicRecovery(l *logger.Logger) func(http.Handler) http.Handler {
 	}
 }
 
-// CORS allows any origin with default methods and headers.
 func CORS() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -133,12 +123,10 @@ func CORS() func(http.Handler) http.Handler {
 	}
 }
 
-// Compression
 func Compression(next http.Handler) http.Handler {
 	return chimiddleware.Compress(5, "text/*", "application/*")(next)
 }
 
-// QueryLimits rejects oversized URLs and too many/long query parameters.
 func QueryLimits(maxURLBytes, maxParams, maxValueLen int) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -168,7 +156,6 @@ func QueryLimits(maxURLBytes, maxParams, maxValueLen int) func(http.Handler) htt
 	}
 }
 
-// BodyLimit enforces a maximum request body size (413 on exceed).
 func BodyLimit(maxBytes int64) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +167,6 @@ func BodyLimit(maxBytes int64) func(http.Handler) http.Handler {
 	}
 }
 
-// ConcurrencyLimiter limits maximum inflight requests.
 func ConcurrencyLimiter(max int64) func(http.Handler) http.Handler {
 	var inflight atomic.Int64
 	return func(next http.Handler) http.Handler {
@@ -221,7 +207,6 @@ func itoaMax(v int64) string {
 	return string(b[i:])
 }
 
-// ClientIP resolves the client address via the standard reverse-proxy cascade.
 func ClientIP(r *http.Request) string {
 	if v := r.Header.Get("CF-Connecting-IP"); v != "" {
 		return strings.TrimSpace(strings.Split(v, ",")[0])
@@ -244,15 +229,13 @@ func ClientIP(r *http.Request) string {
 
 const numShards = 64
 
-// ipEntry holds a fixed-capacity ring buffer of request timestamps (unix nano)
-// to avoid heap allocations on the hot path. maxStamps must be >= max config value.
 const maxStamps = 128
 
 type ipEntry struct {
-	ts   [maxStamps]int64 // ring buffer of arrival times (unix ns)
-	head int              // write head
-	n    int              // count of entries currently valid
-	last int64            // last-seen timestamp (ns) for pruning
+	ts   [maxStamps]int64
+	head int
+	n    int
+	last int64
 }
 
 type rateLimiterShard struct {
@@ -276,7 +259,6 @@ func fnv32(key string) uint32 {
 	return hash
 }
 
-// RateLimiter returns a sharded sliding-window limiter keyed by client IP.
 func RateLimiter(max int, window time.Duration) func(http.Handler) http.Handler {
 	if max <= 0 {
 		return func(next http.Handler) http.Handler {
@@ -284,7 +266,7 @@ func RateLimiter(max int, window time.Duration) func(http.Handler) http.Handler 
 		}
 	}
 	if max > maxStamps {
-		max = maxStamps // safety clamp
+		max = maxStamps
 	}
 	l := &shardedRateLimiter{
 		window: window,
@@ -330,7 +312,6 @@ func (l *shardedRateLimiter) allow(key string) (string, bool) {
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	// Periodic prune: remove IPs that haven't been seen in 2 windows.
 	if now.Sub(shard.lastPrune) > l.window*2 {
 		pruneAfter := now.Add(-l.window * 2).UnixNano()
 		for k, e := range shard.perIP {
@@ -348,7 +329,6 @@ func (l *shardedRateLimiter) allow(key string) (string, bool) {
 	}
 	e.last = nowNs
 
-	// Count how many entries fall within the current window.
 	count := 0
 	for i := 0; i < e.n; i++ {
 		idx := (e.head - e.n + i + maxStamps) % maxStamps
@@ -358,7 +338,7 @@ func (l *shardedRateLimiter) allow(key string) (string, bool) {
 	}
 
 	if count >= l.max {
-		// Find the oldest timestamp in the window to compute retry-after.
+
 		oldest := nowNs
 		for i := 0; i < e.n; i++ {
 			idx := (e.head - e.n + i + maxStamps) % maxStamps
@@ -374,7 +354,6 @@ func (l *shardedRateLimiter) allow(key string) (string, bool) {
 		return itoaSec(secs), false
 	}
 
-	// Write new timestamp into the ring buffer.
 	e.ts[e.head] = nowNs
 	e.head = (e.head + 1) % maxStamps
 	if e.n < maxStamps {

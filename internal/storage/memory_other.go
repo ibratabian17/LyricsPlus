@@ -4,7 +4,6 @@ package storage
 
 import "runtime"
 
-// rssBytes returns active in-use memory on other platforms.
 func rssBytes() uint64 {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
