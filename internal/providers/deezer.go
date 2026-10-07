@@ -519,3 +519,55 @@ func (p *DeezerProvider) NormalizeSong(t deezerTrack) domain.SongCatalogItem {
 		ExternalURLs: map[string]string{"deezer": t.Link},
 	}
 }
+
+func (p *DeezerProvider) SearchCatalog(ctx context.Context, query string) ([]domain.SongCatalogItem, error) {
+	tracks, err := p.SearchTrack(ctx, query, 10)
+	if err != nil {
+		return nil, err
+	}
+	items := make([]domain.SongCatalogItem, len(tracks))
+	for i, t := range tracks {
+		items[i] = p.NormalizeSong(t)
+	}
+	return items, nil
+}
+
+func (p *DeezerProvider) GetMetadata(ctx context.Context, title, artist, album string, durationSec float64) (map[string]interface{}, error) {
+	query := strings.TrimSpace(title + " " + artist)
+	if query == "" {
+		query = title
+	}
+	tracks, err := p.SearchTrack(ctx, query, 10)
+	if err != nil || len(tracks) == 0 {
+		return nil, err
+	}
+	var candidates []similarity.SongCandidate
+	for _, t := range tracks {
+		candidates = append(candidates, similarity.SongCandidate{
+			Title:      t.Title,
+			Artist:     t.Artist.Name,
+			Album:      t.Album.Title,
+			DurationMs: t.Duration * 1000,
+			ISRC:       t.ISRC,
+			PlatformID: strconv.FormatInt(t.ID, 10),
+			Data:       t,
+		})
+	}
+	best := similarity.FindBestSongMatch(candidates, title, artist, album, durationSec, "", "")
+	if best == nil {
+		return nil, nil
+	}
+	matched := best.Candidate.Data.(deezerTrack)
+	meta := map[string]interface{}{
+		"name":       matched.Title,
+		"artistName": matched.Artist.Name,
+		"albumName":  matched.Album.Title,
+		"durationMs": matched.Duration * 1000,
+		"isrc":       matched.ISRC,
+		"id":         strconv.FormatInt(matched.ID, 10),
+		"artworkUrl": matched.Album.CoverXL,
+		"url":        matched.Link,
+		"source":     "Deezer",
+	}
+	return meta, nil
+}

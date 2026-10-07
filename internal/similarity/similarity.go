@@ -811,3 +811,73 @@ func FindBestSongMatch(candidates []SongCandidate, queryTitle, queryArtist, quer
 		ScoreInfo: best.scoreInfo,
 	}
 }
+
+// CatalogQuerySimilarity computes a relevance score (0.0 to 1.0) between a candidate song and a search query.
+func CatalogQuerySimilarity(candTitle, candArtist, candAlbum, query string) float64 {
+	qNorm := normalizeString(query)
+	if qNorm == "" {
+		return 0.0
+	}
+	tNorm := normalizeString(candTitle)
+	aNorm := normalizeString(candArtist)
+	alNorm := normalizeString(candAlbum)
+
+	// 1. Exact title match
+	if tNorm == qNorm {
+		return 1.0
+	}
+
+	combinedTA := strings.TrimSpace(tNorm + " " + aNorm)
+	combinedAT := strings.TrimSpace(aNorm + " " + tNorm)
+
+	// 2. Exact combined match (Title + Artist or Artist + Title)
+	if combinedTA == qNorm || combinedAT == qNorm {
+		return 0.99
+	}
+
+	// 3. String & Token similarities
+	tScore := TitleSimilarity(candTitle, query)
+	diceTA := SorensenDice(combinedTA, qNorm)
+	diceAT := SorensenDice(combinedAT, qNorm)
+	diceT := SorensenDice(tNorm, qNorm)
+
+	score := math.Max(tScore, math.Max(diceTA, math.Max(diceAT, diceT)))
+
+	// 4. Token containment
+	qWords := strings.Fields(qNorm)
+	if len(qWords) > 1 {
+		matchedWords := 0
+		fullText := tNorm + " " + aNorm + " " + alNorm
+		for _, w := range qWords {
+			if strings.Contains(fullText, w) {
+				matchedWords++
+			}
+		}
+		wordRatio := float64(matchedWords) / float64(len(qWords))
+		if wordRatio == 1.0 {
+			score = math.Max(score, 0.88+0.1*SorensenDice(fullText, qNorm))
+		} else {
+			score = math.Max(score, wordRatio*0.7)
+		}
+	} else if len(qWords) == 1 {
+		if strings.HasPrefix(tNorm, qNorm) {
+			score = math.Max(score, 0.92)
+		} else if strings.Contains(tNorm, qNorm) {
+			score = math.Max(score, 0.82)
+		} else if strings.Contains(aNorm, qNorm) {
+			score = math.Max(score, 0.75)
+		}
+	}
+
+	// 5. Version / tag divergence penalty
+	qAnalysis := AnalyzeTitle(query)
+	tAnalysis := AnalyzeTitle(candTitle)
+	if len(tAnalysis.BracketContents) > 0 && len(qAnalysis.BracketContents) == 0 {
+		score -= 0.05
+	}
+	if len(tAnalysis.Tags) > 0 && len(qAnalysis.Tags) == 0 {
+		score -= 0.05
+	}
+
+	return math.Min(1.0, math.Max(0.0, score))
+}

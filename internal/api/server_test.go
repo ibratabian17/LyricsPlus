@@ -544,11 +544,101 @@ func TestCatalogsearchMissingQuery(t *testing.T) {
 	}
 }
 
+func TestCatalogSearchWithDBCache(t *testing.T) {
+	cfg := baseTestConfig()
+	dbPath := filepath.Join(t.TempDir(), "catalog_test.db")
+	cfg.Storage.DBPath = dbPath
+	store, err := storage.NewStore(cfg.Storage)
+	if err != nil {
+		t.Fatalf("open temp store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	err = store.SaveLyrics(context.Background(), &storage.Row{
+		Filename:    "Adele - Hello.json",
+		ContentJSON: []byte(`{"lyrics":[]}`),
+		ISRC:        "GBBKS1500214",
+		PlatformID:  "105141065",
+		Source:      "Apple Music",
+		Title:       "Hello",
+		Artist:      "Adele",
+		DurationMS:  295000,
+	})
+	if err != nil {
+		t.Fatalf("save lyrics: %v", err)
+	}
+
+	lyricsH := &handlers.Lyrics{}
+	catalogH := &handlers.Catalog{Store: store}
+	powH := &handlers.Pow{}
+	healthH := &handlers.Health{Store: store, Started: time.Now()}
+	router := newRouter(cfg, nil, lyricsH, catalogH, powH, healthH)
+
+	rec := doGet(t, router, "/v1/songlist/search?q=Hello")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Results []domain.SongCatalogItem `json:"results"`
+	}
+	decodeJSON(t, rec, &body)
+	if len(body.Results) == 0 {
+		t.Fatalf("expected at least 1 result from DB cache, got 0")
+	}
+	item := body.Results[0]
+	if item.Title != "Hello" || item.Artist != "Adele" {
+		t.Fatalf("unexpected catalog item: %+v", item)
+	}
+}
+
 func TestMetadataMissingParams(t *testing.T) {
 	h := buildTestRouter(t, baseTestConfig(), &fakeSource{resp: sampleWordLyrics()})
 
 	rec := doGet(t, h, "/v1/metadata/get?title=OnlyTitle")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestMetadataWithDBCache(t *testing.T) {
+	cfg := baseTestConfig()
+	dbPath := filepath.Join(t.TempDir(), "meta_test.db")
+	cfg.Storage.DBPath = dbPath
+	store, err := storage.NewStore(cfg.Storage)
+	if err != nil {
+		t.Fatalf("open temp store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	err = store.SaveLyrics(context.Background(), &storage.Row{
+		Filename:    "Adele - Hello.json",
+		ContentJSON: []byte(`{"lyrics":[]}`),
+		ISRC:        "GBBKS1500214",
+		PlatformID:  "105141065",
+		Source:      "Apple Music",
+		Title:       "Hello",
+		Artist:      "Adele",
+		DurationMS:  295000,
+	})
+	if err != nil {
+		t.Fatalf("save lyrics: %v", err)
+	}
+
+	lyricsH := &handlers.Lyrics{}
+	catalogH := &handlers.Catalog{Store: store}
+	powH := &handlers.Pow{}
+	healthH := &handlers.Health{Store: store, Started: time.Now()}
+	router := newRouter(cfg, nil, lyricsH, catalogH, powH, healthH)
+
+	rec := doGet(t, router, "/v1/metadata/get?title=Hello&artist=Adele")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Metadata map[string]interface{} `json:"metadata"`
+	}
+	decodeJSON(t, rec, &body)
+	if body.Metadata["name"] != "Hello" || body.Metadata["artistName"] != "Adele" {
+		t.Fatalf("unexpected metadata: %+v", body.Metadata)
 	}
 }

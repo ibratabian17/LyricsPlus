@@ -740,3 +740,59 @@ func (p *SpotifyProvider) SearchCatalog(ctx context.Context, query string) ([]do
 	}
 	return items, nil
 }
+
+func (p *SpotifyProvider) GetMetadata(ctx context.Context, title, artist, album string, durationSec float64) (map[string]interface{}, error) {
+	query := strings.TrimSpace(title + " " + artist)
+	if query == "" {
+		query = title
+	}
+	tracks, err := p.SearchTrack(ctx, query)
+	if err != nil || len(tracks) == 0 {
+		return nil, err
+	}
+	var candidates []similarity.SongCandidate
+	for _, t := range tracks {
+		isrc := ""
+		if t.ExternalIDs.ISRC != "" {
+			isrc = t.ExternalIDs.ISRC
+		}
+		art := ""
+		if len(t.Artists) > 0 {
+			art = t.Artists[0].Name
+		}
+		candidates = append(candidates, similarity.SongCandidate{
+			Title:      t.Name,
+			Artist:     art,
+			Album:      t.Album.Name,
+			DurationMs: t.DurationMs,
+			ISRC:       isrc,
+			PlatformID: t.ID,
+			Data:       t,
+		})
+	}
+	best := similarity.FindBestSongMatch(candidates, title, artist, album, durationSec, "", "")
+	if best == nil {
+		return nil, nil
+	}
+	matched := best.Candidate.Data.(spotifyTrack)
+	art := ""
+	if len(matched.Artists) > 0 {
+		art = matched.Artists[0].Name
+	}
+	var coverURL string
+	if len(matched.Album.Images) > 0 {
+		coverURL = matched.Album.Images[0].URL
+	}
+	meta := map[string]interface{}{
+		"name":       matched.Name,
+		"artistName": art,
+		"albumName":  matched.Album.Name,
+		"durationMs": matched.DurationMs,
+		"isrc":       matched.ExternalIDs.ISRC,
+		"id":         matched.ID,
+		"artworkUrl": coverURL,
+		"url":        matched.ExternalURLs.Spotify,
+		"source":     "Spotify",
+	}
+	return meta, nil
+}

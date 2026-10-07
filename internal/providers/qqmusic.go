@@ -794,3 +794,135 @@ func ParseQRC(xmlText, defTitle, defArtist string) *domain.LyricsResponse {
 	}
 	return resp
 }
+
+func (p *QQMusicProvider) NormalizeSong(item songItem) domain.SongCatalogItem {
+	title := item.Title
+	if title == "" {
+		title = item.Name
+	}
+	singer := ""
+	if len(item.Singer) > 0 {
+		singer = item.Singer[0].Name
+	}
+	album := item.Album.Title
+	if album == "" {
+		album = item.Album.Name
+	}
+	platID := item.Mid
+	if platID == "" && item.ID > 0 {
+		platID = strconv.FormatInt(item.ID, 10)
+	}
+
+	idMap := map[string]string{}
+	if item.Mid != "" {
+		idMap["qq"] = item.Mid
+	}
+	if item.ID > 0 {
+		idMap["qq_id"] = strconv.FormatInt(item.ID, 10)
+	}
+
+	var artURL *string
+	if item.Album.ID > 0 || item.Mid != "" {
+		u := fmt.Sprintf("https://y.gtimg.cn/music/photo_new/T002R300x300M000%s.jpg", platID)
+		artURL = &u
+	}
+
+	return domain.SongCatalogItem{
+		ID:           idMap,
+		SourceID:     platID,
+		Title:        title,
+		Artist:       singer,
+		Album:        album,
+		AlbumArtURL:  artURL,
+		DurationMs:   int64(item.Interval * 1000),
+		Availability: []string{"QQ Music"},
+		ExternalURLs: map[string]string{
+			"qq": fmt.Sprintf("https://y.qq.com/n/ryqq/songDetail/%s", platID),
+		},
+	}
+}
+
+func (p *QQMusicProvider) SearchCatalog(ctx context.Context, query string) ([]domain.SongCatalogItem, error) {
+	songs, err := p.search(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	limit := len(songs)
+	if limit > 10 {
+		limit = 10
+	}
+	items := make([]domain.SongCatalogItem, limit)
+	for i := 0; i < limit; i++ {
+		items[i] = p.NormalizeSong(songs[i])
+	}
+	return items, nil
+}
+
+func (p *QQMusicProvider) GetMetadata(ctx context.Context, title, artist, album string, durationSec float64) (map[string]interface{}, error) {
+	query := strings.TrimSpace(title + " " + artist)
+	if query == "" {
+		query = title
+	}
+	songs, err := p.search(ctx, query)
+	if err != nil || len(songs) == 0 {
+		return nil, err
+	}
+	var candidates []similarity.SongCandidate
+	for _, s := range songs {
+		singer := ""
+		if len(s.Singer) > 0 {
+			singer = s.Singer[0].Name
+		}
+		t := s.Title
+		if t == "" {
+			t = s.Name
+		}
+		al := s.Album.Title
+		if al == "" {
+			al = s.Album.Name
+		}
+		platID := s.Mid
+		if platID == "" && s.ID > 0 {
+			platID = strconv.FormatInt(s.ID, 10)
+		}
+		candidates = append(candidates, similarity.SongCandidate{
+			Title:      t,
+			Artist:     singer,
+			Album:      al,
+			DurationMs: s.Interval * 1000,
+			PlatformID: platID,
+			Data:       s,
+		})
+	}
+	best := similarity.FindBestSongMatch(candidates, title, artist, album, durationSec, "", "")
+	if best == nil {
+		return nil, nil
+	}
+	matched := best.Candidate.Data.(songItem)
+	tName := matched.Title
+	if tName == "" {
+		tName = matched.Name
+	}
+	singerName := ""
+	if len(matched.Singer) > 0 {
+		singerName = matched.Singer[0].Name
+	}
+	alName := matched.Album.Title
+	if alName == "" {
+		alName = matched.Album.Name
+	}
+	platID := matched.Mid
+	if platID == "" && matched.ID > 0 {
+		platID = strconv.FormatInt(matched.ID, 10)
+	}
+	meta := map[string]interface{}{
+		"name":       tName,
+		"artistName": singerName,
+		"albumName":  alName,
+		"durationMs": matched.Interval * 1000,
+		"id":         platID,
+		"source":     "QQ Music",
+		"url":        fmt.Sprintf("https://y.qq.com/n/ryqq/songDetail/%s", platID),
+	}
+	return meta, nil
+}

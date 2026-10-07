@@ -945,3 +945,42 @@ func (p *MusixmatchProvider) SearchCatalog(ctx context.Context, query string) ([
 	}
 	return items, nil
 }
+
+func (p *MusixmatchProvider) GetMetadata(ctx context.Context, title, artist, album string, durationSec float64) (map[string]interface{}, error) {
+	query := strings.TrimSpace(title + " " + artist)
+	if query == "" {
+		query = title
+	}
+	tracks, err := p.SearchTrack(ctx, query)
+	if err != nil || len(tracks) == 0 {
+		return nil, err
+	}
+	var candidates []similarity.SongCandidate
+	for _, t := range tracks {
+		candidates = append(candidates, similarity.SongCandidate{
+			Title:      t.TrackName,
+			Artist:     t.ArtistName,
+			Album:      t.AlbumName,
+			DurationMs: t.TrackLength * 1000,
+			ISRC:       t.TrackISRC,
+			PlatformID: strconv.FormatInt(t.TrackID, 10),
+			Data:       t,
+		})
+	}
+	best := similarity.FindBestSongMatch(candidates, title, artist, album, durationSec, "", "")
+	if best == nil {
+		return nil, nil
+	}
+	matched := best.Candidate.Data.(mxmTrack)
+	meta := map[string]interface{}{
+		"name":        matched.TrackName,
+		"artistName":  matched.ArtistName,
+		"albumName":   matched.AlbumName,
+		"durationMs":  int64(matched.TrackLength * 1000),
+		"isrc":        matched.TrackISRC,
+		"id":          strconv.FormatInt(matched.TrackID, 10),
+		"songwriters": matched.WriterList,
+		"source":      "Musixmatch",
+	}
+	return meta, nil
+}

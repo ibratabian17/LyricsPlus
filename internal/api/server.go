@@ -104,9 +104,12 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 
 	lyricsH := &handlers.Lyrics{Service: svc, Logger: lg, KpoeInfo: "lyricsplus"}
 	catalogH := &handlers.Catalog{
+		Store:      store,
 		AppleMusic: providerSet.AppleMusic,
 		Spotify:    providerSet.Spotify,
 		Musixmatch: providerSet.Musixmatch,
+		Deezer:     providerSet.Deezer,
+		QQMusic:    providerSet.QQMusic,
 		Logger:     lg,
 	}
 	powH := &handlers.Pow{

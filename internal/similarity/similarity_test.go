@@ -119,3 +119,26 @@ func contains(xs []string, v string) bool {
 	}
 	return false
 }
+
+func TestCatalogQuerySimilarity(t *testing.T) {
+	// Exact title query should score highest
+	s1 := CatalogQuerySimilarity("Sahabat", "Nasyid Gontor", "", "Sahabat")
+	s2 := CatalogQuerySimilarity("Sahabat Sejati", "Sheila On 7", "", "Sahabat")
+	if s1 <= s2 {
+		t.Errorf("exact title match (%f) should outscore partial title match (%f)", s1, s2)
+	}
+
+	// Title + Artist query
+	s3 := CatalogQuerySimilarity("Sahabat", "Nasyid Gontor", "", "Sahabat Nasyid Gontor")
+	s4 := CatalogQuerySimilarity("Sahabat", "Peterpan", "", "Sahabat Nasyid Gontor")
+	if s3 <= s4 {
+		t.Errorf("matching title+artist (%f) should outscore different artist (%f)", s3, s4)
+	}
+
+	// Query with version penalty
+	sClean := CatalogQuerySimilarity("Bohemian Rhapsody", "Queen", "A Night at the Opera", "Bohemian Rhapsody")
+	sLive := CatalogQuerySimilarity("Bohemian Rhapsody (Live at Wembley)", "Queen", "Live at Wembley", "Bohemian Rhapsody")
+	if sClean <= sLive {
+		t.Errorf("clean studio title (%f) should outscore live version (%f) when query is clean", sClean, sLive)
+	}
+}
