@@ -74,6 +74,9 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 	}
 
 	qapleSvc := NewQapleService(qq, apple, mxm)
+	if store != nil {
+		qapleSvc.SetStore(store)
+	}
 	lp := NewLyricsPlus(client)
 	lp.SetQaple(qapleSvc)
 	if store != nil {

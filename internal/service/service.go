@@ -168,7 +168,7 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 		resp.Cached = domain.CacheNone
 	}
 
-	if s.Store != nil && resp.RawData != "" && res.Source != "qaple" && !strings.Contains(resp.Metadata.Source, "with QQ") {
+	if s.Store != nil && (resp.RawData != "" || res.Source == "qaple" || strings.Contains(resp.Metadata.Source, "with QQ")) {
 		title := q.Title
 		artist := q.Artist
 		album := q.Album

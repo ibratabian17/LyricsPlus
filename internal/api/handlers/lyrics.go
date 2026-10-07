@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -162,6 +163,16 @@ func (h *Lyrics) GetV2(w http.ResponseWriter, r *http.Request) {
 			h.writeNotFound(w, start, nf)
 			return
 		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.Context().Err() != nil {
+			h.writeNotFound(w, start, &service.NotFoundError{
+				Message:    "Lyrics not found: request timed out or was canceled",
+				SongTitle:  p.query.Title,
+				SongArtist: p.query.Artist,
+				SongAlbum:  p.query.Album,
+				TotalMs:    time.Since(start).Milliseconds(),
+			})
+			return
+		}
 		if h.logFetch(r, "v2", p.query, start, resp, err) {
 			w.Header().Set("Cache-Control", cacheControlNoStore)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "Internal Server Error"})
@@ -191,6 +202,16 @@ func (h *Lyrics) GetV1(w http.ResponseWriter, r *http.Request) {
 		var nf *service.NotFoundError
 		if errors.As(err, &nf) {
 			h.writeNotFound(w, start, nf)
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.Context().Err() != nil {
+			h.writeNotFound(w, start, &service.NotFoundError{
+				Message:    "Lyrics not found: request timed out or was canceled",
+				SongTitle:  p.query.Title,
+				SongArtist: p.query.Artist,
+				SongAlbum:  p.query.Album,
+				TotalMs:    time.Since(start).Milliseconds(),
+			})
 			return
 		}
 		if h.logFetch(r, "v1", p.query, start, resp, err) {
@@ -236,6 +257,16 @@ func (h *Lyrics) GetTTML(w http.ResponseWriter, r *http.Request) {
 		var nf *service.NotFoundError
 		if errors.As(err, &nf) {
 			h.writeNotFound(w, start, nf)
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.Context().Err() != nil {
+			h.writeNotFound(w, start, &service.NotFoundError{
+				Message:    "Lyrics not found: request timed out or was canceled",
+				SongTitle:  p.query.Title,
+				SongArtist: p.query.Artist,
+				SongAlbum:  p.query.Album,
+				TotalMs:    time.Since(start).Milliseconds(),
+			})
 			return
 		}
 		if h.logFetch(r, "ttml", p.query, start, resp, err) {
@@ -288,6 +319,16 @@ func (h *Lyrics) GetRaw(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			h.writeNotFound(w, start, nf)
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.Context().Err() != nil {
+			h.writeNotFound(w, start, &service.NotFoundError{
+				Message:    "Lyrics not found: request timed out or was canceled",
+				SongTitle:  p.query.Title,
+				SongArtist: p.query.Artist,
+				SongAlbum:  p.query.Album,
+				TotalMs:    time.Since(start).Milliseconds(),
+			})
 			return
 		}
 		h.logf("raw fetch failed: %v", err)

@@ -792,6 +792,16 @@ func buildSearchQueries(title, artist, album string) []string {
 		add(a + " " + t)
 	}
 
+	// Split multi-artists (e.g. "Jung Kook & BTS" -> "Jung Kook")
+	parts := regexp.MustCompile(`(?i)\s*(?:&|and|feat\.?|ft\.?|featuring|with|,)\s*`).Split(a, -1)
+	if len(parts) > 1 {
+		primary := strings.TrimSpace(parts[0])
+		if primary != "" && t != "" {
+			add(t + " " + primary)
+			add(primary + " " + t)
+		}
+	}
+
 	if t != "" {
 		add(t)
 	}

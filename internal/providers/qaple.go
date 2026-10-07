@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"regexp"
@@ -10,7 +11,9 @@ import (
 	"unicode"
 
 	"lyricsplus/backend/internal/domain"
+	"lyricsplus/backend/internal/parsers"
 	"lyricsplus/backend/internal/similarity"
+	"lyricsplus/backend/internal/storage"
 )
 
 const (
@@ -41,6 +44,7 @@ type QapleService struct {
 	qqSource LineSource
 	apple    LineSource
 	mxm      LineSource
+	store    *storage.Store
 }
 
 func NewQapleService(qq, apple, mxm LineSource) *QapleService {
@@ -49,6 +53,49 @@ func NewQapleService(qq, apple, mxm LineSource) *QapleService {
 		apple:    apple,
 		mxm:      mxm,
 	}
+}
+
+func (s *QapleService) SetStore(st *storage.Store) {
+	s.store = st
+}
+
+func parseStoredQQ(row *storage.Row, content []byte) *domain.LyricsResponse {
+	trimmedRaw := strings.TrimSpace(string(content))
+	if strings.HasPrefix(trimmedRaw, "<") {
+		p := parsers.ParseQQQRC(trimmedRaw, parsers.ExactMetadata{
+			Title:      row.Title,
+			Artist:     row.Artist,
+			DurationMs: row.DurationMS,
+			PlatformID: row.PlatformID,
+		})
+		if p != nil && len(p.Lyrics) > 0 {
+			return parsers.NormalizeV2(p)
+		}
+	}
+	var resp domain.LyricsResponse
+	if json.Unmarshal(content, &resp) == nil && len(resp.Lyrics) > 0 {
+		return parsers.NormalizeV2(&resp)
+	}
+	return nil
+}
+
+func parseStoredLine(row *storage.Row, content []byte) *domain.LyricsResponse {
+	trimmedRaw := strings.TrimSpace(string(content))
+	if strings.HasPrefix(trimmedRaw, "<") {
+		if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
+			return parsers.NormalizeV2(p)
+		}
+	}
+	if strings.EqualFold(row.Source, "musixmatch") || strings.EqualFold(row.Source, "musixmatch-word") {
+		if p, err := parsers.ConvertMusixmatchToJSON(content, false); err == nil && p != nil && len(p.Lyrics) > 0 {
+			return parsers.NormalizeV2(p)
+		}
+	}
+	var resp domain.LyricsResponse
+	if json.Unmarshal(content, &resp) == nil && len(resp.Lyrics) > 0 {
+		return parsers.NormalizeV2(&resp)
+	}
+	return nil
 }
 
 func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
@@ -69,11 +116,31 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 	lineCh := make(chan fetchResult, 1)
 
 	go func() {
+		if !q.ForceReload && s.store != nil {
+			if row, content, err := s.store.GetRowForSources(qapleCtx, q, "qq"); err == nil && row != nil && len(content) > 0 {
+				if resp := parseStoredQQ(row, content); resp != nil && len(resp.Lyrics) > 0 {
+					qqCh <- fetchResult{resp: resp, source: "QQ (DB)", err: nil}
+					return
+				}
+			}
+		}
 		resp, err := s.qqSource.FetchLyrics(qapleCtx, q)
 		qqCh <- fetchResult{resp: resp, source: "QQ", err: err}
 	}()
 
 	go func() {
+		if !q.ForceReload && s.store != nil {
+			if row, content, err := s.store.GetRowForSources(qapleCtx, q, "apple", "musixmatch", "musixmatch-word"); err == nil && row != nil && len(content) > 0 {
+				if resp := parseStoredLine(row, content); resp != nil && len(resp.Lyrics) > 0 {
+					src := "Apple (DB)"
+					if strings.HasPrefix(strings.ToLower(row.Source), "musixmatch") {
+						src = "Musixmatch (DB)"
+					}
+					lineCh <- fetchResult{resp: resp, source: src, err: nil}
+					return
+				}
+			}
+		}
 		if s.apple != nil {
 			resp, err := s.apple.FetchLyrics(qapleCtx, q)
 			if err == nil && resp != nil && len(resp.Lyrics) > 0 {
@@ -106,7 +173,8 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 		return nil, nil
 	}
 
-	merged.Metadata.Source = fmt.Sprintf("Lyrics+ (via %s with QQ)", lineRes.source)
+	cleanLineSource := strings.TrimSuffix(lineRes.source, " (DB)")
+	merged.Metadata.Source = fmt.Sprintf("Lyrics+ (via %s with QQ)", cleanLineSource)
 	merged.Cached = domain.CacheNone
 	winner := "qaple"
 	if merged.ProcessingTime == nil {
@@ -168,7 +236,7 @@ func detectQQMode(wordSyncData *domain.LyricsResponse) string {
 	return "word"
 }
 
-var nonWordPunct = regexp.MustCompile(`[^\w\s']`)
+var nonWordPunct = regexp.MustCompile(`[^\pL\pN\s']`)
 var leadingApostrophe = regexp.MustCompile(`(^|\s)'+`)
 var multiSpace = regexp.MustCompile(`\s+`)
 

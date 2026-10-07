@@ -827,3 +827,101 @@ func (s *Store) GetMetadata(ctx context.Context, title, artist, album string, du
 	}
 	return meta, nil
 }
+
+// GetRowForSources searches the store for a lyrics row matching the query and matching any of the specified targetSources.
+func (s *Store) GetRowForSources(ctx context.Context, q domain.SearchQuery, targetSources ...string) (*Row, []byte, error) {
+	if s == nil {
+		return nil, nil, nil
+	}
+	matchSource := func(src string) bool {
+		if len(targetSources) == 0 {
+			return true
+		}
+		for _, ts := range targetSources {
+			if strings.EqualFold(src, ts) {
+				return true
+			}
+			if strings.EqualFold(ts, "apple") && (strings.EqualFold(src, "apple music") || strings.EqualFold(src, "apple")) {
+				return true
+			}
+			if strings.EqualFold(ts, "qq") && (strings.EqualFold(src, "qq music") || strings.EqualFold(src, "qq") || strings.EqualFold(src, "qqmusic")) {
+				return true
+			}
+			if strings.EqualFold(ts, "musixmatch") && (strings.EqualFold(src, "musixmatch") || strings.EqualFold(src, "musixmatch-word")) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var candidateRows []*Row
+	if q.ISRC != "" || q.PlatformID != "" {
+		if r, ok := s.GetExact(ctx, q.ISRC, q.PlatformID); ok && r != nil {
+			if matchSource(r.Source) {
+				candidateRows = append(candidateRows, r)
+			}
+		}
+	}
+
+	if q.Title != "" && q.Artist != "" {
+		if rows, ok := s.GetByTitleArtist(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
+			for _, r := range rows {
+				if matchSource(r.Source) {
+					candidateRows = append(candidateRows, r)
+				}
+			}
+		}
+	}
+
+	if len(candidateRows) == 0 && (q.Title != "" || q.Artist != "") {
+		if rows, ok := s.GetByFTS5(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
+			for _, r := range rows {
+				if matchSource(r.Source) {
+					candidateRows = append(candidateRows, r)
+				}
+			}
+		}
+	}
+
+	if len(candidateRows) == 0 {
+		return nil, nil, nil
+	}
+
+	var bestRow *Row
+	if len(candidateRows) == 1 {
+		bestRow = candidateRows[0]
+	} else {
+		var candidates []similarity.SongCandidate
+		for _, r := range candidateRows {
+			candidates = append(candidates, similarity.SongCandidate{
+				Title:      r.Title,
+				Artist:     r.Artist,
+				DurationMs: r.DurationMS,
+				ISRC:       r.ISRC,
+				PlatformID: r.PlatformID,
+				Data:       r,
+			})
+		}
+		durationSec := float64(q.Duration) / 1000.0
+		best := similarity.FindBestSongMatch(candidates, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
+		if best != nil {
+			bestRow = best.Candidate.Data.(*Row)
+		} else {
+			bestRow = candidateRows[0]
+		}
+	}
+
+	if bestRow == nil {
+		return nil, nil, nil
+	}
+
+	content := bestRow.ContentJSON
+	if len(content) == 0 {
+		c, err := s.GetContent(ctx, bestRow.ID)
+		if err == nil {
+			content = c
+		}
+	}
+
+	return bestRow, content, nil
+}

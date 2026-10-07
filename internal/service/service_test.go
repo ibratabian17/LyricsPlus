@@ -440,7 +440,7 @@ func (f *fakeQapleSource) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	}, nil
 }
 
-func TestQapleResultNotSavedToStore(t *testing.T) {
+func TestQapleResultSavedToStore(t *testing.T) {
 	st, err := storage.NewStore(config.Storage{DBPath: filepath.Join(t.TempDir(), "cache.db"), LRUSize: 64})
 	if err != nil {
 		t.Fatalf("new store: %v", err)
@@ -468,7 +468,8 @@ func TestQapleResultNotSavedToStore(t *testing.T) {
 
 	time.Sleep(100 * time.Millisecond)
 
-	if rows, ok := st.GetByTitleArtist(context.Background(), "Qaple Song", "Qaple Artist"); ok && len(rows) > 0 {
-		t.Fatalf("expected Qaple results NOT to be saved to Store, but found %d rows: %+v", len(rows), rows)
+	rows, ok := st.GetByTitleArtist(context.Background(), "Qaple Song", "Qaple Artist")
+	if !ok || len(rows) == 0 {
+		t.Fatalf("expected Qaple results to be saved to Store, but found 0 rows")
 	}
 }
