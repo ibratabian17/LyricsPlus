@@ -303,6 +303,9 @@ func TestHealthAndReady(t *testing.T) {
 	if body["status"] != "ok" || body["database"] != "ok" {
 		t.Fatalf("unexpected health body: %v", body)
 	}
+	if bd, ok := body["buildDate"].(string); !ok || bd == "" {
+		t.Fatalf("expected non-empty buildDate in health body, got %v", body["buildDate"])
+	}
 
 	rec = doGet(t, router, "/readyz")
 	if rec.Code != http.StatusOK {

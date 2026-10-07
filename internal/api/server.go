@@ -119,7 +119,12 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		AllowSubmissions: cfg.LyricsPlus.AllowSubmissions,
 		Logger:           lg,
 	}
-	healthH := &handlers.Health{Store: store, Started: time.Now(), Version: version.Version}
+	healthH := &handlers.Health{
+		Store:     store,
+		Started:   time.Now(),
+		Version:   version.Version,
+		BuildDate: version.BuildDate,
+	}
 
 	var dumper *storage.Dumper
 	if cfg.GDrive.DailyDumpEnabled {

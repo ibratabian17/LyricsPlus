@@ -14,9 +14,10 @@ type StorePinger interface {
 }
 
 type Health struct {
-	Store   StorePinger
-	Started time.Time
-	Version string
+	Store     StorePinger
+	Started   time.Time
+	Version   string
+	BuildDate string
 }
 
 func (h *Health) Handle(w http.ResponseWriter, r *http.Request) {
@@ -34,6 +35,10 @@ func (h *Health) write(w http.ResponseWriter, r *http.Request, ready bool) {
 	versionStr := h.Version
 	if versionStr == "" {
 		versionStr = version.Version
+	}
+	buildDateStr := h.BuildDate
+	if buildDateStr == "" {
+		buildDateStr = version.BuildDate
 	}
 
 	status := "ok"
@@ -59,7 +64,7 @@ func (h *Health) write(w http.ResponseWriter, r *http.Request, ready bool) {
 		"status":        status,
 		"version":       versionStr,
 		"commit":        version.Commit,
-		"buildDate":     version.BuildDate,
+		"buildDate":     buildDateStr,
 		"uptimeSeconds": int64(time.Since(h.Started).Seconds()),
 		"database":      dbStatus,
 		"requests":      report.Requests,

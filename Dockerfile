@@ -9,12 +9,16 @@ WORKDIR /src
 COPY go.mod go.sum ./
 COPY . .
 
-RUN CGO_ENABLED=0 go build -trimpath \
-    -ldflags "-s -w \
-      -X lyricsplus/backend/internal/version.Version=${VERSION} \
-      -X lyricsplus/backend/internal/version.Commit=${COMMIT} \
-      -X lyricsplus/backend/internal/version.BuildDate=${BUILD_DATE}" \
-    -o /out/server ./cmd/server
+RUN set -e; \
+    if [ -z "$BUILD_DATE" ] || [ "$BUILD_DATE" = "unknown" ]; then \
+        BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+    fi; \
+    CGO_ENABLED=0 go build -trimpath \
+        -ldflags "-s -w \
+          -X lyricsplus/backend/internal/version.Version=${VERSION} \
+          -X lyricsplus/backend/internal/version.Commit=${COMMIT} \
+          -X lyricsplus/backend/internal/version.BuildDate=${BUILD_DATE}" \
+        -o /out/server ./cmd/server
 
 FROM alpine:3.20
 
