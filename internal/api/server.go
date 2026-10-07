@@ -201,7 +201,10 @@ func (s *Server) Start() error {
 		WriteTimeout:      60 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
-	s.logger.Infof("lyricsplus serving on :%s (version=%s, commit=%s)", s.cfg.Server.Addr, version.Version, version.Commit)
+	s.logger.Infof("lyricsplus serving on :%s (version=%s, commit=%s, buildDate=%s)", s.cfg.Server.Addr, version.Version, version.Commit, version.BuildDate)
+	if version.BuildDate == "unknown" || version.Commit == "none" {
+		s.logger.Warnf("build metadata incomplete: buildDate=%s, commit=%s (consider building with build args or inside a git repository)", version.BuildDate, version.Commit)
+	}
 	return s.httpSrv.ListenAndServe()
 }
 
