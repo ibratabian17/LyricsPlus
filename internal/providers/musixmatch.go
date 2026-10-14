@@ -17,6 +17,8 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/logger"
@@ -34,8 +36,26 @@ const (
 	androidUserAgent    = "Dalvik/2.1.0 (Linux; U; Android 16; Pixel 8 Pro Build/BP31.250502.008)"
 	mxmDefaultWebCookie = "AWSELB=55578B011601B1EF8BC274C33F9043CA947F99DCFF0A80541772015CA2B39C35C0F9E1C932D31725A7310BCAEB0C37431E024E2B45320B7F2C84490C2C97351FDE34690157"
 	mxmDefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-	mxmTokenExpiry      = 10 * time.Minute
+	mxmTokenExpiry      = 45 * time.Minute
+	mxmSearchCacheTTL   = 5 * time.Minute
 )
+
+type mxmTrackCacheEntry struct {
+	tracks  []mxmTrack
+	track   *mxmTrack
+	created time.Time
+}
+
+type mxmSharedState struct {
+	mgm            *AccountManager[config.MusixmatchAccount]
+	webMu          sync.RWMutex
+	webTok         map[int]cachedWebToken
+	cookieDisabled map[int]bool
+	androidMu      sync.Mutex
+	android        map[int]*mxmAndroidState
+	searchCache    *lru.Cache[string, *mxmTrackCacheEntry]
+	richsyncCache  *lru.Cache[int64, json.RawMessage]
+}
 
 type MusixmatchProvider struct {
 	client *proxy.Client
@@ -43,24 +63,23 @@ type MusixmatchProvider struct {
 	word   bool
 	mgm    *AccountManager[config.MusixmatchAccount]
 	logger *logger.Logger
-
-	webMu     sync.RWMutex
-	webTok    map[int]cachedWebToken
-	androidMu sync.Mutex
-	android   map[int]*mxmAndroidState
+	state  *mxmSharedState
 }
 
 type cachedWebToken struct {
-	token   string
-	expires time.Time
+	token     string
+	expires   time.Time
+	failUntil time.Time
 }
 
 type mxmAndroidState struct {
 	currentToken string
 	isLoggedIn   bool
 	expiresAt    time.Time
+	failUntil    time.Time
 	initializing bool
 	initDoneCh   chan struct{}
+	initErr      error
 }
 
 func NewMusixmatch(client *proxy.Client) *MusixmatchProvider {
@@ -81,15 +100,32 @@ func NewMusixmatchWithConfig(client *proxy.Client, cfg config.Provider, pname st
 			USER_AGENT: cfg.MusixmatchUserAgent,
 		}}
 	}
-	p := &MusixmatchProvider{
-		client:  client,
-		name:    pname,
-		word:    word,
-		mgm:     newAccountManager(accounts),
-		webTok:  map[int]cachedWebToken{},
-		android: map[int]*mxmAndroidState{},
+	mgm := newAccountManager(accounts)
+	sc, _ := lru.New[string, *mxmTrackCacheEntry](1024)
+	rc, _ := lru.New[int64, json.RawMessage](512)
+	st := &mxmSharedState{
+		mgm:            mgm,
+		webTok:         map[int]cachedWebToken{},
+		cookieDisabled: map[int]bool{},
+		android:        map[int]*mxmAndroidState{},
+		searchCache:    sc,
+		richsyncCache:  rc,
 	}
-	return p
+	return &MusixmatchProvider{
+		client: client,
+		name:   pname,
+		word:   word,
+		mgm:    mgm,
+		state:  st,
+	}
+}
+
+func (p *MusixmatchProvider) ShareStateFrom(other *MusixmatchProvider) {
+	if p == nil || other == nil || other.state == nil {
+		return
+	}
+	p.state = other.state
+	p.mgm = other.mgm
 }
 
 func (p *MusixmatchProvider) SetLogger(lg *logger.Logger) { p.logger = lg }
@@ -136,16 +172,24 @@ func (p *MusixmatchProvider) Configured() bool {
 }
 
 func (p *MusixmatchProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
+	if !p.Configured() {
+		return nil, nil
+	}
 	startIdx := p.mgm.CurrentIndex()
 	accountIdx := startIdx
-	for {
+	tried := 0
+	total := p.mgm.Count()
+	for tried < total {
+		tried++
 		res, err := p.fetchLyricsWithAccount(ctx, q, accountIdx)
 		if err == nil && res != nil {
 			return res, nil
 		}
-		if err != nil {
-			p.debugf("musixmatch account %d error: %v, rotating", accountIdx, err)
+		if err == nil && res == nil {
+			return nil, nil
 		}
+		p.debugf("musixmatch account %d error: %v, rotating", accountIdx, err)
+		p.mgm.MarkBad(accountIdx, 20*time.Second)
 		next, hasNext := p.mgm.Next(accountIdx)
 		if !hasNext || next == startIdx {
 			break
@@ -159,12 +203,23 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 	var matchedTrack *mxmTrack
 
 	if q.ISRC != "" {
-		tr, err := p.searchMatcher(ctx, url.Values{"q_track_isrc": {q.ISRC}}, accountIdx)
-		if err == nil && tr != nil && tr.TrackID != 0 {
-			matchedTrack = tr
-			p.debugf("ISRC search isrc:%s matched track %d", q.ISRC, tr.TrackID)
-		} else if err != nil {
-			p.debugf("ISRC search isrc:%s failed (err=%v)", q.ISRC, err)
+		isrcKey := "isrc:" + strings.ToLower(strings.TrimSpace(q.ISRC))
+		if p.state.searchCache != nil {
+			if cached, ok := p.state.searchCache.Get(isrcKey); ok && cached != nil && time.Since(cached.created) < mxmSearchCacheTTL {
+				matchedTrack = cached.track
+			}
+		}
+		if matchedTrack == nil {
+			tr, err := p.searchMatcher(ctx, url.Values{"q_track_isrc": {q.ISRC}}, accountIdx)
+			if err == nil && tr != nil && tr.TrackID != 0 {
+				matchedTrack = tr
+				if p.state.searchCache != nil {
+					p.state.searchCache.Add(isrcKey, &mxmTrackCacheEntry{track: tr, created: time.Now()})
+				}
+				p.debugf("ISRC search isrc:%s matched track %d", q.ISRC, tr.TrackID)
+			} else if err != nil {
+				p.debugf("ISRC search isrc:%s failed (err=%v)", q.ISRC, err)
+			}
 		}
 	}
 
@@ -308,22 +363,35 @@ func (p *MusixmatchProvider) getUserToken(ctx context.Context, accountIdx int) (
 		return "", err
 	}
 
-	p.webMu.RLock()
-	if t, ok := p.webTok[accountIdx]; ok && time.Now().Before(t.expires) {
-		p.webMu.RUnlock()
-		return t.token, nil
-	}
-	p.webMu.RUnlock()
+	now := time.Now()
+	p.state.webMu.RLock()
+	t, hasTok := p.state.webTok[accountIdx]
+	cookieDisabled := p.state.cookieDisabled[accountIdx]
+	p.state.webMu.RUnlock()
 
-	if tok := extractTokenFromCookie(acc.COOKIE); tok != "" {
-		p.webMu.Lock()
-		p.webTok[accountIdx] = cachedWebToken{token: tok, expires: time.Now().Add(time.Hour)}
-		p.webMu.Unlock()
-		return tok, nil
+	if hasTok {
+		if t.token != "" && now.Before(t.expires) {
+			return t.token, nil
+		}
+		if now.Before(t.failUntil) {
+			return "", fmt.Errorf("musixmatch: web token in cooldown")
+		}
+	}
+
+	if !cookieDisabled {
+		if tok := extractTokenFromCookie(acc.COOKIE); tok != "" {
+			p.state.webMu.Lock()
+			p.state.webTok[accountIdx] = cachedWebToken{token: tok, expires: time.Now().Add(time.Hour)}
+			p.state.webMu.Unlock()
+			return tok, nil
+		}
 	}
 
 	raw, err := p.webRawRequest(ctx, "token.get", nil, accountIdx)
 	if err != nil {
+		p.state.webMu.Lock()
+		p.state.webTok[accountIdx] = cachedWebToken{failUntil: time.Now().Add(15 * time.Second)}
+		p.state.webMu.Unlock()
 		return "", err
 	}
 	var res struct {
@@ -338,13 +406,23 @@ func (p *MusixmatchProvider) getUserToken(ctx context.Context, accountIdx int) (
 	}
 	tok := res.Message.Body.UserToken
 	if tok == "" || strings.Contains(tok, "UpgradeOnly") {
+		p.state.webMu.Lock()
+		p.state.webTok[accountIdx] = cachedWebToken{failUntil: time.Now().Add(30 * time.Second)}
+		p.state.webMu.Unlock()
 		return "", fmt.Errorf("musixmatch: invalid user token")
 	}
 
-	p.webMu.Lock()
-	p.webTok[accountIdx] = cachedWebToken{token: tok, expires: time.Now().Add(time.Hour)}
-	p.webMu.Unlock()
+	p.state.webMu.Lock()
+	p.state.webTok[accountIdx] = cachedWebToken{token: tok, expires: time.Now().Add(mxmTokenExpiry)}
+	p.state.webMu.Unlock()
 	return tok, nil
+}
+
+func (p *MusixmatchProvider) invalidateWebToken(accountIdx int) {
+	p.state.webMu.Lock()
+	delete(p.state.webTok, accountIdx)
+	p.state.cookieDisabled[accountIdx] = true
+	p.state.webMu.Unlock()
 }
 
 func (p *MusixmatchProvider) makeWebRequest(ctx context.Context, endpoint string, params url.Values, accountIdx int) (json.RawMessage, error) {
@@ -361,7 +439,24 @@ func (p *MusixmatchProvider) makeWebRequest(ctx context.Context, endpoint string
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(raw, &statusCheck); err == nil {
+		code := statusCheck.Message.Header.StatusCode
+		if code == 401 || code == 402 {
+			p.invalidateWebToken(accountIdx)
+			if params != nil && params.Get("usertoken") != "" {
+				if newTok, tokErr := p.getUserToken(ctx, accountIdx); tokErr == nil && newTok != "" {
+					params.Set("usertoken", newTok)
+					if retryRaw, retryErr := p.webRawRequest(ctx, endpoint, params, accountIdx); retryErr == nil {
+						if json.Unmarshal(retryRaw, &statusCheck) == nil && statusCheck.Message.Header.StatusCode == 200 {
+							return retryRaw, nil
+						}
+					}
+				}
+			}
+		}
 		if statusCheck.Message.Header.StatusCode != 200 {
+			if statusCheck.Message.Header.StatusCode == 404 {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("musixmatch web error (%d): %s",
 				statusCheck.Message.Header.StatusCode, statusCheck.Message.Header.Hint)
 		}
@@ -384,8 +479,16 @@ func (p *MusixmatchProvider) webRawRequest(ctx context.Context, endpoint string,
 
 	headers := make(http.Header)
 	headers.Set("authority", "apic-desktop.musixmatch.com")
-	headers.Set("User-Agent", acc.USER_AGENT)
-	headers.Set("Cookie", acc.COOKIE)
+	ua := acc.USER_AGENT
+	if ua == "" {
+		ua = mxmDefaultUserAgent
+	}
+	headers.Set("User-Agent", ua)
+	if acc.COOKIE != "" {
+		headers.Set("Cookie", acc.COOKIE)
+	} else {
+		headers.Set("Cookie", mxmDefaultWebCookie)
+	}
 	headers.Set("Origin", "https://musixmatch.com")
 
 	resp, err := p.client.Get(ctx, reqURL, headers)
@@ -418,7 +521,7 @@ func (p *MusixmatchProvider) webTrackSearch(ctx context.Context, query string, a
 	vals.Set("usertoken", userToken)
 
 	raw, err := p.makeWebRequest(ctx, "track.search", vals, accountIdx)
-	if err != nil {
+	if err != nil || raw == nil {
 		return nil, err
 	}
 
@@ -451,7 +554,7 @@ func (p *MusixmatchProvider) searchMatcher(ctx context.Context, params url.Value
 			defaults[k] = v
 		}
 		raw, err := p.androidRequest(ctx, "matcher.track.get", defaults, nil, accountIdx)
-		if err != nil {
+		if err != nil || raw == nil {
 			return nil, err
 		}
 		var res struct {
@@ -486,7 +589,7 @@ func (p *MusixmatchProvider) searchMatcher(ctx context.Context, params url.Value
 	}
 	params.Set("usertoken", userToken)
 	raw, err := p.makeWebRequest(ctx, "matcher.track.get", params, accountIdx)
-	if err != nil {
+	if err != nil || raw == nil {
 		return nil, err
 	}
 
@@ -504,51 +607,64 @@ func (p *MusixmatchProvider) searchMatcher(ctx context.Context, params url.Value
 }
 
 func (p *MusixmatchProvider) SearchTrack(ctx context.Context, query string) ([]mxmTrack, error) {
-	return p.searchTrack(ctx, query, 0)
+	return p.searchTrack(ctx, query, p.mgm.CurrentIndex())
 }
 
 func (p *MusixmatchProvider) searchTrack(ctx context.Context, query string, accountIdx int) ([]mxmTrack, error) {
-	if !p.isAndroid(accountIdx) {
-		return p.webTrackSearch(ctx, query, accountIdx)
-	}
-	if strings.TrimSpace(query) == "" {
+	cleanQ := strings.ToLower(strings.TrimSpace(query))
+	if cleanQ == "" {
 		return nil, nil
 	}
-	params := url.Values{
-		"q":                 {query},
-		"part":              {"track_artist,artist_image"},
-		"track_fields_set":  {"android_track_list"},
-		"artist_fields_set": {"android_track_list_artist"},
-		"page":              {"1"},
-		"page_size":         {"5"},
-	}
-	raw, err := p.androidRequest(ctx, "macro.search", params, nil, accountIdx)
-	if err != nil {
-		return nil, err
+	cacheKey := "q:" + cleanQ
+	if p.state.searchCache != nil {
+		if entry, ok := p.state.searchCache.Get(cacheKey); ok && entry != nil && time.Since(entry.created) < mxmSearchCacheTTL {
+			return entry.tracks, nil
+		}
 	}
 
-	var res struct {
-		Message struct {
-			Body struct {
-				MacroResultList struct {
-					TrackList []trackWrapper `json:"track_list"`
-				} `json:"macro_result_list"`
-			} `json:"body"`
-		} `json:"message"`
+	var out []mxmTrack
+	var err error
+	if !p.isAndroid(accountIdx) {
+		out, err = p.webTrackSearch(ctx, query, accountIdx)
+	} else {
+		params := url.Values{
+			"q":                 {query},
+			"part":              {"track_artist,artist_image"},
+			"track_fields_set":  {"android_track_list"},
+			"artist_fields_set": {"android_track_list_artist"},
+			"page":              {"1"},
+			"page_size":         {"5"},
+		}
+		var raw json.RawMessage
+		raw, err = p.androidRequest(ctx, "macro.search", params, nil, accountIdx)
+		if err == nil && raw != nil {
+			var res struct {
+				Message struct {
+					Body struct {
+						MacroResultList struct {
+							TrackList []trackWrapper `json:"track_list"`
+						} `json:"macro_result_list"`
+					} `json:"body"`
+				} `json:"message"`
+			}
+			if uErr := json.Unmarshal(raw, &res); uErr == nil {
+				out = make([]mxmTrack, len(res.Message.Body.MacroResultList.TrackList))
+				for i, tw := range res.Message.Body.MacroResultList.TrackList {
+					out[i] = tw.Track
+				}
+			} else {
+				err = uErr
+			}
+		}
 	}
-	if err := json.Unmarshal(raw, &res); err != nil {
-		return nil, err
+	if err == nil && p.state.searchCache != nil {
+		p.state.searchCache.Add(cacheKey, &mxmTrackCacheEntry{tracks: out, created: time.Now()})
 	}
-
-	out := make([]mxmTrack, len(res.Message.Body.MacroResultList.TrackList))
-	for i, tw := range res.Message.Body.MacroResultList.TrackList {
-		out[i] = tw.Track
-	}
-	return out, nil
+	return out, err
 }
 
 func (p *MusixmatchProvider) SearchBestMatch(ctx context.Context, title, artist, album string, durationSec float64, songISRC string) (*mxmTrack, error) {
-	return p.searchBestMatch(ctx, title, artist, album, durationSec, songISRC, 0)
+	return p.searchBestMatch(ctx, title, artist, album, durationSec, songISRC, p.mgm.CurrentIndex())
 }
 
 func (p *MusixmatchProvider) searchBestMatch(ctx context.Context, title, artist, album string, durationSec float64, songISRC string, accountIdx int) (*mxmTrack, error) {
@@ -563,7 +679,13 @@ func (p *MusixmatchProvider) searchBestMatch(ctx context.Context, title, artist,
 			continue
 		}
 		tracks, err := p.searchTrack(ctx, q, accountIdx)
-		if err == nil && len(tracks) > 0 {
+		if err != nil {
+			if len(candidates) == 0 {
+				return nil, err
+			}
+			continue
+		}
+		if len(tracks) > 0 {
 			if songISRC != "" {
 				for _, tr := range tracks {
 					if strings.EqualFold(tr.TrackISRC, songISRC) {
@@ -572,41 +694,35 @@ func (p *MusixmatchProvider) searchBestMatch(ctx context.Context, title, artist,
 				}
 			}
 			candidates = append(candidates, tracks...)
+			simCandidates := make([]similarity.SongCandidate, len(candidates))
+			for i, c := range candidates {
+				simCandidates[i] = similarity.SongCandidate{
+					Title:      c.TrackName,
+					Artist:     c.ArtistName,
+					Album:      c.AlbumName,
+					DurationMs: c.TrackLength * 1000,
+					ISRC:       c.TrackISRC,
+					PlatformID: strconv.FormatInt(c.TrackID, 10),
+					Data:       i,
+				}
+			}
+			if best := similarity.FindBestSongMatch(simCandidates, title, artist, album, durationSec, songISRC, ""); best != nil {
+				idx := best.Candidate.Data.(int)
+				return &candidates[idx], nil
+			}
 		}
 	}
 
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-
-	simCandidates := make([]similarity.SongCandidate, len(candidates))
-	for i, c := range candidates {
-		simCandidates[i] = similarity.SongCandidate{
-			Title:      c.TrackName,
-			Artist:     c.ArtistName,
-			Album:      c.AlbumName,
-			DurationMs: c.TrackLength * 1000,
-			ISRC:       c.TrackISRC,
-			PlatformID: strconv.FormatInt(c.TrackID, 10),
-			Data:       i,
-		}
-	}
-
-	best := similarity.FindBestSongMatch(simCandidates, title, artist, album, durationSec, songISRC, "")
-	if best == nil {
-		return nil, nil
-	}
-
-	idx := best.Candidate.Data.(int)
-	return &candidates[idx], nil
+	return nil, nil
 }
 
 func (p *MusixmatchProvider) fetchLyricsFromAPI(ctx context.Context, trackID int64, requireWordSync bool, accountIdx int) (json.RawMessage, error) {
 	trackIDStr := strconv.FormatInt(trackID, 10)
 
-	if requireWordSync {
-		params := url.Values{"track_id": {trackIDStr}}
-		return p.fetchRichsync(ctx, params, accountIdx)
+	if p.state.richsyncCache != nil {
+		if cachedRich, ok := p.state.richsyncCache.Get(trackID); ok && len(cachedRich) > 0 {
+			return cachedRich, nil
+		}
 	}
 
 	paramsRich := url.Values{"track_id": {trackIDStr}}
@@ -622,8 +738,15 @@ func (p *MusixmatchProvider) fetchLyricsFromAPI(ctx context.Context, trackID int
 			} `json:"message"`
 		}
 		if json.Unmarshal(richData, &check) == nil && check.Message.Body.Richsync != nil && check.Message.Body.Richsync.RichsyncBody != "" {
+			if p.state.richsyncCache != nil {
+				p.state.richsyncCache.Add(trackID, richData)
+			}
 			return richData, nil
 		}
+	}
+
+	if requireWordSync {
+		return nil, err
 	}
 
 	paramsSub := url.Values{
@@ -658,12 +781,12 @@ func (p *MusixmatchProvider) fetchSubtitle(ctx context.Context, params url.Value
 }
 
 func (p *MusixmatchProvider) androidState(accountIdx int) *mxmAndroidState {
-	p.androidMu.Lock()
-	defer p.androidMu.Unlock()
-	st, ok := p.android[accountIdx]
+	p.state.androidMu.Lock()
+	defer p.state.androidMu.Unlock()
+	st, ok := p.state.android[accountIdx]
 	if !ok {
 		st = &mxmAndroidState{}
-		p.android[accountIdx] = st
+		p.state.android[accountIdx] = st
 	}
 	return st
 }
@@ -742,25 +865,24 @@ func (p *MusixmatchProvider) makeAndroidRequest(ctx context.Context, endpoint st
 	return data, nil
 }
 
-func (p *MusixmatchProvider) initializeAndroid(ctx context.Context, accountIdx int, st *mxmAndroidState) error {
+func (p *MusixmatchProvider) initializeAndroid(ctx context.Context, accountIdx int) (string, error) {
 	acc, err := p.account(accountIdx)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if acc.EMAIL == "" || acc.PASSWORD == "" {
-		return fmt.Errorf("musixmatch: android account requires EMAIL and PASSWORD")
+		return "", fmt.Errorf("musixmatch: android account requires EMAIL and PASSWORD")
 	}
 
 	tokResp, err := p.fetchAndroidToken(ctx, accountIdx)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	st.currentToken = tokResp
-	st.expiresAt = time.Now().Add(mxmTokenExpiry)
-	st.isLoggedIn = false
-
-	return p.androidLogin(ctx, acc.EMAIL, acc.PASSWORD, st)
+	if err := p.androidLoginWithToken(ctx, acc.EMAIL, acc.PASSWORD, tokResp); err != nil {
+		return "", err
+	}
+	return tokResp, nil
 }
 
 func emailLoginBody(email, password string) []byte {
@@ -814,7 +936,15 @@ func createUserLoginBody(email, password string) []byte {
 }
 
 func (p *MusixmatchProvider) androidLogin(ctx context.Context, email, password string, st *mxmAndroidState) error {
-	params := buildAndroidSignedParams("credential.post", url.Values{}, st.currentToken)
+	if err := p.androidLoginWithToken(ctx, email, password, st.currentToken); err != nil {
+		return err
+	}
+	st.isLoggedIn = true
+	return nil
+}
+
+func (p *MusixmatchProvider) androidLoginWithToken(ctx context.Context, email, password, token string) error {
+	params := buildAndroidSignedParams("credential.post", url.Values{}, token)
 	body := emailLoginBody(email, password)
 	raw, err := p.makeAndroidRequest(ctx, "credential.post", params, body)
 	if err != nil {
@@ -834,54 +964,115 @@ func (p *MusixmatchProvider) androidLogin(ctx context.Context, email, password s
 	if data.Message.Header.StatusCode != 200 {
 		return fmt.Errorf("musixmatch: login failed with status %d: %s", data.Message.Header.StatusCode, data.Message.Header.Hint)
 	}
-	st.isLoggedIn = true
 	return nil
 }
 
-func (p *MusixmatchProvider) ensureLoggedIn(ctx context.Context, accountIdx int) error {
-	st := p.androidState(accountIdx)
-
-	if st.currentToken != "" && st.isLoggedIn && st.expiresAt.After(time.Now().Add(30*time.Second)) {
-		return nil
+func (p *MusixmatchProvider) ensureLoggedIn(ctx context.Context, accountIdx int) (string, error) {
+	p.state.androidMu.Lock()
+	st, ok := p.state.android[accountIdx]
+	if !ok {
+		st = &mxmAndroidState{}
+		p.state.android[accountIdx] = st
+	}
+	now := time.Now()
+	if st.currentToken != "" && st.isLoggedIn && st.expiresAt.After(now.Add(30*time.Second)) {
+		tok := st.currentToken
+		p.state.androidMu.Unlock()
+		return tok, nil
+	}
+	if now.Before(st.failUntil) {
+		p.state.androidMu.Unlock()
+		return "", fmt.Errorf("musixmatch: android account in cooldown")
+	}
+	if st.initializing {
+		waitCh := st.initDoneCh
+		p.state.androidMu.Unlock()
+		select {
+		case <-waitCh:
+			p.state.androidMu.Lock()
+			tok := st.currentToken
+			err := st.initErr
+			p.state.androidMu.Unlock()
+			return tok, err
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
 
 	st.initializing = true
-	err := p.initializeAndroid(ctx, accountIdx, st)
+	doneCh := make(chan struct{})
+	st.initDoneCh = doneCh
+	st.initErr = nil
+	p.state.androidMu.Unlock()
+
+	initCtx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	tok, err := p.initializeAndroid(initCtx, accountIdx)
+	cancel()
+
+	p.state.androidMu.Lock()
 	st.initializing = false
-	return err
+	st.initErr = err
+	if err == nil && tok != "" {
+		st.currentToken = tok
+		st.isLoggedIn = true
+		st.expiresAt = time.Now().Add(mxmTokenExpiry)
+		st.failUntil = time.Time{}
+	} else {
+		st.currentToken = ""
+		st.isLoggedIn = false
+		st.failUntil = time.Now().Add(20 * time.Second)
+	}
+	close(doneCh)
+	p.state.androidMu.Unlock()
+
+	return tok, err
 }
 
 func (p *MusixmatchProvider) androidRequest(ctx context.Context, endpoint string, params url.Values, body []byte, accountIdx int) (json.RawMessage, error) {
-	if err := p.ensureLoggedIn(ctx, accountIdx); err != nil {
+	tok, err := p.ensureLoggedIn(ctx, accountIdx)
+	if err != nil {
 		return nil, err
 	}
-	st := p.androidState(accountIdx)
 
-	signed := buildAndroidSignedParams(endpoint, params, st.currentToken)
+	signed := buildAndroidSignedParams(endpoint, params, tok)
 	raw, err := p.makeAndroidRequest(ctx, endpoint, signed, body)
 	if err == nil {
 		var data struct {
 			Message struct {
 				Header struct {
-					StatusCode int `json:"status_code"`
+					StatusCode int    `json:"status_code"`
+					Hint       string `json:"hint"`
 				} `json:"header"`
 			} `json:"message"`
 		}
 
-		if json.Unmarshal(raw, &data) == nil && data.Message.Header.StatusCode != 401 {
-			return raw, nil
+		if json.Unmarshal(raw, &data) == nil {
+			code := data.Message.Header.StatusCode
+			if code == 200 {
+				return raw, nil
+			}
+			if code == 404 {
+				return nil, nil
+			}
+			if code != 401 && code != 402 {
+				return nil, fmt.Errorf("musixmatch android error (%d): %s", code, data.Message.Header.Hint)
+			}
 		}
 	}
 
-	p.androidMu.Lock()
-	st.currentToken = ""
-	st.isLoggedIn = false
-	st.expiresAt = time.Time{}
-	p.androidMu.Unlock()
-	if err := p.ensureLoggedIn(ctx, accountIdx); err != nil {
+	p.state.androidMu.Lock()
+	if st, ok := p.state.android[accountIdx]; ok && st.currentToken == tok {
+		st.currentToken = ""
+		st.isLoggedIn = false
+		st.expiresAt = time.Time{}
+	}
+	p.state.androidMu.Unlock()
+
+	tok, err = p.ensureLoggedIn(ctx, accountIdx)
+	if err != nil {
 		return nil, err
 	}
-	signed = buildAndroidSignedParams(endpoint, params, st.currentToken)
+	signed = buildAndroidSignedParams(endpoint, params, tok)
 	return p.makeAndroidRequest(ctx, endpoint, signed, body)
 }
 

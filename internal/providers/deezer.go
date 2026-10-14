@@ -13,6 +13,9 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+	"golang.org/x/sync/singleflight"
+
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/logger"
@@ -27,14 +30,21 @@ const (
 	deezerDefaultAuthURL    = "https://auth.deezer.com/login/renew?jo=p&rto=c&i=c"
 	deezerDefaultGraphqlURL = "https://pipe.deezer.com/api"
 	deezerDefaultSearchURL  = "https://api.deezer.com/search/track"
+	deezerSearchCacheTTL    = 5 * time.Minute
 )
 
 const deezerDefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36"
 
 type deezerAccountCredentials struct {
-	jwt      string
-	refToken string
-	expires  time.Time
+	jwt       string
+	refToken  string
+	expires   time.Time
+	failUntil time.Time
+}
+
+type deezerSearchCacheEntry struct {
+	tracks  []deezerTrack
+	created time.Time
 }
 
 type DeezerProvider struct {
@@ -45,8 +55,10 @@ type DeezerProvider struct {
 	graphqlURL string
 	searchURL  string
 
-	mu   sync.RWMutex
-	jwts map[int]*deezerAccountCredentials
+	mu          sync.RWMutex
+	jwts        map[int]*deezerAccountCredentials
+	flightGroup singleflight.Group
+	searchCache *lru.Cache[string, *deezerSearchCacheEntry]
 }
 
 func NewDeezer(client *proxy.Client) *DeezerProvider {
@@ -76,13 +88,15 @@ func NewDeezerWithConfig(client *proxy.Client, cfg config.Provider) *DeezerProvi
 		searchURL = deezerDefaultSearchURL
 	}
 
+	sc, _ := lru.New[string, *deezerSearchCacheEntry](1024)
 	return &DeezerProvider{
-		client:     client,
-		mgm:        newAccountManager(accounts),
-		authURL:    authURL,
-		graphqlURL: graphqlURL,
-		searchURL:  searchURL,
-		jwts:       map[int]*deezerAccountCredentials{},
+		client:      client,
+		mgm:         newAccountManager(accounts),
+		authURL:     authURL,
+		graphqlURL:  graphqlURL,
+		searchURL:   searchURL,
+		jwts:        map[int]*deezerAccountCredentials{},
+		searchCache: sc,
 	}
 }
 
@@ -188,7 +202,7 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 		return nil, nil
 	}
 
-	lyricsJSON, err := p.getLyrics(ctx, trackID, p.mgm.CurrentIndex())
+	lyricsJSON, err := p.getLyrics(ctx, trackID, 0)
 	if err != nil || lyricsJSON == nil {
 		p.debugf("lyrics fetch failed for track %s (err=%v)", trackID, err)
 		return nil, nil
@@ -245,11 +259,18 @@ type deezerTrack struct {
 }
 
 func (p *DeezerProvider) SearchTrack(ctx context.Context, query string, limit int) ([]deezerTrack, error) {
-	if strings.TrimSpace(query) == "" {
+	cleanQ := strings.ToLower(strings.TrimSpace(query))
+	if cleanQ == "" {
 		return nil, nil
 	}
 	if limit <= 0 {
 		limit = 10
+	}
+	cacheKey := fmt.Sprintf("%s:%d", cleanQ, limit)
+	if p.searchCache != nil {
+		if entry, ok := p.searchCache.Get(cacheKey); ok && entry != nil && time.Since(entry.created) < deezerSearchCacheTTL {
+			return entry.tracks, nil
+		}
 	}
 
 	reqURL := fmt.Sprintf("%s?q=%s&limit=%d&index=0", p.searchURL, url.QueryEscape(query), limit)
@@ -274,89 +295,116 @@ func (p *DeezerProvider) SearchTrack(ctx context.Context, query string, limit in
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return nil, err
 	}
+	if p.searchCache != nil {
+		p.searchCache.Add(cacheKey, &deezerSearchCacheEntry{tracks: res.Data, created: time.Now()})
+	}
 	return res.Data, nil
 }
 
 func (p *DeezerProvider) authenticate(ctx context.Context, accountIdx int) (string, error) {
-	acc, ok := p.mgm.At(accountIdx)
-	if !ok {
-		return "", fmt.Errorf("deezer: account %d unavailable", accountIdx)
+	if creds, ok := p.cachedCredentials(accountIdx); ok && creds != nil {
+		now := time.Now()
+		if creds.jwt != "" && now.Before(creds.expires) {
+			return creds.jwt, nil
+		}
+		if now.Before(creds.failUntil) {
+			return "", fmt.Errorf("deezer: account %d auth in cooldown", accountIdx)
+		}
 	}
 
-	rawToken := acc.REFRESH_TOKEN
-	isARL := false
-	if rawToken == "" {
-		rawToken = acc.ARL
-		isARL = true
-	}
-	if rawToken == "" {
-		return "", fmt.Errorf("deezer: account %q has no credentials", acc.NAMEID)
-	}
+	sfKey := "dzauth:" + strconv.Itoa(accountIdx)
+	v, err, _ := p.flightGroup.Do(sfKey, func() (any, error) {
+		if creds, ok := p.cachedCredentials(accountIdx); ok && creds != nil && creds.jwt != "" && time.Now().Before(creds.expires) {
+			return creds.jwt, nil
+		}
 
-	cleanToken := strings.TrimSpace(rawToken)
-	cleanToken = strings.TrimPrefix(cleanToken, "refresh-token=")
-	cleanToken = strings.TrimPrefix(cleanToken, "arl=")
+		acc, ok := p.mgm.At(accountIdx)
+		if !ok {
+			return "", fmt.Errorf("deezer: account %d unavailable", accountIdx)
+		}
 
-	var cookieString string
-	if isARL {
-		cookieString = "arl=" + cleanToken
-	} else {
-		cookieString = "refresh-token=" + cleanToken
-	}
+		rawToken := acc.REFRESH_TOKEN
+		isARL := false
+		if rawToken == "" {
+			rawToken = acc.ARL
+			isARL = true
+		}
+		if rawToken == "" {
+			return "", fmt.Errorf("deezer: account %q has no credentials", acc.NAMEID)
+		}
 
-	headers := make(http.Header)
-	headers.Set("User-Agent", deezerDefaultUserAgent)
-	headers.Set("Content-Type", "application/json")
-	headers.Set("Accept", "*/*")
-	headers.Set("Cookie", cookieString)
+		cleanToken := strings.TrimSpace(rawToken)
+		cleanToken = strings.TrimPrefix(cleanToken, "refresh-token=")
+		cleanToken = strings.TrimPrefix(cleanToken, "arl=")
 
-	resp, err := p.client.Post(ctx, p.authURL, headers, []byte("{}"))
-	if err != nil {
-		return "", fmt.Errorf("deezer auth request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
+		var cookieString string
+		if isARL {
+			cookieString = "arl=" + cleanToken
+		} else {
+			cookieString = "refresh-token=" + cleanToken
+		}
 
-	body, err := io.ReadAll(resp.Body)
+		headers := make(http.Header)
+		headers.Set("User-Agent", deezerDefaultUserAgent)
+		headers.Set("Content-Type", "application/json")
+		headers.Set("Accept", "*/*")
+		headers.Set("Cookie", cookieString)
+
+		resp, err := p.client.Post(ctx, p.authURL, headers, []byte("{}"))
+		if err != nil {
+			p.setCredentials(accountIdx, &deezerAccountCredentials{failUntil: time.Now().Add(15 * time.Second)})
+			return "", fmt.Errorf("deezer auth request: %w", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return "", err
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			p.setCredentials(accountIdx, &deezerAccountCredentials{failUntil: time.Now().Add(20 * time.Second)})
+			return "", fmt.Errorf("deezer auth returned status %d: %s", resp.StatusCode, string(body))
+		}
+
+		var authResp struct {
+			JWT          string `json:"jwt"`
+			RefreshToken string `json:"refresh_token"`
+		}
+		if err := json.Unmarshal(body, &authResp); err != nil {
+			return "", fmt.Errorf("parse deezer auth: %w", err)
+		}
+
+		if authResp.JWT == "" {
+			p.setCredentials(accountIdx, &deezerAccountCredentials{failUntil: time.Now().Add(20 * time.Second)})
+			return "", fmt.Errorf("deezer auth returned empty jwt for account %q", acc.NAMEID)
+		}
+
+		newRefToken := authResp.RefreshToken
+		for _, cookie := range resp.Header["Set-Cookie"] {
+			if rest, ok := strings.CutPrefix(cookie, "refresh-token="); ok {
+				if semicolon := strings.Index(rest, ";"); semicolon >= 0 {
+					rest = rest[:semicolon]
+				}
+				newRefToken = rest
+				break
+			}
+		}
+		if newRefToken == "" {
+			newRefToken = rawToken
+		}
+
+		p.setCredentials(accountIdx, &deezerAccountCredentials{
+			jwt:      authResp.JWT,
+			refToken: newRefToken,
+			expires:  time.Now().Add(50 * time.Minute),
+		})
+		return authResp.JWT, nil
+	})
 	if err != nil {
 		return "", err
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("deezer auth returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var authResp struct {
-		JWT          string `json:"jwt"`
-		RefreshToken string `json:"refresh_token"`
-	}
-	if err := json.Unmarshal(body, &authResp); err != nil {
-		return "", fmt.Errorf("parse deezer auth: %w", err)
-	}
-
-	if authResp.JWT == "" {
-		return "", fmt.Errorf("deezer auth returned empty jwt for account %q", acc.NAMEID)
-	}
-
-	newRefToken := authResp.RefreshToken
-	for _, cookie := range resp.Header["Set-Cookie"] {
-		if rest, ok := strings.CutPrefix(cookie, "refresh-token="); ok {
-			if semicolon := strings.Index(rest, ";"); semicolon >= 0 {
-				rest = rest[:semicolon]
-			}
-			newRefToken = rest
-			break
-		}
-	}
-	if newRefToken == "" {
-		newRefToken = rawToken
-	}
-
-	p.setCredentials(accountIdx, &deezerAccountCredentials{
-		jwt:      authResp.JWT,
-		refToken: newRefToken,
-		expires:  time.Now().Add(50 * time.Minute),
-	})
-	return authResp.JWT, nil
+	return v.(string), nil
 }
 
 const graphqlQuery = `query GetLyrics($trackId: String!) {
@@ -406,18 +454,19 @@ fragment SynchronizedLines on Lyrics {
 }`
 
 func (p *DeezerProvider) getLyrics(ctx context.Context, trackID string, retryCount int) ([]byte, error) {
-	accountIdx := 0
+	accountIdx := p.mgm.CurrentIndex()
 	return p.getLyricsWithAccount(ctx, trackID, accountIdx, retryCount)
 }
 
 func (p *DeezerProvider) getLyricsWithAccount(ctx context.Context, trackID string, accountIdx, retryCount int) ([]byte, error) {
 	jwtToken := ""
-	if creds, ok := p.cachedCredentials(accountIdx); ok && creds.jwt != "" && time.Now().Before(creds.expires) {
+	if creds, ok := p.cachedCredentials(accountIdx); ok && creds != nil && creds.jwt != "" && time.Now().Before(creds.expires) {
 		jwtToken = creds.jwt
 	} else {
 		var err error
 		jwtToken, err = p.authenticate(ctx, accountIdx)
 		if err != nil {
+			p.mgm.MarkBad(accountIdx, 20*time.Second)
 			if next, ok := p.mgm.Next(accountIdx); ok && retryCount < maxAccountRetries {
 				return p.getLyricsWithAccount(ctx, trackID, next, retryCount+1)
 			}
@@ -429,6 +478,7 @@ func (p *DeezerProvider) getLyricsWithAccount(ctx context.Context, trackID strin
 	if err != nil {
 		if isDeezerAuthError(err.Error()) {
 			p.clearCredentials(accountIdx)
+			p.mgm.MarkBad(accountIdx, 20*time.Second)
 			if next, ok := p.mgm.Next(accountIdx); ok && retryCount < maxAccountRetries {
 				return p.getLyricsWithAccount(ctx, trackID, next, retryCount+1)
 			}

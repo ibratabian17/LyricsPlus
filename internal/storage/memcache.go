@@ -9,8 +9,11 @@ import (
 	"lyricsplus/backend/internal/config"
 )
 
+const defaultCacheEntryTTL = 30 * time.Minute
+
 type CacheEntry struct {
 	Body     []byte
+	Parsed   any
 	Header   map[string][]string
 	Status   int
 	StoredAt time.Time
@@ -18,7 +21,7 @@ type CacheEntry struct {
 }
 
 type MemoryCache struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	entries  *lru.Cache[string, *CacheEntry]
 	bytes    int64
 	maxKeys  int
@@ -27,58 +30,118 @@ type MemoryCache struct {
 }
 
 func NewMemoryCache(cfg config.Cache) *MemoryCache {
-	e, _ := lru.New[string, *CacheEntry](cfg.MaxEntries)
+	maxKeys := cfg.MaxEntries
+	if maxKeys <= 0 {
+		maxKeys = 4096
+	}
+	maxBytes := cfg.MaxBytes
+	if maxBytes <= 0 {
+		maxBytes = 64 << 20
+	}
+	maxBody := cfg.MaxBodyBytes
+	if maxBody <= 0 {
+		maxBody = 1 << 20 * 3 / 2
+	}
+	e, _ := lru.New[string, *CacheEntry](maxKeys)
 	return &MemoryCache{
 		entries:  e,
-		maxKeys:  cfg.MaxEntries,
-		maxBytes: cfg.MaxBytes,
-		maxBody:  cfg.MaxBodyBytes,
+		maxKeys:  maxKeys,
+		maxBytes: maxBytes,
+		maxBody:  maxBody,
 	}
 }
 
 func (c *MemoryCache) Get(key string) (*CacheEntry, bool) {
+	if c == nil || c.entries == nil {
+		return nil, false
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	e, ok := c.entries.Get(key)
-	if !ok {
+	if !ok || e == nil {
+		c.mu.Unlock()
 		return nil, false
 	}
-	if e.TTL > 0 && time.Since(e.StoredAt) > e.TTL {
+	ttl := e.TTL
+	if ttl <= 0 {
+		ttl = defaultCacheEntryTTL
+	}
+	if !e.StoredAt.IsZero() && time.Since(e.StoredAt) > ttl {
 		c.bytes -= int64(len(e.Body))
+		if c.bytes < 0 {
+			c.bytes = 0
+		}
 		c.entries.Remove(key)
+		c.mu.Unlock()
 		return nil, false
 	}
+	c.mu.Unlock()
 	return e, true
 }
 
 func (c *MemoryCache) Set(key string, entry *CacheEntry) {
-	if int64(len(entry.Body)) > c.maxBody {
+	if c == nil || c.entries == nil || entry == nil {
 		return
+	}
+	bodyLen := int64(len(entry.Body))
+	if c.maxBody > 0 && bodyLen > c.maxBody {
+		return
+	}
+	if entry.StoredAt.IsZero() {
+		entry.StoredAt = time.Now()
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if prev, ok := c.entries.Get(key); ok {
+	if prev, ok := c.entries.Peek(key); ok && prev != nil {
 		c.bytes -= int64(len(prev.Body))
 		c.entries.Remove(key)
 	}
-	for c.bytes+int64(len(entry.Body)) > c.maxBytes && c.entries.Len() > 0 {
-		if _, v, ok := c.entries.RemoveOldest(); ok {
+	if c.maxBytes > 0 {
+		for c.bytes+bodyLen > c.maxBytes && c.entries.Len() > 0 {
+			if _, v, ok := c.entries.RemoveOldest(); ok && v != nil {
+				c.bytes -= int64(len(v.Body))
+			}
+		}
+	}
+	if c.entries.Len() >= c.maxKeys && c.entries.Len() > 0 {
+		if _, v, ok := c.entries.RemoveOldest(); ok && v != nil {
 			c.bytes -= int64(len(v.Body))
 		}
 	}
+	if c.bytes < 0 {
+		c.bytes = 0
+	}
 	c.entries.Add(key, entry)
-	c.bytes += int64(len(entry.Body))
+	c.bytes += bodyLen
 }
 
 func (c *MemoryCache) Len() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c == nil || c.entries == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.entries.Len()
 }
 
 func (c *MemoryCache) Shed() {
+	if c == nil || c.entries == nil {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
+	for _, k := range c.entries.Keys() {
+		if v, ok := c.entries.Peek(k); ok && v != nil {
+			ttl := v.TTL
+			if ttl <= 0 {
+				ttl = defaultCacheEntryTTL
+			}
+			if !v.StoredAt.IsZero() && now.Sub(v.StoredAt) > ttl {
+				c.bytes -= int64(len(v.Body))
+				c.entries.Remove(k)
+			}
+		}
+	}
 	toRemove := c.entries.Len() / 2
 	if toRemove == 0 {
 		toRemove = c.entries.Len()

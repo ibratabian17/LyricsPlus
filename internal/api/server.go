@@ -44,7 +44,7 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 	}
 
 	httpCache := storage.NewMemoryCache(cfg.Cache)
-	watchdog := storage.NewWatchdog(cfg.Cache.MemoryWatchdogByte, 10*time.Second, httpCache)
+	watchdog := storage.NewWatchdog(cfg.Cache.MemoryWatchdogByte, 10*time.Second, httpCache, store)
 
 	proxyClient := proxy.New(cfg.Server)
 	gdrive := storage.NewGDriveClient(cfg.GDrive, nil)
@@ -73,11 +73,11 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		metrics.Default.RegisterPlatform("lyricsplus", "Lyrics+", providerSet.LyricsPlus.Configured, "LyricsPlus User Store Availability")
 	}
 	if gdrive != nil {
-		metrics.Default.RegisterPlatform("gdrive", "Google Drive", gdrive.IsConfigured, "Google Drive Storage Availability")
+		metrics.Default.RegisterPlatform("gdrive", "Google Drive", gdrive.IsEnabled, "Google Drive Storage Availability")
 	}
 	if store != nil {
 		metrics.Default.RegisterPlatform("database", "LyricsDB", func() bool {
-			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			return store.Ping(ctx) == nil
 		}, "Local LyricsPlus UGC + Cache Database Availability")
@@ -101,6 +101,7 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		Logger:      lg,
 		NegativeTTL: cfg.Storage.NegativeTTL,
 	}
+	racer.SetSaver(svc.SaveResultAsync)
 
 	lyricsH := &handlers.Lyrics{Service: svc, Logger: lg, KpoeInfo: "lyricsplus"}
 	catalogH := &handlers.Catalog{

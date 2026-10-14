@@ -2,8 +2,6 @@ package middleware
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -25,6 +23,8 @@ const (
 	ctxReqID ctxKey = iota
 	ctxStartTime
 )
+
+var reqIDSeq atomic.Uint64
 
 func IsHealthPath(r *http.Request) bool {
 	switch r.URL.Path {
@@ -51,29 +51,34 @@ func Tracing(l *logger.Logger) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			id := shortHexID()
-			ctx := context.WithValue(r.Context(), ctxReqID, id)
-			ctx = context.WithValue(ctx, ctxStartTime, time.Now())
 			start := time.Now()
+			ctx := context.WithValue(r.Context(), ctxReqID, id)
+			ctx = context.WithValue(ctx, ctxStartTime, start)
 			sw := &statusWriter{ResponseWriter: w, status: 200}
 			next.ServeHTTP(sw, r.WithContext(ctx))
 			metrics.Default.RecordHTTPRequest(sw.status)
-			l.Debug("request",
-				slog.String("id", id),
-				slog.String("method", r.Method),
-				slog.String("path", r.URL.Path),
-				slog.Int("status", sw.status),
-				slog.Duration("took", time.Since(start).Round(time.Millisecond)),
-			)
+			if l != nil && l.Enabled(slog.LevelDebug) {
+				l.Debug("request",
+					slog.String("id", id),
+					slog.String("method", r.Method),
+					slog.String("path", r.URL.Path),
+					slog.Int("status", sw.status),
+					slog.Duration("took", time.Since(start).Round(time.Millisecond)),
+				)
+			}
 		})
 	}
 }
 
 func shortHexID() string {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
-		return "00000000"
+	const hexChars = "0123456789abcdef"
+	n := uint32(reqIDSeq.Add(1))
+	var b [8]byte
+	for i := 7; i >= 0; i-- {
+		b[i] = hexChars[n&0xf]
+		n >>= 4
 	}
-	return hex.EncodeToString(b)
+	return string(b[:])
 }
 
 type statusWriter struct {
@@ -207,15 +212,22 @@ func itoaMax(v int64) string {
 	return string(b[i:])
 }
 
+func firstCommaValue(v string) string {
+	if idx := strings.IndexByte(v, ','); idx >= 0 {
+		v = v[:idx]
+	}
+	return strings.TrimSpace(v)
+}
+
 func ClientIP(r *http.Request) string {
 	if v := r.Header.Get("CF-Connecting-IP"); v != "" {
-		return strings.TrimSpace(strings.Split(v, ",")[0])
+		return firstCommaValue(v)
 	}
 	if v := r.Header.Get("X-Vercel-Forwarded-For"); v != "" {
-		return strings.TrimSpace(strings.Split(v, ",")[0])
+		return firstCommaValue(v)
 	}
 	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		return strings.TrimSpace(strings.Split(v, ",")[0])
+		return firstCommaValue(v)
 	}
 	if v := r.Header.Get("X-Real-IP"); v != "" {
 		return strings.TrimSpace(v)
@@ -229,13 +241,10 @@ func ClientIP(r *http.Request) string {
 
 const numShards = 64
 
-const maxStamps = 128
-
 type ipEntry struct {
-	ts   [maxStamps]int64
-	head int
-	n    int
-	last int64
+	windowStart int64
+	count       int
+	last        int64
 }
 
 type rateLimiterShard struct {
@@ -245,9 +254,10 @@ type rateLimiterShard struct {
 }
 
 type shardedRateLimiter struct {
-	window time.Duration
-	max    int
-	shards [numShards]rateLimiterShard
+	window   time.Duration
+	windowNs int64
+	max      int
+	shards   [numShards]rateLimiterShard
 }
 
 func fnv32(key string) uint32 {
@@ -265,12 +275,13 @@ func RateLimiter(max int, window time.Duration) func(http.Handler) http.Handler 
 			return next
 		}
 	}
-	if max > maxStamps {
-		max = maxStamps
+	if window <= 0 {
+		window = 10 * time.Second
 	}
 	l := &shardedRateLimiter{
-		window: window,
-		max:    max,
+		window:   window,
+		windowNs: window.Nanoseconds(),
+		max:      max,
 	}
 	now := time.Now()
 	for i := 0; i < numShards; i++ {
@@ -307,58 +318,57 @@ func (l *shardedRateLimiter) allow(key string) (string, bool) {
 
 	now := time.Now()
 	nowNs := now.UnixNano()
-	cutoffNs := now.Add(-l.window).UnixNano()
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
 	if now.Sub(shard.lastPrune) > l.window*2 {
-		pruneAfter := now.Add(-l.window * 2).UnixNano()
+		pruneAfter := nowNs - l.windowNs*2
+		beforeLen := len(shard.perIP)
 		for k, e := range shard.perIP {
 			if e.last < pruneAfter {
 				delete(shard.perIP, k)
 			}
+		}
+		if beforeLen > 256 && len(shard.perIP) < beforeLen/4 {
+			rebuilt := make(map[string]*ipEntry, len(shard.perIP)+16)
+			for k, v := range shard.perIP {
+				rebuilt[k] = v
+			}
+			shard.perIP = rebuilt
 		}
 		shard.lastPrune = now
 	}
 
 	e := shard.perIP[key]
 	if e == nil {
-		e = &ipEntry{}
+		e = &ipEntry{
+			windowStart: nowNs,
+			count:       1,
+			last:        nowNs,
+		}
 		shard.perIP[key] = e
+		return "0", true
 	}
 	e.last = nowNs
 
-	count := 0
-	for i := 0; i < e.n; i++ {
-		idx := (e.head - e.n + i + maxStamps) % maxStamps
-		if e.ts[idx] >= cutoffNs {
-			count++
-		}
+	elapsed := nowNs - e.windowStart
+	if elapsed >= l.windowNs {
+		e.windowStart = nowNs
+		e.count = 1
+		return "0", true
 	}
 
-	if count >= l.max {
-
-		oldest := nowNs
-		for i := 0; i < e.n; i++ {
-			idx := (e.head - e.n + i + maxStamps) % maxStamps
-			if e.ts[idx] >= cutoffNs && e.ts[idx] < oldest {
-				oldest = e.ts[idx]
-			}
-		}
-		remaining := l.window - time.Duration(nowNs-oldest)
-		secs := int(remaining.Seconds())
+	if e.count >= l.max {
+		remNs := l.windowNs - elapsed
+		secs := int(time.Duration(remNs).Seconds())
 		if secs < 1 {
 			secs = 1
 		}
 		return itoaSec(secs), false
 	}
 
-	e.ts[e.head] = nowNs
-	e.head = (e.head + 1) % maxStamps
-	if e.n < maxStamps {
-		e.n++
-	}
+	e.count++
 	return "0", true
 }
 

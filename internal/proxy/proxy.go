@@ -15,10 +15,12 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"lyricsplus/backend/internal/config"
 )
 
-const dnsCacheTTL = 60 * time.Second
+const dnsCacheTTL = 5 * time.Minute
 
 type dnsCacheEntry struct {
 	ips    []net.IP
@@ -26,37 +28,45 @@ type dnsCacheEntry struct {
 }
 
 var (
-	dnsMu    sync.Mutex
-	dnsStore = make(map[string]dnsCacheEntry, 64)
+	dnsMu     sync.RWMutex
+	dnsStore  = make(map[string]dnsCacheEntry, 64)
+	dnsFlight singleflight.Group
 )
 
 func lookupIPCached(host string) ([]net.IP, error) {
 	now := time.Now()
-	dnsMu.Lock()
-	if e, ok := dnsStore[host]; ok && now.Before(e.expiry) {
-		ips := e.ips
+	dnsMu.RLock()
+	e, hasCached := dnsStore[host]
+	dnsMu.RUnlock()
+	if hasCached && now.Before(e.expiry) {
+		return e.ips, nil
+	}
+
+	v, err, _ := dnsFlight.Do(host, func() (any, error) {
+		ips, lErr := net.LookupIP(host)
+		if lErr != nil {
+			if hasCached && len(e.ips) > 0 {
+				return e.ips, nil
+			}
+			return nil, lErr
+		}
+		dnsMu.Lock()
+		if len(dnsStore) > 512 {
+			t := time.Now()
+			for k, val := range dnsStore {
+				if t.After(val.expiry) {
+					delete(dnsStore, k)
+				}
+			}
+		}
+		dnsStore[host] = dnsCacheEntry{ips: ips, expiry: time.Now().Add(dnsCacheTTL)}
 		dnsMu.Unlock()
 		return ips, nil
-	}
-	dnsMu.Unlock()
-
-	ips, err := net.LookupIP(host)
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	dnsMu.Lock()
-
-	if len(dnsStore) > 512 {
-		for k, v := range dnsStore {
-			if now.After(v.expiry) {
-				delete(dnsStore, k)
-			}
-		}
-	}
-	dnsStore[host] = dnsCacheEntry{ips: ips, expiry: now.Add(dnsCacheTTL)}
-	dnsMu.Unlock()
-	return ips, nil
+	return v.([]net.IP), nil
 }
 
 var hopByHopHeaders = []string{
@@ -66,7 +76,7 @@ var hopByHopHeaders = []string{
 
 var errSSRFBlocked = errors.New("ssrf: request blocked")
 
-const defaultRequestTimeout = 15 * time.Second
+const defaultRequestTimeout = 10 * time.Second
 
 type Client struct {
 	http *http.Client
@@ -77,18 +87,18 @@ func New(cfg config.Server) *Client {
 	tr := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
+			Timeout:   6 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          2000,
-		MaxIdleConnsPerHost:   500,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   64,
+		IdleConnTimeout:       60 * time.Second,
+		TLSHandshakeTimeout:   6 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
 	}
 	return &Client{
-		http: &http.Client{Transport: tr, Timeout: 30 * time.Second},
+		http: &http.Client{Transport: tr, Timeout: 20 * time.Second},
 		cfg:  cfg.Proxy,
 	}
 }
@@ -277,14 +287,11 @@ func (c *Client) validate(u *url.URL) error {
 	if err != nil {
 		return fmt.Errorf("dns lookup failed: %w", err)
 	}
-	seen := map[string]bool{}
 	for _, ip := range ips {
 		if isBogon(ip) {
 			return fmt.Errorf("%w: resolves to private ip %s", errSSRFBlocked, ip)
 		}
-		seen[ip.String()] = true
 	}
-	_ = seen
 	return nil
 }
 

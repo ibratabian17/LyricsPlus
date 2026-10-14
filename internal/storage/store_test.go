@@ -146,3 +146,94 @@ func TestBuildFTSQuery(t *testing.T) {
 		}
 	}
 }
+
+func TestStoreCircuitBreakerAndCooldown(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "cb_test.db")
+	st, err := NewStore(config.Storage{
+		DBPath:                  dbPath,
+		LRUSize:                 64,
+		CircuitBreakerThreshold: 3,
+		CircuitBreakerCooldown:  100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	ctx := context.Background()
+
+	// 1. Initially healthy
+	if st.IsResting() {
+		t.Fatalf("expected store to not be resting initially")
+	}
+	if rem := st.CooldownRemaining(); rem != 0 {
+		t.Fatalf("expected 0 cooldown remaining, got %v", rem)
+	}
+	if err := st.Ping(ctx); err != nil {
+		t.Fatalf("ping failed: %v", err)
+	}
+
+	// 2. Save a row to test lookups
+	q := domain.SearchQuery{Title: "TestTitle", Artist: "TestArtist"}
+	contentData := []byte(`{"type":"line","lyrics":[{"time":1000,"text":"Hello"}]}`)
+	if err := st.SaveUserLyrics(ctx, q, contentData); err != nil {
+		t.Fatalf("SaveUserLyrics failed: %v", err)
+	}
+
+	// 3. Trip cooldown manually
+	st.TripCooldown(100 * time.Millisecond)
+	if !st.IsResting() {
+		t.Fatalf("expected store to be resting after TripCooldown")
+	}
+	if rem := st.CooldownRemaining(); rem <= 0 {
+		t.Fatalf("expected positive cooldown remaining, got %v", rem)
+	}
+
+	// Ping should report resting
+	if err := st.Ping(ctx); err == nil {
+		t.Fatalf("expected ping to fail while resting, got nil")
+	}
+
+	// Non-cached queries should bypass immediately
+	rows, ok := st.GetByTitleArtist(ctx, "UncachedTitle", "UncachedArtist")
+	if ok || len(rows) > 0 {
+		t.Fatalf("expected miss when resting, got %v", rows)
+	}
+
+	// Save should reject when resting
+	if err := st.SaveLyrics(ctx, &Row{Title: "X", Artist: "Y"}); err == nil {
+		t.Fatalf("expected SaveLyrics to fail when resting, got nil")
+	}
+
+	// 4. Reset circuit breaker manually
+	st.ResetCircuitBreaker()
+	if st.IsResting() {
+		t.Fatalf("expected store to not be resting after ResetCircuitBreaker")
+	}
+	if err := st.Ping(ctx); err != nil {
+		t.Fatalf("ping failed after reset: %v", err)
+	}
+
+	// 5. Automatic trip via RecordDBBusy threshold
+	st.RecordDBBusy(context.DeadlineExceeded)
+	if st.IsResting() {
+		t.Fatalf("should not be resting after 1 error (threshold is 3)")
+	}
+	st.RecordDBBusy(context.DeadlineExceeded)
+	if st.IsResting() {
+		t.Fatalf("should not be resting after 2 errors (threshold is 3)")
+	}
+	st.RecordDBBusy(context.DeadlineExceeded)
+	if !st.IsResting() {
+		t.Fatalf("expected store to be resting after 3 consecutive errors")
+	}
+
+	// 6. Wait for cooldown to expire automatically
+	time.Sleep(120 * time.Millisecond)
+	if st.IsResting() {
+		t.Fatalf("expected store to recover after cooldown expired")
+	}
+	if err := st.Ping(ctx); err != nil {
+		t.Fatalf("ping failed after auto-recovery: %v", err)
+	}
+}

@@ -16,7 +16,7 @@ type Limiter struct {
 
 	perSourceLimit int64
 
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	rejected map[string]int64
 }
 
@@ -29,10 +29,10 @@ type LimiterConfig struct {
 
 func DefaultLimiterConfig() LimiterConfig {
 	return LimiterConfig{
-		Global:           4096,
-		PerSource:        1024,
-		DefaultPerSource: 256,
-		Wait:             2 * time.Second,
+		Global:           256,
+		PerSource:        64,
+		DefaultPerSource: 64,
+		Wait:             500 * time.Millisecond,
 	}
 }
 
@@ -121,6 +121,13 @@ func (l *Limiter) TryAcquire(name string) (release func(), ok bool) {
 }
 
 func (l *Limiter) sourceSem(name string) *semaphore.Weighted {
+	l.mu.RLock()
+	if s, ok := l.perSource[name]; ok {
+		l.mu.RUnlock()
+		return s
+	}
+	l.mu.RUnlock()
+
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if s, ok := l.perSource[name]; ok {
@@ -138,8 +145,8 @@ func (l *Limiter) noteReject(name string) {
 }
 
 func (l *Limiter) Rejected() map[string]int64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 	out := make(map[string]int64, len(l.rejected))
 	for k, v := range l.rejected {
 		out[k] = v

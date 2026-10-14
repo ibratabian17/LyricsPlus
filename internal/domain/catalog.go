@@ -34,35 +34,36 @@ func (q SearchQuery) IDOnly() bool {
 	return (q.ISRC != "" || q.PlatformID != "") && q.Title == "" && q.Artist == ""
 }
 
+func (q SearchQuery) durationBucket() string {
+	if q.Duration <= 0 {
+		return "0"
+	}
+	return strconv.Itoa((q.Duration + 500) / 1000)
+}
+
 func (q SearchQuery) NormalizeKey() string {
 	sources := "default"
 	if len(q.Sources) > 0 {
-		sources = ""
-		for i, s := range q.Sources {
-			if i > 0 {
-				sources += ","
-			}
-			sources += s
-		}
+		sources = strings.Join(q.Sources, ",")
 	}
 	return strings.Join([]string{
-		strings.ToLower(q.Title),
-		strings.ToLower(q.Artist),
-		strings.ToLower(q.Album),
-		strconv.Itoa(q.Duration),
-		strings.ToLower(q.ISRC),
-		strings.ToLower(q.PlatformID),
+		strings.ToLower(strings.TrimSpace(q.Title)),
+		strings.ToLower(strings.TrimSpace(q.Artist)),
+		strings.ToLower(strings.TrimSpace(q.Album)),
+		q.durationBucket(),
+		strings.ToLower(strings.TrimSpace(q.ISRC)),
+		strings.ToLower(strings.TrimSpace(q.PlatformID)),
 		sources,
 	}, "::")
 }
 
 func (q SearchQuery) ContentKey() string {
 	return strings.Join([]string{
-		strings.ToLower(q.Title),
-		strings.ToLower(q.Artist),
-		strings.ToLower(q.Album),
-		strconv.Itoa(q.Duration),
-		strings.ToLower(q.ISRC),
-		strings.ToLower(q.PlatformID),
+		strings.ToLower(strings.TrimSpace(q.Title)),
+		strings.ToLower(strings.TrimSpace(q.Artist)),
+		strings.ToLower(strings.TrimSpace(q.Album)),
+		q.durationBucket(),
+		strings.ToLower(strings.TrimSpace(q.ISRC)),
+		strings.ToLower(strings.TrimSpace(q.PlatformID)),
 	}, "::")
 }

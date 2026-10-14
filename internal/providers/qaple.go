@@ -98,6 +98,14 @@ func parseStoredLine(row *storage.Row, content []byte) *domain.LyricsResponse {
 	return nil
 }
 
+func isAlreadyWordSynced(resp *domain.LyricsResponse) bool {
+	if resp == nil {
+		return false
+	}
+	t := strings.ToLower(string(resp.Type))
+	return t == "word" || t == "syllable"
+}
+
 func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
 	if s.qqSource == nil || (s.apple == nil && s.mxm == nil) {
 		return nil, nil
@@ -132,18 +140,28 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 		if !q.ForceReload && s.store != nil {
 			if row, content, err := s.store.GetRowForSources(qapleCtx, q, "apple", "musixmatch", "musixmatch-word"); err == nil && row != nil && len(content) > 0 {
 				if resp := parseStoredLine(row, content); resp != nil && len(resp.Lyrics) > 0 {
-					src := "Apple (DB)"
-					if strings.HasPrefix(strings.ToLower(row.Source), "musixmatch") {
-						src = "Musixmatch (DB)"
+					if !isAlreadyWordSynced(resp) {
+						src := "Apple (DB)"
+						if strings.HasPrefix(strings.ToLower(row.Source), "musixmatch") {
+							src = "Musixmatch (DB)"
+						}
+						lineCh <- fetchResult{resp: resp, source: src, err: nil}
+						return
 					}
-					lineCh <- fetchResult{resp: resp, source: src, err: nil}
-					return
+					if s.mxm == nil {
+						lineCh <- fetchResult{resp: resp, source: "Apple (DB)", err: nil}
+						return
+					}
 				}
 			}
 		}
 		if s.apple != nil {
 			resp, err := s.apple.FetchLyrics(qapleCtx, q)
 			if err == nil && resp != nil && len(resp.Lyrics) > 0 {
+				if isAlreadyWordSynced(resp) {
+					lineCh <- fetchResult{resp: resp, source: "Apple", err: nil}
+					return
+				}
 				lineCh <- fetchResult{resp: resp, source: "Apple", err: nil}
 				return
 			}
@@ -158,14 +176,28 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 		lineCh <- fetchResult{resp: nil, source: "", err: nil}
 	}()
 
-	qqRes := <-qqCh
-	if qqRes.err != nil || qqRes.resp == nil || len(qqRes.resp.Lyrics) == 0 {
-		return nil, nil
-	}
+	var qqRes, lineRes fetchResult
+	var gotQQ, gotLine bool
 
-	lineRes := <-lineCh
-	if lineRes.resp == nil || len(lineRes.resp.Lyrics) == 0 {
-		return nil, nil
+	for !gotQQ || !gotLine {
+		select {
+		case <-qapleCtx.Done():
+			return nil, qapleCtx.Err()
+		case r := <-qqCh:
+			qqRes = r
+			gotQQ = true
+			if qqRes.err != nil || qqRes.resp == nil || len(qqRes.resp.Lyrics) == 0 {
+				cancel()
+				return nil, nil
+			}
+		case r := <-lineCh:
+			lineRes = r
+			gotLine = true
+			if lineRes.resp == nil || len(lineRes.resp.Lyrics) == 0 || isAlreadyWordSynced(lineRes.resp) {
+				cancel()
+				return nil, nil
+			}
+		}
 	}
 
 	merged := MergeAppleMetadataIntoWordSync(lineRes.resp, qqRes.resp)
@@ -247,7 +279,9 @@ func normalizeForMatch(text string) string {
 	s := strings.ToLower(text)
 	s = strings.ReplaceAll(s, "*", "")
 	s = nonWordPunct.ReplaceAllString(s, "")
-	s = leadingApostrophe.ReplaceAllString(s, "$1")
+	if strings.ContainsRune(s, '\'') {
+		s = leadingApostrophe.ReplaceAllString(s, "$1")
+	}
 	s = multiSpace.ReplaceAllString(s, " ")
 	return strings.TrimSpace(s)
 }
@@ -289,7 +323,7 @@ func textSimilarity(n1, n2 string) float64 {
 			filtered1 = append(filtered1, w)
 		}
 	}
-	set2 := make(map[string]bool)
+	set2 := make(map[string]bool, len(w2))
 	for _, w := range w2 {
 		if len(w) > 1 {
 			filtered2 = append(filtered2, w)
@@ -330,6 +364,9 @@ func textSimilaritySyllable(appleNorm, combinedSylNorm string) float64 {
 }
 
 func splitHyphenated(word string) []string {
+	if !strings.ContainsRune(word, '-') {
+		return []string{word}
+	}
 	var parts []string
 	var cur strings.Builder
 	runes := []rune(word)
@@ -358,8 +395,9 @@ type appleToken struct {
 }
 
 func tokenizeAppleLine(text string) []appleToken {
-	var tokens []appleToken
-	for _, word := range strings.Fields(text) {
+	words := strings.Fields(text)
+	tokens := make([]appleToken, 0, len(words))
+	for _, word := range words {
 		parts := splitHyphenated(word)
 		for i, p := range parts {
 			tokens = append(tokens, appleToken{
@@ -373,6 +411,10 @@ func tokenizeAppleLine(text string) []appleToken {
 }
 
 func estimateLineOffset(appleLines, wordLines []domain.Line) int {
+	qqNorms := make([]string, len(wordLines))
+	for i, ql := range wordLines {
+		qqNorms[i] = normalizeForMatch(ql.Text)
+	}
 	var deltas []int
 	for _, al := range appleLines {
 		if al.Time <= 0 || al.Text == "" {
@@ -381,8 +423,8 @@ func estimateLineOffset(appleLines, wordLines []domain.Line) int {
 		aNorm := normalizeForMatch(al.Text)
 		bestSim := 0.5
 		var bestDelta *int
-		for _, ql := range wordLines {
-			sim := textSimilarity(aNorm, normalizeForMatch(ql.Text))
+		for i, ql := range wordLines {
+			sim := textSimilarity(aNorm, qqNorms[i])
 			if sim > bestSim {
 				bestSim = sim
 				d := ql.Time - al.Time
@@ -551,14 +593,18 @@ func alignTokensToQQ(appleTokens []appleToken, qqTokens []qqPoolToken, lineStart
 		simFn = textSimilaritySyllable
 	}
 
+	cols := Q + 1
+	totalCells := (A + 1) * cols
+	dpFlat := make([]float64, totalCells)
+	for i := range dpFlat {
+		dpFlat[i] = infCost
+	}
+	opFlat := make([]dpOp, totalCells)
 	dp := make([][]float64, A+1)
 	op := make([][]dpOp, A+1)
-	for i := range dp {
-		dp[i] = make([]float64, Q+1)
-		for j := range dp[i] {
-			dp[i][j] = infCost
-		}
-		op[i] = make([]dpOp, Q+1)
+	for i := 0; i <= A; i++ {
+		dp[i] = dpFlat[i*cols : (i+1)*cols]
+		op[i] = opFlat[i*cols : (i+1)*cols]
 	}
 	dp[0][0] = 0
 
@@ -709,7 +755,7 @@ func anchorSyntheticsWithResiduals(runTokens []appleToken, residuals []qqPoolTok
 		return result
 	}
 
-	used := make(map[int]bool)
+	used := make(map[int]bool, len(inGap))
 	minSeq := -1
 
 	for k := 0; k < n; k++ {
@@ -1125,7 +1171,7 @@ func MergeAppleMetadataIntoWordSync(appleData, wordSyncData *domain.LyricsRespon
 	lineOffset := estimateLineOffset(appleLines, wordLines)
 	candidatesByLine := collectCandidates(appleLines, qqPool, lineOffset)
 
-	var mergedLyrics []domain.Line
+	mergedLyrics := make([]domain.Line, 0, len(appleLines))
 	totalWords := 0
 	totalSynth := 0
 

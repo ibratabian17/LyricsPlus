@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/textproto"
 	"net/url"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/hashicorp/golang-lru/v2/expirable"
+
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/similarity"
 )
@@ -58,15 +61,28 @@ type GDriveClient struct {
 
 	httpClient  *http.Client
 	fileCache   *lru.Cache[string, []byte]
-	searchCache *lru.Cache[string, []FileItem]
+	searchCache *expirable.LRU[string, []FileItem]
 }
 
 func NewGDriveClient(cfg config.GDrive, httpClient *http.Client) *GDriveClient {
 	if httpClient == nil {
-		httpClient = &http.Client{Timeout: 30 * time.Second}
+		tr := &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   5 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          64,
+			MaxIdleConnsPerHost:   16,
+			IdleConnTimeout:       60 * time.Second,
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+		}
+		httpClient = &http.Client{Transport: tr, Timeout: 15 * time.Second}
 	}
-	fc, _ := lru.New[string, []byte](1000)
-	sc, _ := lru.New[string, []FileItem](1000)
+	fc, _ := lru.New[string, []byte](500)
+	sc := expirable.NewLRU[string, []FileItem](2000, nil, 10*time.Minute)
 
 	return &GDriveClient{
 		cfg:         cfg,
@@ -79,11 +95,15 @@ func NewGDriveClient(cfg config.GDrive, httpClient *http.Client) *GDriveClient {
 }
 
 func (g *GDriveClient) IsConfigured() bool {
-	if len(g.accounts) == 0 {
+	if g == nil || len(g.accounts) == 0 {
 		return false
 	}
 	acc := g.accounts[0]
 	return acc.ClientID != "" && acc.RefreshToken != ""
+}
+
+func (g *GDriveClient) IsEnabled() bool {
+	return g != nil && g.cfg.Enabled && g.IsConfigured()
 }
 
 func (g *GDriveClient) Config() config.GDrive {
@@ -206,6 +226,14 @@ func (g *GDriveClient) Authenticate(ctx context.Context, forceRefresh bool) (str
 
 	resp, err := g.httpClient.Do(req)
 	if err != nil {
+		if ctx.Err() == nil && g.consecutiveErrors >= 0 {
+			g.consecutiveErrors++
+			if g.consecutiveErrors >= 5 {
+				g.circuitOpen = true
+				g.circuitOpenUntil = time.Now().Add(60 * time.Second)
+				g.consecutiveErrors = 0
+			}
+		}
 		return "", fmt.Errorf("gdrive token refresh: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -216,6 +244,17 @@ func (g *GDriveClient) Authenticate(ctx context.Context, forceRefresh bool) (str
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		if g.consecutiveErrors >= 0 {
+			g.consecutiveErrors++
+			if g.consecutiveErrors >= 5 {
+				g.circuitOpen = true
+				g.circuitOpenUntil = time.Now().Add(60 * time.Second)
+				g.consecutiveErrors = 0
+			}
+		}
+		if len(g.accounts) > 1 {
+			g.accountIdx = (g.accountIdx + 1) % len(g.accounts)
+		}
 		return "", fmt.Errorf("gdrive token refresh error (%d): %s", resp.StatusCode, string(body))
 	}
 
@@ -303,11 +342,14 @@ func (g *GDriveClient) SearchFiles(ctx context.Context, folderIDs []string, quer
 
 	resp, err := g.httpClient.Do(req)
 	if err != nil {
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			g.recordRateLimitError()
+		}
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode >= 500 {
 		g.recordRateLimitError()
 		g.rotateAccount()
 		return nil, fmt.Errorf("gdrive rate limited (%d)", resp.StatusCode)
@@ -352,11 +394,14 @@ func (g *GDriveClient) FetchFile(ctx context.Context, fileID string) ([]byte, er
 
 	resp, err := g.httpClient.Do(req)
 	if err != nil {
+		if !errors.Is(ctx.Err(), context.Canceled) {
+			g.recordRateLimitError()
+		}
 		return nil, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden || resp.StatusCode >= 500 {
 		g.recordRateLimitError()
 		g.rotateAccount()
 		return nil, fmt.Errorf("gdrive rate limited (%d)", resp.StatusCode)
@@ -490,8 +535,11 @@ func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []stri
 		return nil, nil
 	}
 
-	cacheKey := fmt.Sprintf("exact:%s:%s", isrc, platformID)
-	if cached, ok := g.searchCache.Get(cacheKey); ok && len(cached) > 0 {
+	cacheKey := fmt.Sprintf("exact:%s:%s:%s", strings.ToLower(isrc), strings.ToLower(platformID), mimeType)
+	if cached, ok := g.searchCache.Get(cacheKey); ok {
+		if len(cached) == 0 {
+			return nil, nil
+		}
 		return &cached[0], nil
 	}
 
@@ -503,6 +551,7 @@ func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []stri
 		searchTerms = append(searchTerms, platformID)
 	}
 
+	var hadErr error
 	for _, term := range searchTerms {
 		var qParts []string
 		if mimeType != "" {
@@ -512,7 +561,11 @@ func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []stri
 		query := strings.Join(qParts, " and ")
 
 		res, err := g.SearchFiles(ctx, folderIDs, query, 15, "")
-		if err != nil || res == nil || len(res.Files) == 0 {
+		if err != nil {
+			hadErr = err
+			continue
+		}
+		if res == nil || len(res.Files) == 0 {
 			continue
 		}
 
@@ -529,7 +582,10 @@ func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []stri
 		}
 	}
 
-	return nil, nil
+	if hadErr == nil {
+		g.searchCache.Add(cacheKey, []FileItem{})
+	}
+	return nil, hadErr
 }
 
 func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string, title, artist, album string, durationSec float64, isrc, platformID, mimeType string) (*FileItem, error) {
@@ -545,25 +601,39 @@ func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string,
 		return g.FindExactMatchByIds(ctx, folderIDs, isrc, platformID, mimeType)
 	}
 
-	var qParts []string
-	if mimeType != "" {
-		qParts = append(qParts, fmt.Sprintf("mimeType = '%s'", escapeQueryLiteral(mimeType)))
-	}
-	for _, kw := range keywords {
-		qParts = append(qParts, fmt.Sprintf("name contains '%s'", escapeQueryLiteral(kw)))
-	}
-	query := strings.Join(qParts, " and ")
+	cacheKey := fmt.Sprintf("kw:%s:%s", strings.ToLower(strings.Join(keywords, ",")), mimeType)
+	var files []FileItem
+	if cached, ok := g.searchCache.Get(cacheKey); ok {
+		files = cached
+	} else {
+		var qParts []string
+		if mimeType != "" {
+			qParts = append(qParts, fmt.Sprintf("mimeType = '%s'", escapeQueryLiteral(mimeType)))
+		}
+		for _, kw := range keywords {
+			qParts = append(qParts, fmt.Sprintf("name contains '%s'", escapeQueryLiteral(kw)))
+		}
+		query := strings.Join(qParts, " and ")
 
-	res, err := g.SearchFiles(ctx, folderIDs, query, 20, "")
-	if err != nil || res == nil || len(res.Files) == 0 {
+		res, err := g.SearchFiles(ctx, folderIDs, query, 20, "")
+		if err != nil {
+			return nil, err
+		}
+		if res != nil && len(res.Files) > 0 {
+			files = res.Files
+		}
+		g.searchCache.Add(cacheKey, files)
+	}
+
+	if len(files) == 0 {
 		if isrc != "" || platformID != "" {
 			return g.FindExactMatchByIds(ctx, folderIDs, isrc, platformID, mimeType)
 		}
-		return nil, err
+		return nil, nil
 	}
 
-	candidates := make([]similarity.SongCandidate, len(res.Files))
-	for i, f := range res.Files {
+	candidates := make([]similarity.SongCandidate, len(files))
+	for i, f := range files {
 		parsed := ParseFilename(f.Name)
 		candidates[i] = similarity.SongCandidate{
 			Title:      parsed.Title,
@@ -584,7 +654,7 @@ func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string,
 		return nil, nil
 	}
 	idx := best.Candidate.Data.(int)
-	return &res.Files[idx], nil
+	return &files[idx], nil
 }
 
 func (g *GDriveClient) UploadUserLyrics(ctx context.Context, fileName string, data []byte) (*FileItem, error) {

@@ -27,6 +27,21 @@ import (
 
 var kpoeToolsRe = regexp.MustCompile(`"KpoeTools"\s*:\s*(-?[0-9]+(?:\.[0-9]+)?)`)
 
+func coerceKpoePayload(trimmedRaw string) []byte {
+	idx := strings.Index(trimmedRaw, `"KpoeTools"`)
+	if idx < 0 {
+		return []byte(trimmedRaw)
+	}
+	rest := trimmedRaw[idx+len(`"KpoeTools"`):]
+	for len(rest) > 0 && (rest[0] == ' ' || rest[0] == '\t' || rest[0] == ':') {
+		rest = rest[1:]
+	}
+	if len(rest) > 0 && rest[0] == '"' {
+		return []byte(trimmedRaw)
+	}
+	return []byte(kpoeToolsRe.ReplaceAllString(trimmedRaw, `"KpoeTools": "$1"`))
+}
+
 func parseLyricsPayload(content []byte) *domain.LyricsResponse {
 	trimmedRaw := strings.TrimSpace(string(content))
 	if trimmedRaw == "" {
@@ -37,11 +52,11 @@ func parseLyricsPayload(content []byte) *domain.LyricsResponse {
 			return p
 		}
 	}
-	coerced := kpoeToolsRe.ReplaceAllString(trimmedRaw, `"KpoeTools": "$1"`)
+	coerced := coerceKpoePayload(trimmedRaw)
 
-	if strings.Contains(coerced, `"isLineEnding"`) {
+	if strings.Contains(trimmedRaw, `"isLineEnding"`) {
 		var v1 domain.V1Response
-		if json.Unmarshal([]byte(coerced), &v1) == nil && len(v1.Lyrics) > 0 {
+		if json.Unmarshal(coerced, &v1) == nil && len(v1.Lyrics) > 0 {
 			if p := parsers.V1ToV2(&v1); p != nil && len(p.Lyrics) > 0 {
 				return p
 			}
@@ -49,7 +64,7 @@ func parseLyricsPayload(content []byte) *domain.LyricsResponse {
 	}
 
 	var resp domain.LyricsResponse
-	if json.Unmarshal([]byte(coerced), &resp) == nil && len(resp.Lyrics) > 0 {
+	if json.Unmarshal(coerced, &resp) == nil && len(resp.Lyrics) > 0 {
 		return parsers.NormalizeV2(&resp)
 	}
 	return nil
@@ -145,18 +160,19 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		}
 
 		if row != nil && row.Source == "lyricsplus" {
-			if len(row.ContentJSON) == 0 {
-				content, err := st.GetContent(ctx, row.ID)
+			content := row.ContentJSON
+			if len(content) == 0 {
+				c, err := st.GetContent(ctx, row.ID)
 				if err == nil {
-					row.ContentJSON = content
+					content = c
 				}
 			}
-			if len(row.ContentJSON) > 0 {
-				if parsed := parseLyricsPayload(row.ContentJSON); parsed != nil && len(parsed.Lyrics) > 0 {
+			if len(content) > 0 {
+				if parsed := parseLyricsPayload(content); parsed != nil && len(parsed.Lyrics) > 0 {
 					norm := parsers.NormalizeV2(parsed)
 					norm.Metadata.Source = "Lyrics+"
 					norm.Cached = domain.CacheUserJSON
-					norm.RawData = string(row.ContentJSON)
+					norm.RawData = string(content)
 
 					var pf storage.ParsedFilename
 					if row.Filename != "" {
@@ -228,7 +244,7 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		}
 	}
 
-	if !q.ForceReload && (lpResult == nil || !hasWordSync(lpResult)) && gd != nil && gd.IsConfigured() {
+	if !q.ForceReload && (lpResult == nil || !hasWordSync(lpResult)) && gd != nil && gd.IsEnabled() {
 		driveCtx, driveCancel := context.WithTimeout(ctx, gdriveBudget)
 		defer driveCancel()
 

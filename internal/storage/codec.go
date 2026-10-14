@@ -16,20 +16,53 @@ var decompressBufs = sync.Pool{
 	New: func() any { return new(bytes.Buffer) },
 }
 
+var compressWriters = sync.Pool{
+	New: func() any {
+		zw, _ := zlib.NewWriterLevel(io.Discard, zlib.BestSpeed)
+		return zw
+	},
+}
+
+var decompressReaders = sync.Pool{}
+
 func CompressContent(data []byte) []byte {
 	if len(data) < 64 {
-		return append([]byte{contentRaw}, data...)
+		out := make([]byte, len(data)+1)
+		out[0] = contentRaw
+		copy(out[1:], data)
+		return out
 	}
-	var buf bytes.Buffer
-	buf.Grow(len(data)/2 + 32)
-	buf.WriteByte(contentCompressed)
-	zw, _ := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
+	scratch, _ := decompressBufs.Get().(*bytes.Buffer)
+	if scratch == nil {
+		scratch = new(bytes.Buffer)
+	}
+	scratch.Reset()
+	scratch.Grow(len(data)/2 + 32)
+	scratch.WriteByte(contentCompressed)
+
+	zw, _ := compressWriters.Get().(*zlib.Writer)
+	if zw == nil {
+		zw, _ = zlib.NewWriterLevel(scratch, zlib.BestSpeed)
+	} else {
+		zw.Reset(scratch)
+	}
 	_, _ = zw.Write(data)
 	_ = zw.Close()
-	if buf.Len() >= len(data)+2 {
-		return append([]byte{contentRaw}, data...)
+	compressWriters.Put(zw)
+
+	if scratch.Len() >= len(data)+2 {
+		scratch.Reset()
+		decompressBufs.Put(scratch)
+		out := make([]byte, len(data)+1)
+		out[0] = contentRaw
+		copy(out[1:], data)
+		return out
 	}
-	return buf.Bytes()
+	out := make([]byte, scratch.Len())
+	copy(out, scratch.Bytes())
+	scratch.Reset()
+	decompressBufs.Put(scratch)
+	return out
 }
 
 func DecompressContent(data []byte) []byte {
@@ -38,7 +71,15 @@ func DecompressContent(data []byte) []byte {
 	}
 	switch data[0] {
 	case contentCompressed:
-		zr, err := zlib.NewReader(bytes.NewReader(data[1:]))
+		br := bytes.NewReader(data[1:])
+		var zr io.ReadCloser
+		var err error
+		if pooled := decompressReaders.Get(); pooled != nil {
+			zr = pooled.(io.ReadCloser)
+			err = zr.(zlib.Resetter).Reset(br, nil)
+		} else {
+			zr, err = zlib.NewReader(br)
+		}
 		if err != nil {
 			return data
 		}
@@ -55,6 +96,7 @@ func DecompressContent(data []byte) []byte {
 		scratch.Reset()
 		decompressBufs.Put(scratch)
 		_ = zr.Close()
+		decompressReaders.Put(zr)
 
 		if readErr != nil && len(out) == 0 {
 			return data

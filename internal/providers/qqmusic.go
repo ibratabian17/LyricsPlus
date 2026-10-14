@@ -16,6 +16,9 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+	"golang.org/x/sync/singleflight"
+
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/parsers"
@@ -28,7 +31,18 @@ const qqmusicName = "qq"
 const (
 	qqAPIEndpoint      = "https://u.y.qq.com/cgi-bin/musicu.fcg"
 	qqSmartboxEndpoint = "https://c.y.qq.com/splcloud/fcgi-bin/smartbox_new.fcg"
+	qqSearchCacheTTL   = 5 * time.Minute
 )
+
+type qqSearchCacheEntry struct {
+	songs   []songItem
+	created time.Time
+}
+
+type qqQRCCacheEntry struct {
+	qrc     string
+	created time.Time
+}
 
 type QQMusicProvider struct {
 	client         *proxy.Client
@@ -39,13 +53,21 @@ type QQMusicProvider struct {
 	sessionUID     string
 	sessionSID     string
 	sessionSavedAt time.Time
+
+	flightGroup singleflight.Group
+	searchCache *lru.Cache[string, *qqSearchCacheEntry]
+	qrcCache    *lru.Cache[string, *qqQRCCacheEntry]
 }
 
 func NewQQMusic(client *proxy.Client, cookie string) *QQMusicProvider {
+	sc, _ := lru.New[string, *qqSearchCacheEntry](1024)
+	qc, _ := lru.New[string, *qqQRCCacheEntry](512)
 	return &QQMusicProvider{
-		client: client,
-		cookie: cookie,
-		guid:   getGUID(),
+		client:      client,
+		cookie:      cookie,
+		guid:        getGUID(),
+		searchCache: sc,
+		qrcCache:    qc,
 	}
 }
 
@@ -62,6 +84,27 @@ func (p *QQMusicProvider) Name() string     { return qqmusicName }
 func (p *QQMusicProvider) Configured() bool { return true }
 
 func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
+	sfKey := q.ContentKey()
+	ch := p.flightGroup.DoChan(sfKey, func() (any, error) {
+		runCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		return p.doFetchLyrics(runCtx, q)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		if resp, ok := res.Val.(*domain.LyricsResponse); ok && resp != nil {
+			return cloneAppleLyrics(resp), nil
+		}
+		return nil, nil
+	}
+}
+
+func (p *QQMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
 	songMid := ""
 	var songID int64
 	if isQQMid(q.PlatformID) {
@@ -80,17 +123,15 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 			return nil, nil
 		}
 
-		queries := []string{}
+		queries := make([]string, 0, 2)
 		t := strings.TrimSpace(q.Title)
 		a := strings.TrimSpace(q.Artist)
 		if t != "" && a != "" {
 			queries = append(queries, t+" "+a)
-			queries = append(queries, a+" "+t)
 		}
 		if t != "" {
 			queries = append(queries, t)
-		}
-		if a != "" {
+		} else if a != "" {
 			queries = append(queries, a)
 		}
 
@@ -100,7 +141,7 @@ func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 			if err != nil || len(songs) == 0 {
 				continue
 			}
-			var candidates []similarity.SongCandidate
+			candidates := make([]similarity.SongCandidate, 0, len(songs))
 			for _, s := range songs {
 				singer := ""
 				if len(s.Singer) > 0 {
@@ -259,6 +300,16 @@ type songItem struct {
 }
 
 func (p *QQMusicProvider) search(ctx context.Context, query string) ([]songItem, error) {
+	cleanQ := strings.ToLower(strings.TrimSpace(query))
+	if cleanQ == "" {
+		return nil, nil
+	}
+	if p.searchCache != nil {
+		if entry, ok := p.searchCache.Get(cleanQ); ok && entry != nil && time.Since(entry.created) < qqSearchCacheTTL {
+			return entry.songs, nil
+		}
+	}
+
 	searchParams := map[string]interface{}{
 		"searchid":     getSearchID(),
 		"query":        query,
@@ -277,40 +328,23 @@ func (p *QQMusicProvider) search(ctx context.Context, query string) ([]songItem,
 			} `json:"body"`
 		}
 		if err := json.Unmarshal(raw, &res); err == nil && len(res.Body.ItemSong) > 0 {
+			if p.searchCache != nil {
+				p.searchCache.Add(cleanQ, &qqSearchCacheEntry{songs: res.Body.ItemSong, created: time.Now()})
+			}
 			return res.Body.ItemSong, nil
 		}
 	}
 
-	adaptorParams := map[string]interface{}{
-		"searchid":    getSearchID(),
-		"query":       query,
-		"search_type": 100,
-		"page_num":    10,
-		"page_id":     1,
-		"highlight":   1,
-		"grp":         1,
-	}
-	if raw, err := p.apiRequest(ctx, "music.adaptor.SearchAdaptor", "do_search_v2", adaptorParams); err == nil {
-		var res struct {
-			Body struct {
-				Song struct {
-					Items []songItem `json:"items"`
-				} `json:"song"`
-			} `json:"body"`
-		}
-		if err := json.Unmarshal(raw, &res); err == nil && len(res.Body.Song.Items) > 0 {
-			return res.Body.Song.Items, nil
-		}
-	}
-
 	if items, err := p.searchSmartbox(ctx, query); err == nil && len(items) > 0 {
+		if p.searchCache != nil {
+			p.searchCache.Add(cleanQ, &qqSearchCacheEntry{songs: items, created: time.Now()})
+		}
 		return items, nil
 	}
 
-	if items, err := p.searchSmartboxCgi(ctx, query); err == nil && len(items) > 0 {
-		return items, nil
+	if err == nil && p.searchCache != nil {
+		p.searchCache.Add(cleanQ, &qqSearchCacheEntry{songs: nil, created: time.Now()})
 	}
-
 	return nil, err
 }
 
@@ -478,6 +512,13 @@ func (p *QQMusicProvider) getTracksByID(ctx context.Context, songIDs []int64) ([
 }
 
 func (p *QQMusicProvider) fetchQRC(ctx context.Context, songMid string, songID int64) (string, error) {
+	cacheKey := fmt.Sprintf("%s:%d", songMid, songID)
+	if p.qrcCache != nil {
+		if entry, ok := p.qrcCache.Get(cacheKey); ok && entry != nil && time.Since(entry.created) < qqSearchCacheTTL {
+			return entry.qrc, nil
+		}
+	}
+
 	tryFetch := func(param map[string]interface{}) (string, error) {
 		raw, err := p.apiRequest(ctx, "music.musichallSong.PlayLyricInfo", "GetPlayLyricInfo", param)
 		if err != nil {
@@ -528,6 +569,9 @@ func (p *QQMusicProvider) fetchQRC(ctx context.Context, songMid string, songID i
 		p1 := baseParams()
 		p1["songMid"] = songMid
 		if content, err := tryFetch(p1); err == nil && content != "" {
+			if p.qrcCache != nil {
+				p.qrcCache.Add(cacheKey, &qqQRCCacheEntry{qrc: content, created: time.Now()})
+			}
 			return content, nil
 		}
 	}
@@ -536,6 +580,9 @@ func (p *QQMusicProvider) fetchQRC(ctx context.Context, songMid string, songID i
 		p2 := baseParams()
 		p2["songId"] = songID
 		if content, err := tryFetch(p2); err == nil && content != "" {
+			if p.qrcCache != nil {
+				p.qrcCache.Add(cacheKey, &qqQRCCacheEntry{qrc: content, created: time.Now()})
+			}
 			return content, nil
 		}
 	}
@@ -581,8 +628,11 @@ func isHexString(s string) bool {
 }
 
 func (p *QQMusicProvider) ensureSession(ctx context.Context) (string, string) {
+	if p.cookie == "" {
+		return "", ""
+	}
 	p.sessionMu.RLock()
-	if p.sessionUID != "" && p.sessionSID != "" && time.Since(p.sessionSavedAt) < 24*time.Hour {
+	if !p.sessionSavedAt.IsZero() && time.Since(p.sessionSavedAt) < 30*time.Minute {
 		u, s := p.sessionUID, p.sessionSID
 		p.sessionMu.RUnlock()
 		return u, s
@@ -591,9 +641,10 @@ func (p *QQMusicProvider) ensureSession(ctx context.Context) (string, string) {
 
 	p.sessionMu.Lock()
 	defer p.sessionMu.Unlock()
-	if p.sessionUID != "" && p.sessionSID != "" && time.Since(p.sessionSavedAt) < 24*time.Hour {
+	if !p.sessionSavedAt.IsZero() && time.Since(p.sessionSavedAt) < 30*time.Minute {
 		return p.sessionUID, p.sessionSID
 	}
+	p.sessionSavedAt = time.Now()
 
 	raw, err := p.doApiRequest(ctx, "music.getSession.session", "GetSession", map[string]interface{}{
 		"uid":    "",
@@ -620,7 +671,6 @@ func (p *QQMusicProvider) ensureSession(ctx context.Context) (string, string) {
 			if uidStr != "" {
 				p.sessionUID = uidStr
 				p.sessionSID = res.Session.SID
-				p.sessionSavedAt = time.Now()
 				p.debugf("GetSession success: uid=%s sid=%s", p.sessionUID, p.sessionSID)
 				return p.sessionUID, p.sessionSID
 			}
@@ -695,10 +745,9 @@ func (p *QQMusicProvider) doApiRequest(ctx context.Context, module, method strin
 }
 
 func getSearchID() string {
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	e := int64(r.Intn(20) + 1)
+	e := int64(rand.Intn(20) + 1)
 	t := e * 18014398509481984
-	n := int64(r.Intn(4194304)) * 4294967296
+	n := int64(rand.Intn(4194304)) * 4294967296
 	rem := time.Now().UnixMilli() % 86400000
 	return strconv.FormatInt(t+n+rem, 10)
 }
@@ -740,10 +789,10 @@ func (p *QQMusicProvider) buildCommonParams(uid, sid string) map[string]interfac
 
 func getGUID() string {
 	const chars = "0123456789abcdef"
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	var b strings.Builder
+	b.Grow(32)
 	for i := 0; i < 32; i++ {
-		b.WriteByte(chars[r.Intn(len(chars))])
+		b.WriteByte(chars[rand.Intn(len(chars))])
 	}
 	return b.String()
 }
@@ -800,45 +849,36 @@ func (p *QQMusicProvider) NormalizeSong(item songItem) domain.SongCatalogItem {
 	if title == "" {
 		title = item.Name
 	}
-	singer := ""
-	if len(item.Singer) > 0 {
-		singer = item.Singer[0].Name
+	var artists []string
+	for _, s := range item.Singer {
+		if s.Name != "" {
+			artists = append(artists, s.Name)
+		}
 	}
 	album := item.Album.Title
 	if album == "" {
 		album = item.Album.Name
 	}
-	platID := item.Mid
-	if platID == "" && item.ID > 0 {
-		platID = strconv.FormatInt(item.ID, 10)
+
+	sourceID := item.Mid
+	if sourceID == "" && item.ID > 0 {
+		sourceID = strconv.FormatInt(item.ID, 10)
 	}
 
-	idMap := map[string]string{}
+	var extURL string
 	if item.Mid != "" {
-		idMap["qq"] = item.Mid
-	}
-	if item.ID > 0 {
-		idMap["qq_id"] = strconv.FormatInt(item.ID, 10)
-	}
-
-	var artURL *string
-	if item.Album.ID > 0 || item.Mid != "" {
-		u := fmt.Sprintf("https://y.gtimg.cn/music/photo_new/T002R300x300M000%s.jpg", platID)
-		artURL = &u
+		extURL = "https://y.qq.com/n/ryqq/songDetail/" + item.Mid
 	}
 
 	return domain.SongCatalogItem{
-		ID:           idMap,
-		SourceID:     platID,
+		ID:           map[string]string{"qq": sourceID},
+		SourceID:     sourceID,
 		Title:        title,
-		Artist:       singer,
+		Artist:       strings.Join(artists, ", "),
 		Album:        album,
-		AlbumArtURL:  artURL,
 		DurationMs:   int64(item.Interval * 1000),
 		Availability: []string{"QQ Music"},
-		ExternalURLs: map[string]string{
-			"qq": fmt.Sprintf("https://y.qq.com/n/ryqq/songDetail/%s", platID),
-		},
+		ExternalURLs: map[string]string{"qq": extURL},
 	}
 }
 
@@ -873,22 +913,22 @@ func (p *QQMusicProvider) GetMetadata(ctx context.Context, title, artist, album 
 		if len(s.Singer) > 0 {
 			singer = s.Singer[0].Name
 		}
-		t := s.Title
-		if t == "" {
-			t = s.Name
+		tName := s.Title
+		if tName == "" {
+			tName = s.Name
 		}
-		al := s.Album.Title
-		if al == "" {
-			al = s.Album.Name
+		alName := s.Album.Title
+		if alName == "" {
+			alName = s.Album.Name
 		}
 		platID := s.Mid
 		if platID == "" && s.ID > 0 {
 			platID = strconv.FormatInt(s.ID, 10)
 		}
 		candidates = append(candidates, similarity.SongCandidate{
-			Title:      t,
+			Title:      tName,
 			Artist:     singer,
-			Album:      al,
+			Album:      alName,
 			DurationMs: s.Interval * 1000,
 			PlatformID: platID,
 			Data:       s,
@@ -903,9 +943,9 @@ func (p *QQMusicProvider) GetMetadata(ctx context.Context, title, artist, album 
 	if tName == "" {
 		tName = matched.Name
 	}
-	singerName := ""
+	singer := ""
 	if len(matched.Singer) > 0 {
-		singerName = matched.Singer[0].Name
+		singer = matched.Singer[0].Name
 	}
 	alName := matched.Album.Title
 	if alName == "" {
@@ -917,12 +957,11 @@ func (p *QQMusicProvider) GetMetadata(ctx context.Context, title, artist, album 
 	}
 	meta := map[string]interface{}{
 		"name":       tName,
-		"artistName": singerName,
+		"artistName": singer,
 		"albumName":  alName,
 		"durationMs": matched.Interval * 1000,
 		"id":         platID,
 		"source":     "QQ Music",
-		"url":        fmt.Sprintf("https://y.qq.com/n/ryqq/songDetail/%s", platID),
 	}
 	return meta, nil
 }

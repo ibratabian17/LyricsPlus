@@ -6,8 +6,11 @@ import (
 	"sort"
 	"strings"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/mozillazg/go-unidecode"
 )
+
+var titleAnalysisCache, _ = lru.New[string, Analysis](4096)
 
 func normalizeString(str string) string {
 	if str == "" {
@@ -27,7 +30,7 @@ func getNGrams(str string, size int) map[string]bool {
 	if len(runes) < size {
 		return map[string]bool{}
 	}
-	set := make(map[string]bool)
+	set := make(map[string]bool, len(runes)-size+1)
 	for i := 0; i <= len(runes)-size; i++ {
 		set[string(runes[i:i+size])] = true
 	}
@@ -40,6 +43,9 @@ func SorensenDice(str1, str2 string) float64 {
 	}
 	if str1 == "" || str2 == "" {
 		return 0.0
+	}
+	if str1 == str2 {
+		return 1.0
 	}
 	bigrams1 := getNGrams(str1, 2)
 	bigrams2 := getNGrams(str2, 2)
@@ -100,6 +106,9 @@ func minInt(a, b int) int {
 }
 
 func LevenshteinNorm(str1, str2 string) float64 {
+	if str1 == str2 {
+		return 1.0
+	}
 	r1 := []rune(str1)
 	r2 := []rune(str2)
 	maxLen := math.Max(float64(len(r1)), float64(len(r2)))
@@ -246,64 +255,87 @@ func AnalyzeTitle(title string) Analysis {
 	if strings.TrimSpace(title) == "" {
 		return Analysis{Tags: map[string]bool{}, FeatArtists: []string{}, BracketContents: []string{}}
 	}
+	if titleAnalysisCache != nil {
+		if cached, ok := titleAnalysisCache.Get(title); ok {
+			return cached
+		}
+	}
 	tags := map[string]bool{}
 	var featArtists []string
 	var bracketContents []string
 
 	cleanTitle := strings.ToLower(title)
 
-	fa, cleaned := extractFeatPat(cleanTitle)
-	featArtists = append(featArtists, fa...)
-	cleanTitle = cleaned
+	if strings.Contains(cleanTitle, "feat") || strings.Contains(cleanTitle, "ft") || strings.Contains(cleanTitle, "with") {
+		fa, cleaned := extractFeatPat(cleanTitle)
+		featArtists = append(featArtists, fa...)
+		cleanTitle = cleaned
+	}
+
+	hasBracketsOrDash := strings.ContainsAny(cleanTitle, "([{-")
 
 	cleanTitle = keepTitleChars.ReplaceAllString(cleanTitle, " ")
 	cleanTitle = collapseSpace.ReplaceAllString(cleanTitle, " ")
 
-	for _, p := range anchorTagPatterns {
-		if p.re.MatchString(cleanTitle) {
-			tags[p.tag] = true
-		}
-	}
-
-	bracketMatch := bracketRegex.FindAllStringSubmatch(cleanTitle, -1)
-	for _, m := range bracketMatch {
-		content := m[1]
-		if content == "" {
-			content = m[2]
-		}
-		if content == "" {
-			content = m[3]
-		}
-		content = strings.TrimSpace(content)
-		if content != "" {
-			bracketContents = append(bracketContents, content)
-			for _, ck := range contentKeywordMap {
-				if ck.kw.MatchString(content) {
-					tags[ck.tag] = true
-				}
+	if hasBracketsOrDash {
+		for _, p := range anchorTagPatterns {
+			if p.re.MatchString(cleanTitle) {
+				tags[p.tag] = true
 			}
 		}
+
+		if strings.ContainsAny(cleanTitle, "([{") {
+			bracketMatch := bracketRegex.FindAllStringSubmatch(cleanTitle, -1)
+			for _, m := range bracketMatch {
+				content := m[1]
+				if content == "" {
+					content = m[2]
+				}
+				if content == "" {
+					content = m[3]
+				}
+				content = strings.TrimSpace(content)
+				if content != "" {
+					bracketContents = append(bracketContents, content)
+					for _, ck := range contentKeywordMap {
+						if ck.kw.MatchString(content) {
+							tags[ck.tag] = true
+						}
+					}
+				}
+			}
+
+			cleanTitle = stripSquare.ReplaceAllString(cleanTitle, " ")
+			cleanTitle = stripParen.ReplaceAllString(cleanTitle, " ")
+			cleanTitle = stripBrace.ReplaceAllString(cleanTitle, " ")
+		}
+		if strings.Contains(cleanTitle, " - ") {
+			cleanTitle = trailingDashSegment.ReplaceAllString(cleanTitle, " ")
+		}
+		cleanTitle = collapseSpace.ReplaceAllString(cleanTitle, " ")
 	}
 
-	cleanTitle = stripSquare.ReplaceAllString(cleanTitle, " ")
-	cleanTitle = stripParen.ReplaceAllString(cleanTitle, " ")
-	cleanTitle = stripBrace.ReplaceAllString(cleanTitle, " ")
-	cleanTitle = trailingDashSegment.ReplaceAllString(cleanTitle, " ")
-	cleanTitle = collapseSpace.ReplaceAllString(cleanTitle, " ")
 	cleanTitle = strings.TrimSpace(cleanTitle)
 	cleanTitle = stripLeadingArticle.ReplaceAllString(cleanTitle, "")
 	cleanTitle = stripTrailingArticle.ReplaceAllString(cleanTitle, "")
 
-	return Analysis{BaseTitle: cleanTitle, Tags: tags, FeatArtists: featArtists, BracketContents: bracketContents}
+	res := Analysis{BaseTitle: cleanTitle, Tags: tags, FeatArtists: featArtists, BracketContents: bracketContents}
+	if titleAnalysisCache != nil {
+		titleAnalysisCache.Add(title, res)
+	}
+	return res
 }
 
 func normalizeArtistName(artist string) string {
 	if artist == "" {
 		return ""
 	}
-	normalized := strings.ToLower(bracketStripper.ReplaceAllString(artist, ""))
+	lower := strings.ToLower(artist)
+	if strings.ContainsAny(lower, "([") {
+		lower = bracketStripper.ReplaceAllString(lower, "")
+	}
 	var parts []string
-	for _, name := range artistSeparator.Split(normalized, -1) {
+	for _, name := range artistSeparator.Split(lower, -1) {
 		name = strings.ReplaceAll(name, "the", "")
 		name = collapseSpace.ReplaceAllString(name, " ")
 		name = strings.TrimSpace(name)
@@ -311,7 +343,9 @@ func normalizeArtistName(artist string) string {
 			parts = append(parts, name)
 		}
 	}
-	sort.Strings(parts)
+	if len(parts) > 1 {
+		sort.Strings(parts)
+	}
 	return strings.Join(parts, " ")
 }
 
@@ -358,83 +392,102 @@ func containsNonASCII(s string) bool {
 	return false
 }
 
-func TitleSimilarity(title1, title2 string) float64 {
-	computeScore := func(t1, t2 string) float64 {
-		if t1 == "" || t2 == "" {
-			return 0
-		}
-		analysis1 := AnalyzeTitle(t1)
-		analysis2 := AnalyzeTitle(t2)
-		crit1 := criticalTagsOf(analysis1.Tags)
-		crit2 := criticalTagsOf(analysis2.Tags)
+func computeTitleAnalysisScore(analysis1, analysis2 Analysis) float64 {
+	crit1 := criticalTagsOf(analysis1.Tags)
+	crit2 := criticalTagsOf(analysis2.Tags)
 
-		if analysis1.BaseTitle == analysis2.BaseTitle && len(analysis1.BaseTitle) > 0 {
-			oneSideCritical := false
-			for _, t := range crit1 {
-				if !analysis2.Tags[t] {
-					oneSideCritical = true
-				}
+	if analysis1.BaseTitle == analysis2.BaseTitle && len(analysis1.BaseTitle) > 0 {
+		oneSideCritical := false
+		for _, t := range crit1 {
+			if !analysis2.Tags[t] {
+				oneSideCritical = true
 			}
-			for _, t := range crit2 {
-				if !analysis1.Tags[t] {
-					oneSideCritical = true
-				}
-			}
-			if oneSideCritical {
-				bothConflict := len(crit1) > 0 && len(crit2) > 0 && !sharesAny(crit1, crit2)
-				if bothConflict {
-					return 0.65
-				}
-				return 0.72
-			}
-			candHasExtra := len(analysis1.BracketContents) > len(analysis2.BracketContents)
-			queryHasExtra := len(analysis2.BracketContents) > len(analysis1.BracketContents)
-			if candHasExtra || queryHasExtra {
-				return 0.88
-			}
-			return 1.0
 		}
-
-		diceScore := SorensenDice(analysis1.BaseTitle, analysis2.BaseTitle)
-		if diceScore < 0.2 {
-			return 0
-		}
-		maxLength := math.Max(float64(len(analysis1.BaseTitle)), float64(len(analysis2.BaseTitle)))
-		levenshteinScore := 0.0
-		if maxLength > 0 {
-			levenshteinScore = 1 - float64(levenshteinDistance(analysis1.BaseTitle, analysis2.BaseTitle))/maxLength
-		}
-		baseSimilarity := diceScore*0.7 + levenshteinScore*0.3
-
-		tagPenalty := 0.0
-		if len(crit1) > 0 && len(crit2) > 0 {
-			hasConflict := true
-			for _, t := range crit1 {
-				if containsString(crit2, t) {
-					hasConflict = false
-				}
+		for _, t := range crit2 {
+			if !analysis1.Tags[t] {
+				oneSideCritical = true
 			}
-			if hasConflict {
-				tagPenalty = 0.4
-			}
-		} else if len(crit1) > 0 || len(crit2) > 0 {
-			tagPenalty = 0.15
 		}
-
-		return math.Max(0, baseSimilarity-tagPenalty)
+		if oneSideCritical {
+			bothConflict := len(crit1) > 0 && len(crit2) > 0 && !sharesAny(crit1, crit2)
+			if bothConflict {
+				return 0.65
+			}
+			return 0.72
+		}
+		candHasExtra := len(analysis1.BracketContents) > len(analysis2.BracketContents)
+		queryHasExtra := len(analysis2.BracketContents) > len(analysis1.BracketContents)
+		if candHasExtra || queryHasExtra {
+			return 0.88
+		}
+		return 1.0
 	}
 
-	scoreOriginal := computeScore(title1, title2)
+	diceScore := SorensenDice(analysis1.BaseTitle, analysis2.BaseTitle)
+	if diceScore < 0.2 {
+		return 0
+	}
+	maxLength := math.Max(float64(len(analysis1.BaseTitle)), float64(len(analysis2.BaseTitle)))
+	levenshteinScore := 0.0
+	if maxLength > 0 {
+		levenshteinScore = 1 - float64(levenshteinDistance(analysis1.BaseTitle, analysis2.BaseTitle))/maxLength
+	}
+	baseSimilarity := diceScore*0.7 + levenshteinScore*0.3
+
+	tagPenalty := 0.0
+	if len(crit1) > 0 && len(crit2) > 0 {
+		hasConflict := true
+		for _, t := range crit1 {
+			if containsString(crit2, t) {
+				hasConflict = false
+			}
+		}
+		if hasConflict {
+			tagPenalty = 0.4
+		}
+	} else if len(crit1) > 0 || len(crit2) > 0 {
+		tagPenalty = 0.15
+	}
+
+	return math.Max(0, baseSimilarity-tagPenalty)
+}
+
+func TitleSimilarity(title1, title2 string) float64 {
+	if title1 == "" || title2 == "" {
+		return 0
+	}
+	if strings.EqualFold(strings.TrimSpace(title1), strings.TrimSpace(title2)) {
+		return 1.0
+	}
+	return titleSimilarityWithAnalysis(title1, title2, AnalyzeTitle(title1), AnalyzeTitle(title2))
+}
+
+func titleSimilarityWithAnalysis(title1, title2 string, analysis1, analysis2 Analysis) float64 {
+	if title1 == "" || title2 == "" {
+		return 0
+	}
+	if strings.EqualFold(strings.TrimSpace(title1), strings.TrimSpace(title2)) {
+		return 1.0
+	}
+	scoreOriginal := computeTitleAnalysisScore(analysis1, analysis2)
 	if scoreOriginal >= 0.8 {
 		return scoreOriginal
 	}
 	if !containsNonASCII(title1) && !containsNonASCII(title2) {
 		return scoreOriginal
 	}
-	return math.Max(scoreOriginal, computeScore(translit(title1), translit(title2)))
+	t1 := translit(title1)
+	t2 := translit(title2)
+	return math.Max(scoreOriginal, computeTitleAnalysisScore(AnalyzeTitle(t1), AnalyzeTitle(t2)))
 }
 
 func ArtistSimilarity(artist1, artist2 string, analysis1, analysis2 *Analysis) float64 {
+	if artist1 == "" || artist2 == "" {
+		return 0
+	}
+	if strings.EqualFold(strings.TrimSpace(artist1), strings.TrimSpace(artist2)) {
+		return 1.0
+	}
 	computeScore := func(a1, a2 string, feats1, feats2 []string) float64 {
 		if a1 == "" || a2 == "" {
 			return 0
@@ -575,6 +628,9 @@ func AlbumSimilarity(album1, album2 string) float64 {
 	if album1 == "" || album2 == "" {
 		return 0.5
 	}
+	if strings.EqualFold(strings.TrimSpace(album1), strings.TrimSpace(album2)) {
+		return 1.0
+	}
 	stripNoise := func(s string) string {
 		s = stripAlbumSingleEP.ReplaceAllString(s, "")
 		s = stripAlbumNoise.ReplaceAllString(s, "")
@@ -585,10 +641,13 @@ func AlbumSimilarity(album1, album2 string) float64 {
 	if norm1 == norm2 {
 		return 1.0
 	}
-	dice := math.Max(
-		SorensenDice(norm1, norm2),
-		SorensenDice(normalizeString(stripNoise(translit(album1))), normalizeString(stripNoise(translit(album2)))),
-	)
+	dice := SorensenDice(norm1, norm2)
+	if containsNonASCII(album1) || containsNonASCII(album2) {
+		dice = math.Max(
+			dice,
+			SorensenDice(normalizeString(stripNoise(translit(album1))), normalizeString(stripNoise(translit(album2)))),
+		)
+	}
 	if dice < 0.2 {
 		return 0.1
 	}
@@ -624,11 +683,20 @@ func SongSimilarity(candTitle, candArtist, candAlbum string, candDur float64,
 	if candTitle == "" || candArtist == "" {
 		return ScoreInfo{Score: 0, Reason: "Missing title or artist"}
 	}
-
 	queryTitleAnalysis := AnalyzeTitle(queryTitle)
+	return songSimilarityWithQueryAnalysis(candTitle, candArtist, candAlbum, candDur, queryTitle, queryArtist, queryAlbum, queryDur, queryTitleAnalysis)
+}
+
+func songSimilarityWithQueryAnalysis(candTitle, candArtist, candAlbum string, candDur float64,
+	queryTitle, queryArtist, queryAlbum string, queryDur float64, queryTitleAnalysis Analysis) ScoreInfo {
+
+	if candTitle == "" || candArtist == "" {
+		return ScoreInfo{Score: 0, Reason: "Missing title or artist"}
+	}
+
 	candTitleAnalysis := AnalyzeTitle(candTitle)
 
-	titleScore := TitleSimilarity(candTitle, queryTitle)
+	titleScore := titleSimilarityWithAnalysis(candTitle, queryTitle, candTitleAnalysis, queryTitleAnalysis)
 	artistScore := ArtistSimilarity(candArtist, queryArtist, &candTitleAnalysis, &queryTitleAnalysis)
 	albumScore := AlbumSimilarity(candAlbum, queryAlbum)
 	durationScore := DurationSimilarity(candDur, queryDur)
@@ -753,6 +821,8 @@ func FindBestSongMatch(candidates []SongCandidate, queryTitle, queryArtist, quer
 		return nil
 	}
 
+	queryAnalysis := AnalyzeTitle(queryTitle)
+
 	type scored struct {
 		cand      SongCandidate
 		scoreInfo ScoreInfo
@@ -778,7 +848,7 @@ func FindBestSongMatch(candidates []SongCandidate, queryTitle, queryArtist, quer
 			}
 		} else {
 			candDur := float64(cand.DurationMs) / 1000.0
-			info = SongSimilarity(cand.Title, cand.Artist, cand.Album, candDur, queryTitle, queryArtist, queryAlbum, queryDurationSec)
+			info = songSimilarityWithQueryAnalysis(cand.Title, cand.Artist, cand.Album, candDur, queryTitle, queryArtist, queryAlbum, queryDurationSec, queryAnalysis)
 		}
 		scoredList = append(scoredList, scored{cand: cand, scoreInfo: info})
 	}

@@ -157,6 +157,10 @@ func (c *Collector) RecordProviderCall(providerID string, status string, elapsed
 	}
 	c.platformMu.Unlock()
 
+	if status == "CANCEL" {
+		return
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.totalCalls++

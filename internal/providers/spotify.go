@@ -18,6 +18,9 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
+	"golang.org/x/sync/singleflight"
+
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/logger"
@@ -34,6 +37,7 @@ const (
 	spotifyAuthURL          = "https://accounts.spotify.com/api/token"
 	spotifyDefaultSecretURL = "https://raw.githubusercontent.com/Thereallo1026/spotify-secrets/main/secrets/secretDict.json"
 	spotifyDefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+	spotifySearchCacheTTL   = 5 * time.Minute
 )
 
 var spotifyUserAgents = []string{
@@ -57,6 +61,11 @@ func BestSecret() []int {
 	return fallbackSecrets["14"]
 }
 
+type spotifySearchCacheEntry struct {
+	tracks  []spotifyTrack
+	created time.Time
+}
+
 type SpotifyProvider struct {
 	client *proxy.Client
 	mgm    *AccountManager[config.SpotifyAccount]
@@ -70,11 +79,19 @@ type SpotifyProvider struct {
 	secretsMu   sync.Mutex
 	secretsDict map[string][]int
 	secretsTime time.Time
+
+	timeMu            sync.Mutex
+	serverTimeOffset  time.Duration
+	serverTimeChecked time.Time
+
+	flightGroup singleflight.Group
+	searchCache *lru.Cache[string, *spotifySearchCacheEntry]
 }
 
 type spotifyCachedToken struct {
-	token   string
-	expires time.Time
+	token     string
+	expires   time.Time
+	failUntil time.Time
 }
 
 func NewSpotify(client *proxy.Client) *SpotifyProvider {
@@ -94,12 +111,14 @@ func NewSpotifyWithConfig(client *proxy.Client, cfg config.Provider) *SpotifyPro
 	for i := range accounts {
 		accounts[i].COOKIE = normalizeCookie(accounts[i].COOKIE)
 	}
+	sc, _ := lru.New[string, *spotifySearchCacheEntry](1024)
 	return &SpotifyProvider{
 		client:      client,
 		mgm:         newAccountManager(accounts),
 		webTok:      map[int]*spotifyCachedToken{},
 		apiTok:      map[int]*spotifyCachedToken{},
 		secretsDict: fallbackSecrets,
+		searchCache: sc,
 	}
 }
 
@@ -235,10 +254,14 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	}
 	p.debugf("lyrics parsed lines=%d track=%s", len(converted.Lyrics), trackID)
 
-	if songWriters, werr := p.fetchSpotifySongwriters(ctx, trackID); werr == nil {
-		converted.Metadata.SongWriters = songWriters
-	} else {
-		converted.Metadata.SongWriters = []string{}
+	if len(converted.Metadata.SongWriters) == 0 {
+		wCtx, wCancel := context.WithTimeout(ctx, 1200*time.Millisecond)
+		if songWriters, werr := p.fetchSpotifySongwriters(wCtx, trackID); werr == nil && len(songWriters) > 0 {
+			converted.Metadata.SongWriters = songWriters
+		} else {
+			converted.Metadata.SongWriters = []string{}
+		}
+		wCancel()
 	}
 
 	if converted.Metadata.Source == "" {
@@ -292,76 +315,105 @@ type spotifyTrack struct {
 }
 
 func (p *SpotifyProvider) getWebToken(ctx context.Context, accountIdx int) (string, error) {
+	now := time.Now()
 	p.webTokMu.Lock()
-	if tok, ok := p.webTok[accountIdx]; ok && time.Now().Before(tok.expires) {
-		p.webTokMu.Unlock()
-		return tok.token, nil
+	if tok, ok := p.webTok[accountIdx]; ok {
+		if tok.token != "" && now.Before(tok.expires) {
+			t := tok.token
+			p.webTokMu.Unlock()
+			return t, nil
+		}
+		if now.Before(tok.failUntil) {
+			p.webTokMu.Unlock()
+			return "", fmt.Errorf("spotify: web token in cooldown")
+		}
 	}
 	p.webTokMu.Unlock()
 
-	acc, ok := p.mgm.At(accountIdx)
-	if !ok || acc.COOKIE == "" {
-		return "", fmt.Errorf("spotify: no web-token account available")
-	}
-	cookie := normalizeCookie(acc.COOKIE)
-
-	totp, ver, err := p.generateTOTP(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	headers := make(http.Header)
-	headers.Set("Cookie", cookie)
-	headers.Set("User-Agent", getRandomSpotifyUserAgent())
-	headers.Set("app-platform", "WebPlayer")
-	headers.Set("Referer", "https://open.spotify.com/")
-
-	tokenEndpoint := fmt.Sprintf("https://open.spotify.com/api/token?reason=transport&productType=web-player&totp=%s&totpServer=%s&totpVer=%s",
-		url.QueryEscape(totp), url.QueryEscape(totp), url.QueryEscape(strconv.Itoa(ver)))
-
-	resp, err := p.client.Get(ctx, tokenEndpoint, headers)
-	if err != nil || (resp != nil && resp.StatusCode != http.StatusOK) {
-		if resp != nil {
-			_ = resp.Body.Close()
+	sfKey := "webtok:" + strconv.Itoa(accountIdx)
+	v, err, _ := p.flightGroup.Do(sfKey, func() (any, error) {
+		p.webTokMu.Lock()
+		if tok, ok := p.webTok[accountIdx]; ok && tok.token != "" && time.Now().Before(tok.expires) {
+			t := tok.token
+			p.webTokMu.Unlock()
+			return t, nil
 		}
-		initEndpoint := fmt.Sprintf("https://open.spotify.com/api/token?reason=init&productType=web-player&totp=%s&totpServer=%s&totpVer=%s",
-			url.QueryEscape(totp), url.QueryEscape(totp), url.QueryEscape(strconv.Itoa(ver)))
-		resp, err = p.client.Get(ctx, initEndpoint, headers)
+		p.webTokMu.Unlock()
+
+		acc, ok := p.mgm.At(accountIdx)
+		if !ok || acc.COOKIE == "" {
+			return "", fmt.Errorf("spotify: no web-token account available")
+		}
+		cookie := normalizeCookie(acc.COOKIE)
+
+		totp, ver, err := p.generateTOTP(ctx)
 		if err != nil {
 			return "", err
 		}
-	}
-	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("spotify web token error %d: %s", resp.StatusCode, string(b))
-	}
+		headers := make(http.Header)
+		headers.Set("Cookie", cookie)
+		headers.Set("User-Agent", getRandomSpotifyUserAgent())
+		headers.Set("app-platform", "WebPlayer")
+		headers.Set("Referer", "https://open.spotify.com/")
 
-	var res struct {
-		ClientID                string `json:"clientId"`
-		AccessToken             string `json:"accessToken"`
-		AccessTokenExpirationMs int64  `json:"accessTokenExpirationTimestampMs"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		tokenEndpoint := fmt.Sprintf("https://open.spotify.com/api/token?reason=transport&productType=web-player&totp=%s&totpServer=%s&totpVer=%s",
+			url.QueryEscape(totp), url.QueryEscape(totp), url.QueryEscape(strconv.Itoa(ver)))
+
+		resp, err := p.client.Get(ctx, tokenEndpoint, headers)
+		if err != nil || (resp != nil && resp.StatusCode != http.StatusOK) {
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+			initEndpoint := fmt.Sprintf("https://open.spotify.com/api/token?reason=init&productType=web-player&totp=%s&totpServer=%s&totpVer=%s",
+				url.QueryEscape(totp), url.QueryEscape(totp), url.QueryEscape(strconv.Itoa(ver)))
+			resp, err = p.client.Get(ctx, initEndpoint, headers)
+			if err != nil {
+				p.webTokMu.Lock()
+				p.webTok[accountIdx] = &spotifyCachedToken{failUntil: time.Now().Add(15 * time.Second)}
+				p.webTokMu.Unlock()
+				return "", err
+			}
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			p.webTokMu.Lock()
+			p.webTok[accountIdx] = &spotifyCachedToken{failUntil: time.Now().Add(20 * time.Second)}
+			p.webTokMu.Unlock()
+			return "", fmt.Errorf("spotify web token error %d: %s", resp.StatusCode, string(b))
+		}
+
+		var res struct {
+			ClientID                string `json:"clientId"`
+			AccessToken             string `json:"accessToken"`
+			AccessTokenExpirationMs int64  `json:"accessTokenExpirationTimestampMs"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			return "", err
+		}
+		if res.AccessToken == "" {
+			return "", fmt.Errorf("spotify: empty access token")
+		}
+
+		tok := &spotifyCachedToken{token: res.AccessToken}
+		if res.AccessTokenExpirationMs > 0 {
+			tok.expires = time.UnixMilli(res.AccessTokenExpirationMs)
+		} else {
+			tok.expires = time.Now().Add(50 * time.Minute)
+		}
+
+		p.webTokMu.Lock()
+		p.webTok[accountIdx] = tok
+		p.webTokMu.Unlock()
+
+		return tok.token, nil
+	})
+	if err != nil {
 		return "", err
 	}
-	if res.AccessToken == "" {
-		return "", fmt.Errorf("spotify: empty access token")
-	}
-
-	tok := &spotifyCachedToken{token: res.AccessToken}
-	if res.AccessTokenExpirationMs > 0 {
-		tok.expires = time.UnixMilli(res.AccessTokenExpirationMs)
-	} else {
-		tok.expires = time.Now().Add(50 * time.Minute)
-	}
-
-	p.webTokMu.Lock()
-	p.webTok[accountIdx] = tok
-	p.webTokMu.Unlock()
-
-	return tok.token, nil
+	return v.(string), nil
 }
 
 func (p *SpotifyProvider) getAPIToken(ctx context.Context, accountIdx int) (string, error) {
@@ -374,52 +426,81 @@ func (p *SpotifyProvider) getAPIToken(ctx context.Context, accountIdx int) (stri
 		return p.getWebToken(ctx, accountIdx)
 	}
 
+	now := time.Now()
 	p.apiTokMu.Lock()
-	if tok, ok := p.apiTok[accountIdx]; ok && time.Now().Before(tok.expires) {
-		p.apiTokMu.Unlock()
-		return tok.token, nil
-	}
-	p.apiTokMu.Unlock()
-
-	authBasic := base64.StdEncoding.EncodeToString([]byte(acc.CLIENT_ID + ":" + acc.CLIENT_SECRET))
-	headers := make(http.Header)
-	headers.Set("Authorization", "Basic "+authBasic)
-	headers.Set("Content-Type", "application/x-www-form-urlencoded")
-
-	body := []byte("grant_type=client_credentials")
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, spotifyAuthURL, strings.NewReader(string(body)))
-	if err != nil {
-		return "", err
-	}
-	for k, vv := range headers {
-		for _, v := range vv {
-			req.Header.Add(k, v)
+	if tok, ok := p.apiTok[accountIdx]; ok {
+		if tok.token != "" && now.Before(tok.expires) {
+			t := tok.token
+			p.apiTokMu.Unlock()
+			return t, nil
+		}
+		if now.Before(tok.failUntil) {
+			p.apiTokMu.Unlock()
+			return "", fmt.Errorf("spotify: api token in cooldown")
 		}
 	}
+	p.apiTokMu.Unlock()
 
-	resp, err := p.client.Do(req)
+	sfKey := "apitok:" + strconv.Itoa(accountIdx)
+	v, err, _ := p.flightGroup.Do(sfKey, func() (any, error) {
+		p.apiTokMu.Lock()
+		if tok, ok := p.apiTok[accountIdx]; ok && tok.token != "" && time.Now().Before(tok.expires) {
+			t := tok.token
+			p.apiTokMu.Unlock()
+			return t, nil
+		}
+		p.apiTokMu.Unlock()
+
+		authBasic := base64.StdEncoding.EncodeToString([]byte(acc.CLIENT_ID + ":" + acc.CLIENT_SECRET))
+		headers := make(http.Header)
+		headers.Set("Authorization", "Basic "+authBasic)
+		headers.Set("Content-Type", "application/x-www-form-urlencoded")
+
+		body := []byte("grant_type=client_credentials")
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, spotifyAuthURL, strings.NewReader(string(body)))
+		if err != nil {
+			return "", err
+		}
+		for k, vv := range headers {
+			for _, v := range vv {
+				req.Header.Add(k, v)
+			}
+		}
+
+		resp, err := p.client.Do(req)
+		if err != nil {
+			p.apiTokMu.Lock()
+			p.apiTok[accountIdx] = &spotifyCachedToken{failUntil: time.Now().Add(15 * time.Second)}
+			p.apiTokMu.Unlock()
+			return "", err
+		}
+		defer func() { _ = resp.Body.Close() }()
+
+		var res struct {
+			AccessToken string `json:"access_token"`
+			ExpiresIn   int    `json:"expires_in"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+			return "", err
+		}
+		if res.AccessToken == "" {
+			p.apiTokMu.Lock()
+			p.apiTok[accountIdx] = &spotifyCachedToken{failUntil: time.Now().Add(20 * time.Second)}
+			p.apiTokMu.Unlock()
+			return "", fmt.Errorf("spotify client credentials returned no token")
+		}
+
+		tok := &spotifyCachedToken{token: res.AccessToken, expires: time.Now().Add(time.Duration(res.ExpiresIn-60) * time.Second)}
+
+		p.apiTokMu.Lock()
+		p.apiTok[accountIdx] = tok
+		p.apiTokMu.Unlock()
+		return tok.token, nil
+	})
 	if err != nil {
 		return "", err
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var res struct {
-		AccessToken string `json:"access_token"`
-		ExpiresIn   int    `json:"expires_in"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return "", err
-	}
-	if res.AccessToken == "" {
-		return "", fmt.Errorf("spotify client credentials returned no token")
-	}
-
-	tok := &spotifyCachedToken{token: res.AccessToken, expires: time.Now().Add(time.Duration(res.ExpiresIn-60) * time.Second)}
-
-	p.apiTokMu.Lock()
-	p.apiTok[accountIdx] = tok
-	p.apiTokMu.Unlock()
-	return tok.token, nil
+	return v.(string), nil
 }
 
 func (p *SpotifyProvider) doSpotifyRequest(ctx context.Context, urlstr string, extra http.Header, retries, accountIdx int) (*http.Response, error) {
@@ -441,6 +522,12 @@ func (p *SpotifyProvider) doSpotifyRequest(ctx context.Context, urlstr string, e
 		if headers.Get("Authorization") == "" {
 			token, err := p.getWebToken(ctx, accountIdx)
 			if err != nil {
+				p.mgm.MarkBad(accountIdx, 20*time.Second)
+				if retries < maxAccountRetries {
+					if next, hasNext := p.mgm.Next(accountIdx); hasNext {
+						return p.doSpotifyRequest(ctx, urlstr, extra, retries+1, next)
+					}
+				}
 				return nil, err
 			}
 			headers.Set("Authorization", "Bearer "+token)
@@ -453,6 +540,12 @@ func (p *SpotifyProvider) doSpotifyRequest(ctx context.Context, urlstr string, e
 		if headers.Get("Authorization") == "" {
 			token, err := p.getAPIToken(ctx, accountIdx)
 			if err != nil {
+				p.mgm.MarkBad(accountIdx, 20*time.Second)
+				if retries < maxAccountRetries {
+					if next, hasNext := p.mgm.Next(accountIdx); hasNext {
+						return p.doSpotifyRequest(ctx, urlstr, extra, retries+1, next)
+					}
+				}
 				return nil, err
 			}
 			headers.Set("Authorization", "Bearer "+token)
@@ -479,11 +572,11 @@ func (p *SpotifyProvider) doSpotifyRequest(ctx context.Context, urlstr string, e
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
 		errMsg, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		message := parseSpotifyErrorMessage(errMsg)
-		if resp.StatusCode == http.StatusUnauthorized {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			p.webTokMu.Lock()
 			delete(p.webTok, accountIdx)
 			p.webTokMu.Unlock()
@@ -491,6 +584,7 @@ func (p *SpotifyProvider) doSpotifyRequest(ctx context.Context, urlstr string, e
 			delete(p.apiTok, accountIdx)
 			p.apiTokMu.Unlock()
 		}
+		p.mgm.MarkBad(accountIdx, 20*time.Second)
 		if retries < maxAccountRetries {
 			if next, hasNext := p.mgm.Next(accountIdx); hasNext {
 				return p.doSpotifyRequest(ctx, urlstr, extra, retries+1, next)
@@ -539,6 +633,16 @@ func parseSpotifyErrorMessage(body []byte) string {
 }
 
 func (p *SpotifyProvider) SearchTrack(ctx context.Context, query string) ([]spotifyTrack, error) {
+	cleanQ := strings.ToLower(strings.TrimSpace(query))
+	if cleanQ == "" {
+		return nil, nil
+	}
+	if p.searchCache != nil {
+		if entry, ok := p.searchCache.Get(cleanQ); ok && entry != nil && time.Since(entry.created) < spotifySearchCacheTTL {
+			return entry.tracks, nil
+		}
+	}
+
 	searchURL := fmt.Sprintf("%s/search?q=%s&type=track&limit=10", spotifyBaseURL, url.QueryEscape(query))
 	resp, err := p.doSpotifyRequest(ctx, searchURL, nil, 0, p.mgm.CurrentIndex())
 	if err != nil {
@@ -553,6 +657,9 @@ func (p *SpotifyProvider) SearchTrack(ctx context.Context, query string) ([]spot
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
 		return nil, err
+	}
+	if p.searchCache != nil {
+		p.searchCache.Add(cleanQ, &spotifySearchCacheEntry{tracks: res.Tracks.Items, created: time.Now()})
 	}
 	return res.Tracks.Items, nil
 }
@@ -619,40 +726,61 @@ func (p *SpotifyProvider) generateTOTP(ctx context.Context) (string, int, error)
 	secretBytes := DeriveSecretBytes(cipherBytes)
 	serverTime, err := p.getServerTime(ctx)
 	if err != nil {
-		return "", 0, err
+		serverTime = time.Now().UTC()
 	}
 	totp := GenerateTOTP(secretBytes, serverTime.Unix(), 6, 30)
 	return totp, maxVer, nil
 }
 
 func (p *SpotifyProvider) getServerTime(ctx context.Context) (time.Time, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "https://open.spotify.com/", nil)
+	p.timeMu.Lock()
+	if !p.serverTimeChecked.IsZero() && time.Since(p.serverTimeChecked) < 30*time.Minute {
+		offset := p.serverTimeOffset
+		p.timeMu.Unlock()
+		return time.Now().UTC().Add(offset), nil
+	}
+	p.timeMu.Unlock()
+
+	tCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(tCtx, http.MethodHead, "https://open.spotify.com/", nil)
 	if err == nil {
 		req.Header.Set("User-Agent", spotifyDefaultUserAgent)
 		resp, err := p.client.Do(req)
 		if err == nil {
 			defer func() { _ = resp.Body.Close() }()
-			if resp.StatusCode == http.StatusOK {
-				dateHeader := resp.Header.Get("Date")
-				if dateHeader != "" {
-					if t, err := http.ParseTime(dateHeader); err == nil {
-						return t, nil
-					}
+			dateHeader := resp.Header.Get("Date")
+			if dateHeader != "" {
+				if t, err := http.ParseTime(dateHeader); err == nil {
+					p.timeMu.Lock()
+					p.serverTimeOffset = time.Until(t)
+					p.serverTimeChecked = time.Now()
+					p.timeMu.Unlock()
+					return t, nil
 				}
 			}
 		}
 	}
-	return time.Time{}, fmt.Errorf("failed to fetch spotify server time")
+	p.timeMu.Lock()
+	p.serverTimeChecked = time.Now()
+	offset := p.serverTimeOffset
+	p.timeMu.Unlock()
+	return time.Now().UTC().Add(offset), nil
 }
 
 func (p *SpotifyProvider) getSecrets(ctx context.Context) map[string][]int {
 	p.secretsMu.Lock()
 	defer p.secretsMu.Unlock()
-	if time.Since(p.secretsTime) < 4*time.Hour && len(p.secretsDict) > 0 {
+	if !p.secretsTime.IsZero() && time.Since(p.secretsTime) < 4*time.Hour && len(p.secretsDict) > 0 {
 		return p.secretsDict
 	}
+	p.secretsTime = time.Now()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spotifyDefaultSecretURL, nil)
+	sCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(sCtx, http.MethodGet, spotifyDefaultSecretURL, nil)
 	if err == nil {
 		resp, err := p.client.Do(req)
 		if err == nil {
@@ -661,7 +789,6 @@ func (p *SpotifyProvider) getSecrets(ctx context.Context) map[string][]int {
 				var dict map[string][]int
 				if json.NewDecoder(resp.Body).Decode(&dict) == nil && len(dict) > 0 {
 					p.secretsDict = dict
-					p.secretsTime = time.Now()
 					return dict
 				}
 			}

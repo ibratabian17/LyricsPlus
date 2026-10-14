@@ -201,7 +201,7 @@ func Default() Config {
 	return Config{
 		Server: Server{
 			Addr:             "3000",
-			MaxConcurrency:   15000,
+			MaxConcurrency:   2000,
 			MaxURLBytes:      4096,
 			MaxQueryParams:   20,
 			MaxQueryValueLen: 500,
@@ -215,10 +215,10 @@ func Default() Config {
 			ShutdownTimeout: 10 * time.Second,
 		},
 		Provider: Provider{
-			Timeout:                  8 * time.Second,
-			MaxConcurrentFetches:     4096,
-			MaxConcurrentPerSource:   1024,
-			FetchAdmissionWait:       2 * time.Second,
+			Timeout:                  6 * time.Second,
+			MaxConcurrentFetches:     256,
+			MaxConcurrentPerSource:   64,
+			FetchAdmissionWait:       500 * time.Millisecond,
 			SpotifySpotifySecretsURL: secretsURL,
 			SpotifySecretsURL:        secretsURL,
 			SpotifyFallbackSecrets: [][]int{
@@ -240,27 +240,27 @@ func Default() Config {
 			AllowSubmissions: true,
 		},
 		RateLimit: RateLimit{
-			Requests: 20,
+			Requests: 300,
 			Window:   10 * time.Second,
 		},
 		Storage: Storage{
 			DBPath:                  "database/lyrics_cache.db",
-			LRUSize:                 20000,
+			LRUSize:                 4096,
 			ReadConns:               8,
-			WriteQueueSize:          2048,
-			MissMemoSize:            5000,
-			ContentCacheBytes:       48 << 20,
+			WriteQueueSize:          1024,
+			MissMemoSize:            4096,
+			ContentCacheBytes:       32 << 20,
 			ExactTTL:                15 * time.Minute,
 			ExistingTTL:             15 * time.Minute,
 			NegativeTTL:             30 * time.Second,
-			CircuitBreakerThreshold: 5,
-			CircuitBreakerCooldown:  60 * time.Second,
+			CircuitBreakerThreshold: 8,
+			CircuitBreakerCooldown:  15 * time.Second,
 		},
 		Cache: Cache{
-			MaxEntries:         2000,
-			MaxBytes:           96 << 20,
+			MaxEntries:         4096,
+			MaxBytes:           64 << 20,
 			MaxBodyBytes:       1 << 20 * 3 / 2,
-			MemoryWatchdogByte: 3072 << 20,
+			MemoryWatchdogByte: 1536 << 20,
 		},
 		GDrive: GDrive{
 			Enabled:           false,
@@ -588,6 +588,21 @@ func loadJSONConfig(cfg *Config, path string) error {
 					if err := json.Unmarshal(pv, &t); err == nil {
 						cfg.Provider.Timeout = time.Duration(t) * time.Millisecond
 					}
+				case "max_concurrent_fetches":
+					var n int64
+					if err := json.Unmarshal(pv, &n); err == nil && n > 0 {
+						cfg.Provider.MaxConcurrentFetches = n
+					}
+				case "max_concurrent_per_source":
+					var n int64
+					if err := json.Unmarshal(pv, &n); err == nil && n > 0 {
+						cfg.Provider.MaxConcurrentPerSource = n
+					}
+				case "fetch_admission_wait_ms":
+					var t int
+					if err := json.Unmarshal(pv, &t); err == nil && t > 0 {
+						cfg.Provider.FetchAdmissionWait = time.Duration(t) * time.Millisecond
+					}
 				case "spotify_secrets_url":
 					var s string
 					if err := json.Unmarshal(pv, &s); err == nil {
@@ -691,13 +706,17 @@ func loadJSONConfig(cfg *Config, path string) error {
 	}
 	if raw, ok := rawMap["storage"]; ok {
 		var st struct {
-			DBPath            *string `json:"db_path"`
-			SQLitePath        *string `json:"sqlite_path"`
-			LRUSize           *int    `json:"lru_size"`
-			ContentCacheBytes *int64  `json:"content_cache_bytes"`
-			ExactTTLMS        *int    `json:"exact_ttl_ms"`
-			ExistingTTLMS     *int    `json:"existing_ttl_ms"`
-			NegativeTTLMS     *int    `json:"negative_ttl_ms"`
+			DBPath                  *string `json:"db_path"`
+			SQLitePath              *string `json:"sqlite_path"`
+			LRUSize                 *int    `json:"lru_size"`
+			ReadConns               *int    `json:"read_conns"`
+			WriteQueueSize          *int    `json:"write_queue_size"`
+			ContentCacheBytes       *int64  `json:"content_cache_bytes"`
+			ExactTTLMS              *int    `json:"exact_ttl_ms"`
+			ExistingTTLMS           *int    `json:"existing_ttl_ms"`
+			NegativeTTLMS           *int    `json:"negative_ttl_ms"`
+			CircuitBreakerThreshold *int    `json:"circuit_breaker_threshold"`
+			CircuitBreakerCooldown  *int    `json:"circuit_breaker_cooldown_ms"`
 		}
 		if err := json.Unmarshal(raw, &st); err == nil {
 			if st.SQLitePath != nil && *st.SQLitePath != "" {
@@ -707,6 +726,12 @@ func loadJSONConfig(cfg *Config, path string) error {
 			}
 			if st.LRUSize != nil {
 				cfg.Storage.LRUSize = *st.LRUSize
+			}
+			if st.ReadConns != nil && *st.ReadConns > 0 {
+				cfg.Storage.ReadConns = *st.ReadConns
+			}
+			if st.WriteQueueSize != nil && *st.WriteQueueSize > 0 {
+				cfg.Storage.WriteQueueSize = *st.WriteQueueSize
 			}
 			if st.ContentCacheBytes != nil {
 				cfg.Storage.ContentCacheBytes = *st.ContentCacheBytes
@@ -719,6 +744,34 @@ func loadJSONConfig(cfg *Config, path string) error {
 			}
 			if st.NegativeTTLMS != nil {
 				cfg.Storage.NegativeTTL = time.Duration(*st.NegativeTTLMS) * time.Millisecond
+			}
+			if st.CircuitBreakerThreshold != nil && *st.CircuitBreakerThreshold > 0 {
+				cfg.Storage.CircuitBreakerThreshold = *st.CircuitBreakerThreshold
+			}
+			if st.CircuitBreakerCooldown != nil && *st.CircuitBreakerCooldown > 0 {
+				cfg.Storage.CircuitBreakerCooldown = time.Duration(*st.CircuitBreakerCooldown) * time.Millisecond
+			}
+		}
+	}
+	if raw, ok := rawMap["cache"]; ok {
+		var cc struct {
+			MaxEntries         *int   `json:"max_entries"`
+			MaxBytes           *int64 `json:"max_bytes"`
+			MaxBodyBytes       *int64 `json:"max_body_bytes"`
+			MemoryWatchdogByte *int64 `json:"memory_watchdog_bytes"`
+		}
+		if err := json.Unmarshal(raw, &cc); err == nil {
+			if cc.MaxEntries != nil && *cc.MaxEntries > 0 {
+				cfg.Cache.MaxEntries = *cc.MaxEntries
+			}
+			if cc.MaxBytes != nil && *cc.MaxBytes > 0 {
+				cfg.Cache.MaxBytes = *cc.MaxBytes
+			}
+			if cc.MaxBodyBytes != nil && *cc.MaxBodyBytes > 0 {
+				cfg.Cache.MaxBodyBytes = *cc.MaxBodyBytes
+			}
+			if cc.MemoryWatchdogByte != nil && *cc.MemoryWatchdogByte > 0 {
+				cfg.Cache.MemoryWatchdogByte = *cc.MemoryWatchdogByte
 			}
 		}
 	}

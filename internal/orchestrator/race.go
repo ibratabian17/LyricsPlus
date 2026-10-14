@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lyricsplus/backend/internal/domain"
@@ -14,6 +15,8 @@ import (
 
 var errUnavailable = errors.New("provider unavailable")
 var errOverloaded = errors.New("provider overloaded")
+
+const siblingGracePeriod = 120 * time.Millisecond
 
 type Source interface {
 	Name() string
@@ -36,11 +39,14 @@ type SourceOutcome struct {
 	ElapsedMs int64
 }
 
+type ResultSaver func(q domain.SearchQuery, res *Result)
+
 type Racer struct {
 	sources map[string]Source
 	timeout time.Duration
 	logger  *logger.Logger
 	limiter *Limiter
+	saver   ResultSaver
 }
 
 type raceSession struct {
@@ -80,6 +86,22 @@ func WithLimiter(l *Limiter) RacerOption {
 	return func(r *Racer) { r.limiter = l }
 }
 
+func WithSaver(s ResultSaver) RacerOption {
+	return func(r *Racer) { r.saver = s }
+}
+
+func (r *Racer) SetSaver(s ResultSaver) {
+	if r != nil {
+		r.saver = s
+	}
+}
+
+func (r *Racer) saveAsync(q domain.SearchQuery, res *Result) {
+	if r != nil && r.saver != nil && res != nil && res.Resp != nil && len(res.Resp.Lyrics) > 0 {
+		r.saver(q, res)
+	}
+}
+
 func NewRacer(sources []Source, timeout time.Duration, opts ...RacerOption) *Racer {
 	m := make(map[string]Source, len(sources))
 	for _, s := range sources {
@@ -107,10 +129,16 @@ func (r *Racer) TryFetch(ctx context.Context, name string, q domain.SearchQuery)
 func (s *raceSession) tryFetch(ctx context.Context, name string, q domain.SearchQuery, release func()) *Result {
 	src, ok := s.r.sources[name]
 	if !ok {
+		if release != nil {
+			release()
+		}
 		s.record(name, "SKIP", 0)
 		return &Result{Source: name, Status: "SKIP", Err: errUnavailable}
 	}
 	if c, ok := src.(interface{ Configured() bool }); ok && !c.Configured() {
+		if release != nil {
+			release()
+		}
 		s.record(name, "SKIP", 0)
 		return &Result{Source: name, Status: "SKIP"}
 	}
@@ -134,7 +162,7 @@ func (s *raceSession) tryFetch(ctx context.Context, name string, q domain.Search
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	s.record(name, "BAD", 0)
+	s.record(name, "WAIT", 0)
 
 	resp, err := src.FetchLyrics(reqCtx, q)
 	elapsed := time.Since(start)
@@ -148,18 +176,24 @@ func (s *raceSession) tryFetch(ctx context.Context, name string, q domain.Search
 		}
 		res.Priority = Grade(resp, res.Source)
 		res.Status = "OK"
-	case err == context.DeadlineExceeded || err == context.Canceled || reqCtx.Err() != nil:
+	case errors.Is(err, context.Canceled) || ctx.Err() == context.Canceled || reqCtx.Err() == context.Canceled:
+		res.Status = "CANCEL"
+	case errors.Is(err, context.DeadlineExceeded) || reqCtx.Err() == context.DeadlineExceeded:
 		res.Status = "RTO"
 	default:
 		res.Status = "BAD"
 	}
 	s.record(name, res.Status, elapsed.Milliseconds())
-	metrics.Default.RecordProviderCall(name, res.Status, elapsed.Milliseconds())
+	if res.Status != "CANCEL" {
+		metrics.Default.RecordProviderCall(name, res.Status, elapsed.Milliseconds())
+	}
 	switch res.Status {
 	case "OK":
 		s.r.debugf("source %s OK priority=%d lines=%d took=%s", name, res.Priority, len(resp.Lyrics), elapsed.Round(time.Millisecond))
 	case "RTO":
 		s.r.debugf("source %s RTO took=%s", name, elapsed.Round(time.Millisecond))
+	case "CANCEL":
+		s.r.debugf("source %s CANCEL took=%s", name, elapsed.Round(time.Millisecond))
 	case "BAD":
 		if err != nil {
 			s.r.debugf("source %s BAD took=%s err=%v", name, elapsed.Round(time.Millisecond), err)
@@ -250,11 +284,9 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 	if len(names) == 0 {
 		return nil
 	}
-	phaseCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	results := make([]*Result, len(names))
-	idxByName := map[string]int{}
+	idxByName := make(map[string]int, len(names))
 	for i, n := range names {
 		idxByName[n] = i
 	}
@@ -262,8 +294,13 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 	launched := make([]string, 0, len(names))
 	releases := make([]func(), 0, len(names))
 	for _, n := range names {
-		if !s.r.has(n) {
+		src, ok := s.r.sources[n]
+		if !ok {
 			results[idxByName[n]] = nil
+			continue
+		}
+		if c, ok := src.(interface{ Configured() bool }); ok && !c.Configured() {
+			s.record(n, "SKIP", 0)
 			continue
 		}
 		release, ok := s.r.limiter.TryAcquire(n)
@@ -277,6 +314,19 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 	}
 	if len(launched) == 0 {
 		return nil
+	}
+
+	fetchTimeout := s.r.timeout
+	if fetchTimeout <= 0 {
+		fetchTimeout = 8 * time.Second
+	}
+
+	var winnerFound atomic.Bool
+	winnerCh := make(chan struct{})
+	var closeWinnerOnce sync.Once
+	markWinner := func() {
+		winnerFound.Store(true)
+		closeWinnerOnce.Do(func() { close(winnerCh) })
 	}
 
 	type phaseOutcome struct {
@@ -285,11 +335,48 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 	}
 	ch := make(chan phaseOutcome, len(launched))
 	for i, n := range launched {
-		release := releases[i]
-		go func(name string, rel func()) {
-			defer rel()
-			ch <- phaseOutcome{name: name, res: s.tryFetch(phaseCtx, name, q, nil)}
-		}(n, release)
+		rel := releases[i]
+		go func(name string, release func()) {
+			fetchCtx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+			defer cancel()
+
+			stopMonitor := make(chan struct{})
+			go func() {
+				select {
+				case <-ctx.Done():
+					if !winnerFound.Load() {
+						cancel()
+						return
+					}
+					t := time.NewTimer(siblingGracePeriod)
+					defer t.Stop()
+					select {
+					case <-t.C:
+						cancel()
+					case <-stopMonitor:
+					case <-fetchCtx.Done():
+					}
+				case <-winnerCh:
+					t := time.NewTimer(siblingGracePeriod)
+					defer t.Stop()
+					select {
+					case <-t.C:
+						cancel()
+					case <-stopMonitor:
+					case <-fetchCtx.Done():
+					}
+				case <-stopMonitor:
+				case <-fetchCtx.Done():
+				}
+			}()
+			defer close(stopMonitor)
+
+			res := s.tryFetch(fetchCtx, name, q, release)
+			ch <- phaseOutcome{name: name, res: res}
+			if res != nil && res.Resp != nil && len(res.Resp.Lyrics) > 0 {
+				s.r.saveAsync(q, res)
+			}
+		}(n, rel)
 	}
 
 	finished := 0
@@ -298,27 +385,32 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 		select {
 		case out = <-ch:
 		case <-ctx.Done():
-			cancel()
 			return pickWinner(results, names)
 		}
 		finished++
 		results[idxByName[out.name]] = out.res
 		if out.res != nil && out.res.Priority >= PriorityWord {
-			cancel()
+			markWinner()
 			return out.res
 		}
 	}
-	return pickWinner(results, names)
+	if w := pickWinner(results, names); w != nil {
+		markWinner()
+		return w
+	}
+	return nil
 }
 
 func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery, names []string, want int) *Result {
-	phaseCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	launched := make([]string, 0, len(names))
 	releases := make([]func(), 0, len(names))
 	for _, n := range names {
-		if !s.r.has(n) {
+		src, ok := s.r.sources[n]
+		if !ok {
+			continue
+		}
+		if c, ok := src.(interface{ Configured() bool }); ok && !c.Configured() {
+			s.record(n, "SKIP", 0)
 			continue
 		}
 		release, ok := s.r.limiter.TryAcquire(n)
@@ -334,13 +426,63 @@ func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery,
 		return nil
 	}
 
+	fetchTimeout := s.r.timeout
+	if fetchTimeout <= 0 {
+		fetchTimeout = 8 * time.Second
+	}
+
+	var winnerFound atomic.Bool
+	winnerCh := make(chan struct{})
+	var closeWinnerOnce sync.Once
+	markWinner := func() {
+		winnerFound.Store(true)
+		closeWinnerOnce.Do(func() { close(winnerCh) })
+	}
+
 	ch := make(chan *Result, len(launched))
 	for i, n := range launched {
-		release := releases[i]
-		go func(name string, rel func()) {
-			defer rel()
-			ch <- s.tryFetch(phaseCtx, name, q, nil)
-		}(n, release)
+		rel := releases[i]
+		go func(name string, release func()) {
+			fetchCtx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
+			defer cancel()
+
+			stopMonitor := make(chan struct{})
+			go func() {
+				select {
+				case <-ctx.Done():
+					if !winnerFound.Load() {
+						cancel()
+						return
+					}
+					t := time.NewTimer(siblingGracePeriod)
+					defer t.Stop()
+					select {
+					case <-t.C:
+						cancel()
+					case <-stopMonitor:
+					case <-fetchCtx.Done():
+					}
+				case <-winnerCh:
+					t := time.NewTimer(siblingGracePeriod)
+					defer t.Stop()
+					select {
+					case <-t.C:
+						cancel()
+					case <-stopMonitor:
+					case <-fetchCtx.Done():
+					}
+				case <-stopMonitor:
+				case <-fetchCtx.Done():
+				}
+			}()
+			defer close(stopMonitor)
+
+			res := s.tryFetch(fetchCtx, name, q, release)
+			ch <- res
+			if res != nil && res.Resp != nil && len(res.Resp.Lyrics) > 0 {
+				s.r.saveAsync(q, res)
+			}
+		}(n, rel)
 	}
 
 	for finished := 0; finished < len(launched); finished++ {
@@ -351,7 +493,7 @@ func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery,
 			return nil
 		}
 		if res != nil && res.Priority >= want {
-			cancel()
+			markWinner()
 			return res
 		}
 	}
@@ -380,7 +522,7 @@ func pickWinner(results []*Result, names []string) *Result {
 		}
 		return nil
 	}
-	idx := map[string]int{}
+	idx := make(map[string]int, len(names))
 	for i, n := range names {
 		idx[n] = i
 	}

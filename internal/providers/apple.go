@@ -15,6 +15,7 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"golang.org/x/sync/singleflight"
 
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
@@ -41,6 +42,7 @@ const appleName = "apple"
 const (
 	appleBaseURL            = "https://amp-api.music.apple.com/v1"
 	appleSuggestionsBaseURL = "https://amp-api-edge.music.apple.com/v1"
+	appleSearchCacheTTL     = 5 * time.Minute
 )
 
 type appleSongCacheEntry struct {
@@ -58,11 +60,14 @@ type AppleMusicProvider struct {
 	mgm    *AccountManager[config.AppleAccount]
 	logger *logger.Logger
 
-	tokenMu          sync.Mutex
-	storefrontMu     sync.Mutex
-	cachedWebToken   string
-	cachedStorefront string
+	tokenMu           sync.Mutex
+	storefrontMu      sync.Mutex
+	cachedWebToken    string
+	webTokenExpires   time.Time
+	webTokenFailUntil time.Time
+	cachedStorefront  string
 
+	flightGroup      singleflight.Group
 	searchCache      *lru.Cache[string, *appleSongCacheEntry]
 	suggestionsCache *lru.Cache[string, *appleSongCacheEntry]
 	isrcCache        *lru.Cache[string, *appleISRCCacheEntry]
@@ -92,14 +97,21 @@ func NewAppleMusicWithConfig(client *proxy.Client, cfg config.Provider) *AppleMu
 			},
 		}
 	}
+	var validAccounts []config.AppleAccount
 	for i := range accounts {
 		if accounts[i].ANDROID_USER_AGENT == "" {
 			accounts[i].ANDROID_USER_AGENT = "Music/6.1 Android/16 model/RealmeGT2Pro build/1472 (dt:66)"
 		}
+		if accounts[i].IsConfigured() {
+			validAccounts = append(validAccounts, accounts[i])
+		}
 	}
-	searchCache, _ := lru.New[string, *appleSongCacheEntry](500)
-	suggestionsCache, _ := lru.New[string, *appleSongCacheEntry](500)
-	isrcCache, _ := lru.New[string, *appleISRCCacheEntry](500)
+	if len(validAccounts) > 0 {
+		accounts = validAccounts
+	}
+	searchCache, _ := lru.New[string, *appleSongCacheEntry](1024)
+	suggestionsCache, _ := lru.New[string, *appleSongCacheEntry](1024)
+	isrcCache, _ := lru.New[string, *appleISRCCacheEntry](1024)
 	return &AppleMusicProvider{
 		client:           client,
 		mgm:              newAccountManager(accounts),
@@ -128,7 +140,47 @@ func (p *AppleMusicProvider) Configured() bool {
 	return false
 }
 
+func cloneAppleLyrics(src *domain.LyricsResponse) *domain.LyricsResponse {
+	if src == nil {
+		return nil
+	}
+	cp := *src
+	if src.ProcessingTime != nil {
+		pt := *src.ProcessingTime
+		if src.ProcessingTime.SelectedSongMetadata != nil {
+			sm := *src.ProcessingTime.SelectedSongMetadata
+			pt.SelectedSongMetadata = &sm
+		}
+		cp.ProcessingTime = &pt
+	}
+	return &cp
+}
+
 func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
+	if !p.Configured() {
+		return nil, nil
+	}
+	sfKey := q.ContentKey()
+	ch := p.flightGroup.DoChan(sfKey, func() (any, error) {
+		runCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		return p.doFetchLyrics(runCtx, q)
+	})
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		if resp, ok := res.Val.(*domain.LyricsResponse); ok && resp != nil {
+			return cloneAppleLyrics(resp), nil
+		}
+		return nil, nil
+	}
+}
+
+func (p *AppleMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
 	storefront, err := p.GetStorefront(ctx)
 	if err != nil || storefront == "" {
 		if acc, ok := p.mgm.At(p.mgm.CurrentIndex()); ok && acc.STOREFRONT != "" {
@@ -298,19 +350,19 @@ type appleSong struct {
 
 func (s *appleSong) UnmarshalJSON(data []byte) error {
 	var raw struct {
-		ID         string                 `json:"id"`
-		Type       string                 `json:"type"`
-		Attributes map[string]interface{} `json:"attributes"`
+		ID         string          `json:"id"`
+		Type       string          `json:"type"`
+		Attributes json.RawMessage `json:"attributes"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	s.ID = raw.ID
 	s.Type = raw.Type
-	s.RawAttributes = raw.Attributes
-
-	attrBytes, _ := json.Marshal(raw.Attributes)
-	_ = json.Unmarshal(attrBytes, &s.Attributes)
+	if len(raw.Attributes) > 0 {
+		_ = json.Unmarshal(raw.Attributes, &s.Attributes)
+		_ = json.Unmarshal(raw.Attributes, &s.RawAttributes)
+	}
 	return nil
 }
 
@@ -322,6 +374,9 @@ func (p *AppleMusicProvider) getAuthHeaders(ctx context.Context, accountIdx int)
 
 	h := make(http.Header)
 	if strings.EqualFold(acc.AUTH_TYPE, "android") || acc.AUTH_TYPE == "" {
+		if acc.ANDROID_AUTH_TOKEN == "" {
+			return nil, fmt.Errorf("apple music: empty android auth token")
+		}
 		h.Set("Authorization", "Bearer "+acc.ANDROID_AUTH_TOKEN)
 		h.Set("x-dsid", acc.ANDROID_DSID)
 		ua := acc.ANDROID_USER_AGENT
@@ -349,10 +404,15 @@ func (p *AppleMusicProvider) getAuthHeaders(ctx context.Context, accountIdx int)
 	return h, nil
 }
 
-func (p *AppleMusicProvider) resetCaches() {
+func (p *AppleMusicProvider) resetWebToken() {
 	p.tokenMu.Lock()
 	p.cachedWebToken = ""
+	p.webTokenExpires = time.Time{}
 	p.tokenMu.Unlock()
+}
+
+func (p *AppleMusicProvider) resetCaches() {
+	p.resetWebToken()
 	p.storefrontMu.Lock()
 	p.cachedStorefront = ""
 	p.storefrontMu.Unlock()
@@ -361,6 +421,12 @@ func (p *AppleMusicProvider) resetCaches() {
 func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr string, extra http.Header, retries, rateLimitRetries, accountIdx int) (*http.Response, error) {
 	headers, err := p.getAuthHeaders(ctx, accountIdx)
 	if err != nil {
+		p.mgm.MarkBad(accountIdx, 30*time.Second)
+		if retries < maxAccountRetries {
+			if next, hasNext := p.mgm.Next(accountIdx); hasNext {
+				return p.makeAppleMusicRequest(ctx, urlstr, extra, retries+1, 0, next)
+			}
+		}
 		return nil, err
 	}
 	for k, vv := range extra {
@@ -374,9 +440,9 @@ func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr s
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusServiceUnavailable && rateLimitRetries < 3 {
+	if resp.StatusCode == http.StatusServiceUnavailable && rateLimitRetries < 1 {
 		_ = resp.Body.Close()
-		delay := time.Duration(500+rand.Intn(1500)) * time.Millisecond
+		delay := time.Duration(150+rand.Intn(200)) * time.Millisecond
 		select {
 		case <-time.After(delay):
 			return p.makeAppleMusicRequest(ctx, urlstr, extra, retries, rateLimitRetries+1, accountIdx)
@@ -385,20 +451,35 @@ func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr s
 		}
 	}
 
-	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests) && retries < maxAccountRetries {
+	if resp.StatusCode == http.StatusTooManyRequests {
 		_ = resp.Body.Close()
-		p.resetCaches()
-		if next, hasNext := p.mgm.Next(accountIdx); hasNext {
-			return p.makeAppleMusicRequest(ctx, urlstr, extra, retries+1, 0, next)
+		p.mgm.MarkBad(accountIdx, 15*time.Second)
+		if retries < maxAccountRetries {
+			if next, hasNext := p.mgm.Next(accountIdx); hasNext {
+				return p.makeAppleMusicRequest(ctx, urlstr, extra, retries+1, 0, next)
+			}
 		}
+		return nil, &appleAPIError{StatusCode: resp.StatusCode, Msg: "Apple Music API rate limited (429)"}
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if acc, ok := p.mgm.At(accountIdx); ok && strings.EqualFold(acc.AUTH_TYPE, "web") {
+			p.resetWebToken()
+		}
+		p.mgm.MarkBad(accountIdx, 30*time.Second)
+		if retries < maxAccountRetries {
+			if next, hasNext := p.mgm.Next(accountIdx); hasNext {
+				return p.makeAppleMusicRequest(ctx, urlstr, extra, retries+1, 0, next)
+			}
+		}
+		return nil, &appleAPIError{StatusCode: resp.StatusCode, Msg: fmt.Sprintf("Apple Music API returned status %d: %s", resp.StatusCode, string(body))}
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusTooManyRequests {
-			return nil, &appleAPIError{StatusCode: resp.StatusCode, Msg: fmt.Sprintf("Apple Music API returned status %d: %s", resp.StatusCode, string(body))}
-		}
 		return nil, &appleAPIError{StatusCode: resp.StatusCode, Msg: fmt.Sprintf("Apple Music API returned status %d: %s", resp.StatusCode, string(body))}
 	}
 
@@ -406,69 +487,96 @@ func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr s
 }
 
 var (
-	reScriptTag = regexp.MustCompile(`<script type="module" crossorigin src="(/assets/index[^"]+\.js)"></script>`)
-	reTokenVar  = regexp.MustCompile(`\.headers\.Authorization\s*=\s*` + "`" + `Bearer\s*\$\{([^}]+)\}` + "`")
+	reScriptTag   = regexp.MustCompile(`<script[^>]+src="(/assets/index[^"]+\.js)"`)
+	reTokenVar    = regexp.MustCompile(`\.headers\.Authorization\s*=\s*` + "`" + `Bearer\s*\$\{([^}]+)\}` + "`")
+	reDirectJWT   = regexp.MustCompile(`"(eyJhbGciOiJFUzI1NiIsImtpZCI6[^"]+)"`)
+	reMultiArtist = regexp.MustCompile(`(?i)\s*(?:&|and|feat\.?|ft\.?|featuring|with|,)\s*`)
 )
 
 func (p *AppleMusicProvider) getWebToken(ctx context.Context) (string, error) {
 	p.tokenMu.Lock()
 	defer p.tokenMu.Unlock()
-	if p.cachedWebToken != "" {
+	now := time.Now()
+	if p.cachedWebToken != "" && now.Before(p.webTokenExpires) {
 		return p.cachedWebToken, nil
 	}
+	if now.Before(p.webTokenFailUntil) {
+		return "", fmt.Errorf("apple music: web token fetch in cooldown")
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://music.apple.com/", nil)
+	tokCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(tokCtx, http.MethodGet, "https://music.apple.com/", nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 	resp, err := p.client.Do(req)
 	if err != nil {
+		p.webTokenFailUntil = time.Now().Add(15 * time.Second)
 		return "", fmt.Errorf("fetch apple music home: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	htmlBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
+		p.webTokenFailUntil = time.Now().Add(15 * time.Second)
 		return "", err
 	}
 
 	m := reScriptTag.FindSubmatch(htmlBytes)
 	if len(m) < 2 {
+		p.webTokenFailUntil = time.Now().Add(30 * time.Second)
 		return "", fmt.Errorf("apple music: could not find index script tag")
 	}
 	scriptPath := string(m[1])
 	scriptURL := "https://music.apple.com" + scriptPath
 
-	sReq, err := http.NewRequestWithContext(ctx, http.MethodGet, scriptURL, nil)
+	sReq, err := http.NewRequestWithContext(tokCtx, http.MethodGet, scriptURL, nil)
 	if err != nil {
 		return "", err
 	}
 	sReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
 	sResp, err := p.client.Do(sReq)
 	if err != nil {
+		p.webTokenFailUntil = time.Now().Add(15 * time.Second)
 		return "", fmt.Errorf("fetch apple music script: %w", err)
 	}
 	defer func() { _ = sResp.Body.Close() }()
 
 	jsBytes, err := io.ReadAll(sResp.Body)
 	if err != nil {
+		p.webTokenFailUntil = time.Now().Add(15 * time.Second)
 		return "", err
+	}
+
+	if jwtM := reDirectJWT.FindSubmatch(jsBytes); len(jwtM) >= 2 {
+		p.cachedWebToken = string(jwtM[1])
+		p.webTokenExpires = time.Now().Add(2 * time.Hour)
+		return p.cachedWebToken, nil
 	}
 
 	vm := reTokenVar.FindSubmatch(jsBytes)
 	if len(vm) < 2 {
+		p.webTokenFailUntil = time.Now().Add(30 * time.Second)
 		return "", fmt.Errorf("apple music: could not find authorization token variable")
 	}
 	tokenVar := regexp.QuoteMeta(string(vm[1]))
 
-	reTokenVal := regexp.MustCompile(tokenVar + `\s*=\s*"([^"]+)"`)
+	reTokenVal, err := regexp.Compile(tokenVar + `\s*=\s*"([^"]+)"`)
+	if err != nil {
+		p.webTokenFailUntil = time.Now().Add(30 * time.Second)
+		return "", err
+	}
 	valM := reTokenVal.FindSubmatch(jsBytes)
 	if len(valM) < 2 {
+		p.webTokenFailUntil = time.Now().Add(30 * time.Second)
 		return "", fmt.Errorf("apple music: could not find authorization token value")
 	}
 
 	p.cachedWebToken = string(valM[1])
+	p.webTokenExpires = time.Now().Add(2 * time.Hour)
 	return p.cachedWebToken, nil
 }
 
@@ -479,29 +587,29 @@ func (p *AppleMusicProvider) GetStorefront(ctx context.Context) (string, error) 
 		return p.cachedStorefront, nil
 	}
 
-	current, ok := p.mgm.First()
-	if ok {
-		if current.STOREFRONT != "" {
-			p.cachedStorefront = current.STOREFRONT
+	for i := 0; i < p.mgm.Count(); i++ {
+		if acc, ok := p.mgm.At(i); ok && acc.STOREFRONT != "" {
+			p.cachedStorefront = acc.STOREFRONT
 			return p.cachedStorefront, nil
 		}
+	}
 
-		if strings.EqualFold(current.AUTH_TYPE, "web") {
-			headers, err := p.getAuthHeaders(ctx, 0)
+	current, ok := p.mgm.First()
+	if ok && strings.EqualFold(current.AUTH_TYPE, "web") {
+		headers, err := p.getAuthHeaders(ctx, 0)
+		if err == nil {
+			resp, err := p.client.Get(ctx, "https://api.music.apple.com/v1/me/storefront", headers)
 			if err == nil {
-				resp, err := p.client.Get(ctx, "https://api.music.apple.com/v1/me/storefront", headers)
-				if err == nil {
-					defer func() { _ = resp.Body.Close() }()
-					if resp.StatusCode == http.StatusOK {
-						var sfResp struct {
-							Data []struct {
-								ID string `json:"id"`
-							} `json:"data"`
-						}
-						if json.NewDecoder(resp.Body).Decode(&sfResp) == nil && len(sfResp.Data) > 0 {
-							p.cachedStorefront = sfResp.Data[0].ID
-							return p.cachedStorefront, nil
-						}
+				defer func() { _ = resp.Body.Close() }()
+				if resp.StatusCode == http.StatusOK {
+					var sfResp struct {
+						Data []struct {
+							ID string `json:"id"`
+						} `json:"data"`
+					}
+					if json.NewDecoder(resp.Body).Decode(&sfResp) == nil && len(sfResp.Data) > 0 && sfResp.Data[0].ID != "" {
+						p.cachedStorefront = sfResp.Data[0].ID
+						return p.cachedStorefront, nil
 					}
 				}
 			}
@@ -513,10 +621,10 @@ func (p *AppleMusicProvider) GetStorefront(ctx context.Context) (string, error) 
 }
 
 func (p *AppleMusicProvider) SearchByISRC(ctx context.Context, isrc, storefront string) (*appleSong, error) {
-	cacheKey := storefront + ":" + isrc
+	cacheKey := storefront + ":" + strings.ToLower(strings.TrimSpace(isrc))
 	if p.isrcCache != nil {
 		if entry, ok := p.isrcCache.Get(cacheKey); ok && entry != nil {
-			if time.Since(entry.created) < 60*time.Second {
+			if time.Since(entry.created) < appleSearchCacheTTL {
 				return entry.song, nil
 			}
 		}
@@ -557,7 +665,7 @@ func (p *AppleMusicProvider) SearchSongBySuggestions(ctx context.Context, query,
 	cacheKey := storefront + ":" + strings.ToLower(strings.TrimSpace(query))
 	if p.suggestionsCache != nil {
 		if entry, ok := p.suggestionsCache.Get(cacheKey); ok && entry != nil {
-			if time.Since(entry.created) < 60*time.Second {
+			if time.Since(entry.created) < appleSearchCacheTTL {
 				return entry.songs, nil
 			}
 		}
@@ -629,7 +737,7 @@ func (p *AppleMusicProvider) SearchSong(ctx context.Context, query, storefront s
 	cacheKey := storefront + ":" + strings.ToLower(strings.TrimSpace(query))
 	if p.searchCache != nil {
 		if entry, ok := p.searchCache.Get(cacheKey); ok && entry != nil {
-			if time.Since(entry.created) < 60*time.Second {
+			if time.Since(entry.created) < appleSearchCacheTTL {
 				return entry.songs, nil
 			}
 		}
@@ -675,48 +783,26 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 	}
 
 	queries := buildSearchQueries(title, artist, album)
+	if len(queries) == 0 {
+		return nil, nil
+	}
+
 	var candidates []appleSong
-
-	reversed := make([]string, len(queries))
-	for i, q := range queries {
-		reversed[len(queries)-1-i] = q
+	maxTry := len(queries)
+	if maxTry > 2 {
+		maxTry = 2
 	}
-
-	type sugResult struct {
-		songs []appleSong
-	}
-	sugCh := make(chan sugResult, len(reversed))
-	var wg sync.WaitGroup
-	for _, q := range reversed {
-		wg.Add(1)
-		go func(query string) {
-			defer wg.Done()
-			defer func() {
-				if rec := recover(); rec != nil && p.logger != nil {
-					p.logger.Errorf("panic in SearchSongBySuggestions: %v", rec)
-				}
-			}()
-			sugSongs, err := p.SearchSongBySuggestions(ctx, query, storefront)
-			if err == nil && len(sugSongs) > 0 {
-				sugCh <- sugResult{songs: sugSongs}
+	for i := 0; i < maxTry; i++ {
+		if sugSongs, err := p.SearchSongBySuggestions(ctx, queries[i], storefront); err == nil && len(sugSongs) > 0 {
+			candidates = append(candidates, sugSongs...)
+			if best := matchAppleSongs(candidates, title, artist, album, durationSec); best != nil {
+				return best, nil
 			}
-		}(q)
-	}
-	wg.Wait()
-	close(sugCh)
-
-	for sr := range sugCh {
-		candidates = append(candidates, sr.songs...)
-	}
-
-	if len(candidates) > 0 {
-		if best := matchAppleSongs(candidates, title, artist, album, durationSec); best != nil {
-			return best, nil
 		}
 	}
 
-	for _, q := range queries {
-		songs, err := p.SearchSong(ctx, q, storefront)
+	for i := 0; i < maxTry; i++ {
+		songs, err := p.SearchSong(ctx, queries[i], storefront)
 		if err == nil && len(songs) > 0 {
 			candidates = append(candidates, songs...)
 			if best := matchAppleSongs(candidates, title, artist, album, durationSec); best != nil {
@@ -750,7 +836,7 @@ func matchAppleSongs(songs []appleSong, title, artist, album string, durationSec
 
 func buildSearchQueries(title, artist, album string) []string {
 	var queries []string
-	seen := make(map[string]bool)
+	seen := make(map[string]bool, 6)
 	add := func(q string) {
 		q = strings.TrimSpace(q)
 		if q != "" && !seen[q] {
@@ -762,6 +848,17 @@ func buildSearchQueries(title, artist, album string) []string {
 	t := strings.TrimSpace(title)
 	a := strings.TrimSpace(artist)
 	al := strings.TrimSpace(album)
+
+	var ta []string
+	if t != "" {
+		ta = append(ta, t)
+	}
+	if a != "" {
+		ta = append(ta, a)
+	}
+	if len(ta) > 0 {
+		add(strings.Join(ta, " "))
+	}
 
 	var full []string
 	if t != "" {
@@ -777,23 +874,12 @@ func buildSearchQueries(title, artist, album string) []string {
 		add(strings.Join(full, " "))
 	}
 
-	var ta []string
-	if t != "" {
-		ta = append(ta, t)
-	}
-	if a != "" {
-		ta = append(ta, a)
-	}
-	if len(ta) > 0 {
-		add(strings.Join(ta, " "))
-	}
-
 	if a != "" && t != "" {
 		add(a + " " + t)
 	}
 
 	// Split multi-artists (e.g. "Jung Kook & BTS" -> "Jung Kook")
-	parts := regexp.MustCompile(`(?i)\s*(?:&|and|feat\.?|ft\.?|featuring|with|,)\s*`).Split(a, -1)
+	parts := reMultiArtist.Split(a, -1)
 	if len(parts) > 1 {
 		primary := strings.TrimSpace(parts[0])
 		if primary != "" && t != "" {
@@ -904,6 +990,10 @@ func buildMetadataQueries(title, artist, album string) []string {
 	a := strings.TrimSpace(artist)
 	al := strings.TrimSpace(album)
 
+	if t != "" && a != "" {
+		queries = append(queries, t+" "+a)
+	}
+
 	var parts []string
 	if t != "" {
 		parts = append(parts, t)
@@ -914,12 +1004,11 @@ func buildMetadataQueries(title, artist, album string) []string {
 	if al != "" {
 		parts = append(parts, al)
 	}
-	if len(parts) > 0 {
+	if len(parts) > 0 && al != "" {
 		queries = append(queries, strings.Join(parts, " "))
 	}
 
 	if t != "" && a != "" {
-		queries = append(queries, t+" "+a)
 		queries = append(queries, a+" "+t)
 	}
 

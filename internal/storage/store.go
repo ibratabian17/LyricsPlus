@@ -99,9 +99,17 @@ type Store struct {
 	exist      *lru.Cache[string, []*Row]
 	content    *lru.Cache[int64, []byte]
 	miss       *expirable.LRU[string, struct{}]
+	recentSave *expirable.LRU[string, struct{}]
 
 	writes    *writeQueue
 	closeOnce sync.Once
+
+	cbMu              sync.RWMutex
+	cbOpen            bool
+	cbOpenUntil       time.Time
+	consecutiveErrors int
+	cbThreshold       int
+	cbCooldown        time.Duration
 }
 
 func NewStore(cfg config.Storage) (*Store, error) {
@@ -145,32 +153,49 @@ func NewStore(cfg config.Storage) (*Store, error) {
 
 	size := cfg.LRUSize
 	if size <= 0 {
-		size = 16384
+		size = 4096
 	}
 	exact, _ := lru.New[string, *Row](size)
 	exactTitle, _ := lru.New[string, []*Row](size)
 	exist, _ := lru.New[string, []*Row](size)
-	content, _ := lru.New[int64, []byte](size)
+	contentSize := size / 2
+	if contentSize < 64 {
+		contentSize = size
+	}
+	content, _ := lru.New[int64, []byte](contentSize)
 
 	negSize := cfg.MissMemoSize
 	if negSize <= 0 {
-		negSize = size / 4
+		negSize = size
 	}
 	negTTL := cfg.NegativeTTL
 	if negTTL <= 0 {
 		negTTL = 30 * time.Second
 	}
 	miss := expirable.NewLRU[string, struct{}](negSize, nil, negTTL)
+	recentSave := expirable.NewLRU[string, struct{}](2048, nil, 30*time.Second)
+
+	cbThreshold := cfg.CircuitBreakerThreshold
+	if cbThreshold <= 0 {
+		cbThreshold = 8
+	}
+	cbCooldown := cfg.CircuitBreakerCooldown
+	if cbCooldown <= 0 {
+		cbCooldown = 15 * time.Second
+	}
 
 	st := &Store{
-		cfg:        cfg,
-		db:         db,
-		wdb:        wdb,
-		exact:      exact,
-		exactTitle: exactTitle,
-		exist:      exist,
-		content:    content,
-		miss:       miss,
+		cfg:         cfg,
+		db:          db,
+		wdb:         wdb,
+		exact:       exact,
+		exactTitle:  exactTitle,
+		exist:       exist,
+		content:     content,
+		miss:        miss,
+		recentSave:  recentSave,
+		cbThreshold: cbThreshold,
+		cbCooldown:  cbCooldown,
 	}
 	st.writes = newWriteQueue(1, cfg.WriteQueueSize)
 	return st, nil
@@ -178,8 +203,8 @@ func NewStore(cfg config.Storage) (*Store, error) {
 
 const (
 	defaultReadConns = 8
-	readCacheKB      = 16384
-	writeCacheKB     = 2000
+	readCacheKB      = -8192
+	writeCacheKB     = -2000
 )
 
 func buildDSN(path string, cacheKB int) string {
@@ -188,7 +213,8 @@ func buildDSN(path string, cacheKB int) string {
 			"&_pragma=journal_mode(WAL)"+
 			"&_pragma=synchronous(NORMAL)"+
 			"&_pragma=cache_size(%d)"+
-			"&_pragma=mmap_size(1073741824)"+
+			"&_pragma=mmap_size(67108864)"+
+			"&_pragma=journal_size_limit(67108864)"+
 			"&_pragma=temp_store(MEMORY)"+
 			"&_pragma=foreign_keys(ON)",
 		path, cacheKB,
@@ -208,8 +234,9 @@ func initStoreSchema(db *sql.DB) error {
 		"PRAGMA journal_mode = WAL;",
 		"PRAGMA synchronous = NORMAL;",
 		"PRAGMA busy_timeout = 10000;",
-		"PRAGMA cache_size = -16384;",
-		"PRAGMA mmap_size = 1073741824;",
+		"PRAGMA cache_size = -8192;",
+		"PRAGMA mmap_size = 67108864;",
+		"PRAGMA journal_size_limit = 67108864;",
 		"PRAGMA temp_store = MEMORY;",
 		"PRAGMA foreign_keys = ON;",
 	}
@@ -229,6 +256,144 @@ func initStoreSchema(db *sql.DB) error {
 	return nil
 }
 
+func isDBBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "busy") ||
+		strings.Contains(msg, "locked") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "cannot start a transaction within a transaction") ||
+		strings.Contains(msg, "bad connection")
+}
+
+func (s *Store) Shed() {
+	if s == nil {
+		return
+	}
+	shedLRU(s.content)
+	shedLRU(s.exist)
+	shedLRU(s.exactTitle)
+	shedLRU(s.exact)
+}
+
+func shedLRU[K comparable, V any](c *lru.Cache[K, V]) {
+	if c == nil {
+		return
+	}
+	toRemove := c.Len() / 2
+	for i := 0; i < toRemove; i++ {
+		c.RemoveOldest()
+	}
+}
+
+func (s *Store) IsResting() bool {
+	if s == nil {
+		return false
+	}
+	s.cbMu.RLock()
+	if !s.cbOpen {
+		s.cbMu.RUnlock()
+		return false
+	}
+	if time.Now().After(s.cbOpenUntil) {
+		s.cbMu.RUnlock()
+		s.cbMu.Lock()
+		if s.cbOpen && time.Now().After(s.cbOpenUntil) {
+			s.cbOpen = false
+			s.consecutiveErrors = 0
+		}
+		s.cbMu.Unlock()
+		return false
+	}
+	s.cbMu.RUnlock()
+	return true
+}
+
+func (s *Store) CooldownRemaining() time.Duration {
+	if s == nil {
+		return 0
+	}
+	s.cbMu.RLock()
+	defer s.cbMu.RUnlock()
+	if !s.cbOpen {
+		return 0
+	}
+	rem := time.Until(s.cbOpenUntil)
+	if rem < 0 {
+		return 0
+	}
+	return rem
+}
+
+func (s *Store) TripCooldown(d time.Duration) {
+	if s == nil {
+		return
+	}
+	s.cbMu.Lock()
+	defer s.cbMu.Unlock()
+	s.cbOpen = true
+	if d <= 0 {
+		d = s.cbCooldown
+	}
+	s.cbOpenUntil = time.Now().Add(d)
+}
+
+func (s *Store) ResetCircuitBreaker() {
+	if s == nil {
+		return
+	}
+	s.cbMu.Lock()
+	defer s.cbMu.Unlock()
+	s.cbOpen = false
+	s.consecutiveErrors = 0
+}
+
+func (s *Store) RecordDBBusy(err error) {
+	if s == nil || !isDBBusyError(err) {
+		return
+	}
+	s.cbMu.Lock()
+	defer s.cbMu.Unlock()
+	s.consecutiveErrors++
+	if s.consecutiveErrors >= s.cbThreshold {
+		s.cbOpen = true
+		s.cbOpenUntil = time.Now().Add(s.cbCooldown)
+	}
+}
+
+func (s *Store) recordQueryErr(ctx context.Context, err error) {
+	if err == nil {
+		return
+	}
+	if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return
+	}
+	s.RecordDBBusy(err)
+}
+
+func (s *Store) RecordDBSuccess() {
+	if s == nil {
+		return
+	}
+	s.cbMu.RLock()
+	if s.consecutiveErrors == 0 {
+		s.cbMu.RUnlock()
+		return
+	}
+	s.cbMu.RUnlock()
+	s.cbMu.Lock()
+	s.consecutiveErrors = 0
+	s.cbMu.Unlock()
+}
+
 func (s *Store) GetExact(ctx context.Context, isrc, platformID string) (*Row, bool) {
 	if isrc == "" && platformID == "" {
 		return nil, false
@@ -238,6 +403,9 @@ func (s *Store) GetExact(ctx context.Context, isrc, platformID string) (*Row, bo
 		return v, v != nil
 	}
 	if s.wasMiss(key) {
+		return nil, false
+	}
+	if s.IsResting() {
 		return nil, false
 	}
 	row, err := s.queryExact(ctx, isrc, platformID)
@@ -266,12 +434,20 @@ func (s *Store) GetExisting(ctx context.Context, keywords []string) ([]*Row, boo
 	if v, ok := s.exist.Get(key); ok {
 		return v, len(v) > 0
 	}
+	if s.wasMiss(key) {
+		return nil, false
+	}
+	if s.IsResting() {
+		return nil, false
+	}
 	rows, err := s.queryExisting(ctx, clean)
 	if err != nil {
 		return nil, false
 	}
 	if len(rows) > 0 {
 		s.exist.Add(key, rows)
+	} else {
+		s.noteMiss(key)
 	}
 	return rows, len(rows) > 0
 }
@@ -293,6 +469,9 @@ func (s *Store) GetByFTS5(ctx context.Context, title, artist string) ([]*Row, bo
 		return v, len(v) > 0
 	}
 	if s.wasMiss(key) {
+		return nil, false
+	}
+	if s.IsResting() {
 		return nil, false
 	}
 
@@ -336,6 +515,7 @@ func buildFTSQuery(title, artist string) string {
 
 func sanitizeFTSToken(word string) string {
 	var b strings.Builder
+	b.Grow(len(word))
 	for _, r := range word {
 		if r == '"' || r == '(' || r == ')' || r == '^' || r == '*' || r == ':' || r == '{' || r == '}' || r == '[' || r == ']' {
 			continue
@@ -353,8 +533,10 @@ WHERE lyrics_fts MATCH ?
 LIMIT 30`
 	rows, err := s.db.QueryContext(ctx, q, matchExpr)
 	if err != nil {
+		s.recordQueryErr(ctx, err)
 		return nil, err
 	}
+	s.RecordDBSuccess()
 	defer func() { _ = rows.Close() }()
 
 	var out []*Row
@@ -381,11 +563,14 @@ func (s *Store) scanSingleRow(ctx context.Context, query string, args ...any) (*
 		&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
 	)
 	if err == sql.ErrNoRows {
+		s.RecordDBSuccess()
 		return nil, nil
 	}
 	if err != nil {
+		s.recordQueryErr(ctx, err)
 		return nil, err
 	}
+	s.RecordDBSuccess()
 	row.CreatedAt = time.UnixMilli(createdAt)
 	row.ContentJSON = DecompressContent(row.ContentJSON)
 	return row, nil
@@ -414,6 +599,9 @@ func (s *Store) GetExactUser(ctx context.Context, isrc, platformID string) (*Row
 		return v, v != nil
 	}
 	if s.wasMiss(key) {
+		return nil, false
+	}
+	if s.IsResting() {
 		return nil, false
 	}
 	row, err := s.queryExactUser(ctx, isrc, platformID)
@@ -450,11 +638,14 @@ func (s *Store) scanLightRow(ctx context.Context, query string, args ...any) (*R
 		&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
 	)
 	if err == sql.ErrNoRows {
+		s.RecordDBSuccess()
 		return nil, nil
 	}
 	if err != nil {
+		s.recordQueryErr(ctx, err)
 		return nil, err
 	}
+	s.RecordDBSuccess()
 	row.CreatedAt = time.UnixMilli(createdAt)
 	return row, nil
 }
@@ -470,6 +661,9 @@ func (s *Store) GetByTitleArtist(ctx context.Context, title, artist string) ([]*
 		return v, len(v) > 0
 	}
 	if s.wasMiss(key) {
+		return nil, false
+	}
+	if s.IsResting() {
 		return nil, false
 	}
 	rows, err := s.queryTitleArtist(ctx, title, artist)
@@ -491,8 +685,10 @@ WHERE title = ? COLLATE NOCASE AND artist = ? COLLATE NOCASE
 LIMIT 10`
 	rows, err := s.db.QueryContext(ctx, q, title, artist)
 	if err != nil {
+		s.recordQueryErr(ctx, err)
 		return nil, err
 	}
+	s.RecordDBSuccess()
 	defer func() { _ = rows.Close() }()
 
 	var out []*Row
@@ -518,11 +714,16 @@ func (s *Store) GetContent(ctx context.Context, id int64) ([]byte, error) {
 	if v, ok := s.content.Get(id); ok && len(v) > 0 {
 		return v, nil
 	}
+	if s.IsResting() {
+		return nil, fmt.Errorf("storage: database resting")
+	}
 	const q = `SELECT content FROM lyrics WHERE id = ?`
 	var raw []byte
 	if err := s.db.QueryRowContext(ctx, q, id).Scan(&raw); err != nil {
+		s.recordQueryErr(ctx, err)
 		return nil, err
 	}
+	s.RecordDBSuccess()
 	content := DecompressContent(raw)
 	if len(content) > 0 {
 		s.content.Add(id, content)
@@ -542,8 +743,10 @@ func (s *Store) queryExisting(ctx context.Context, keywords []string) ([]*Row, e
 		` LIMIT 100`
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
+		s.recordQueryErr(ctx, err)
 		return nil, err
 	}
+	s.RecordDBSuccess()
 	defer func() { _ = rows.Close() }()
 
 	var out []*Row
@@ -578,6 +781,9 @@ func (s *Store) SaveUserLyrics(ctx context.Context, query domain.SearchQuery, co
 }
 
 func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
+	if s.IsResting() {
+		return fmt.Errorf("storage: database resting")
+	}
 	if row == nil {
 		return nil
 	}
@@ -587,7 +793,7 @@ func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
 	if row.CreatedAt.IsZero() {
 		row.CreatedAt = time.Now()
 	}
-	row.ContentJSON = CompressContent(row.ContentJSON)
+	compressed := CompressContent(row.ContentJSON)
 	const upsert = `INSERT INTO lyrics (filename, content, isrc, platform_id, source, title, artist, duration_ms, created_at)
 	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(filename, source) DO UPDATE SET
@@ -601,20 +807,36 @@ func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
 	RETURNING id`
 	var id int64
 	if err := s.wdb.QueryRowContext(ctx, upsert,
-		row.Filename, row.ContentJSON, row.ISRC, row.PlatformID, row.Source,
+		row.Filename, compressed, row.ISRC, row.PlatformID, row.Source,
 		row.Title, row.Artist, row.DurationMS, row.CreatedAt.UnixMilli(),
 	).Scan(&id); err != nil {
+		s.recordQueryErr(ctx, err)
 		return err
 	}
+	row.ContentJSON = compressed
+	s.RecordDBSuccess()
 	s.invalidate(row, id)
 	return nil
 }
 
 func (s *Store) SaveLyricsAsync(row *Row, timeout time.Duration) {
-	if row == nil {
+	if row == nil || s.IsResting() {
 		return
 	}
+	if row.Filename == "" {
+		row.Filename = CanonicalFilename(row.Artist, row.Title, "", row.DurationMS, row.ISRC, row.PlatformID, "json")
+	}
+	if s.recentSave != nil {
+		dedupKey := strings.ToLower(row.Source) + "::" + row.Filename
+		if _, exists := s.recentSave.Get(dedupKey); exists {
+			return
+		}
+		s.recentSave.Add(dedupKey, struct{}{})
+	}
 	s.writes.Submit(context.Background(), func(ctx context.Context) {
+		if s.IsResting() {
+			return
+		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		_ = s.SaveLyrics(ctx, row)
@@ -622,9 +844,15 @@ func (s *Store) SaveLyricsAsync(row *Row, timeout time.Duration) {
 }
 
 func (s *Store) SaveUserLyricsAsync(q domain.SearchQuery, content []byte, timeout time.Duration) {
+	if s.IsResting() {
+		return
+	}
 	buf := make([]byte, len(content))
 	copy(buf, content)
 	s.writes.Submit(context.Background(), func(ctx context.Context) {
+		if s.IsResting() {
+			return
+		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 		_ = s.SaveUserLyrics(ctx, q, buf)
@@ -634,13 +862,39 @@ func (s *Store) SaveUserLyricsAsync(q domain.SearchQuery, content []byte, timeou
 func (s *Store) invalidate(row *Row, id int64) {
 	loISRC := strings.ToLower(row.ISRC)
 	loPlat := strings.ToLower(row.PlatformID)
-	s.exact.Remove("exact::" + loISRC + "::" + loPlat)
-	s.exact.Remove("exact_user::" + loISRC + "::" + loPlat)
-	s.exactTitle.Remove("ta::" + strings.ToLower(row.Title) + "::" + strings.ToLower(row.Artist))
+	loTitle := strings.ToLower(strings.TrimSpace(row.Title))
+	loArtist := strings.ToLower(strings.TrimSpace(row.Artist))
+
+	exactKey := "exact::" + loISRC + "::" + loPlat
+	exactUserKey := "exact_user::" + loISRC + "::" + loPlat
+	taKey := "ta::" + loTitle + "::" + loArtist
+
+	s.exact.Remove(exactKey)
+	s.exact.Remove(exactUserKey)
+	s.exact.Remove("exact::" + loISRC + "::")
+	s.exact.Remove("exact::::" + loPlat)
+	s.exact.Remove("exact_user::" + loISRC + "::")
+	s.exact.Remove("exact_user::::" + loPlat)
+	s.exactTitle.Remove(taKey)
 	if id > 0 {
 		s.content.Remove(id)
 	}
-	s.miss.Purge()
+	if tokens := buildFTSQuery(row.Title, row.Artist); tokens != "" {
+		ftsKey := "fts5::" + tokens
+		s.exist.Remove(ftsKey)
+		if s.miss != nil {
+			s.miss.Remove(ftsKey)
+		}
+	}
+	if s.miss != nil {
+		s.miss.Remove(exactKey)
+		s.miss.Remove(exactUserKey)
+		s.miss.Remove("exact::" + loISRC + "::")
+		s.miss.Remove("exact::::" + loPlat)
+		s.miss.Remove("exact_user::" + loISRC + "::")
+		s.miss.Remove("exact_user::::" + loPlat)
+		s.miss.Remove(taKey)
+	}
 }
 
 func (s *Store) noteMiss(key string) {
@@ -678,11 +932,20 @@ func (s *Store) Ping(ctx context.Context) error {
 	if s.db == nil {
 		return fmt.Errorf("storage: store not initialized")
 	}
-	return s.db.PingContext(ctx)
+	if s.IsResting() {
+		return fmt.Errorf("storage: database resting (cooldown remaining: %s)", s.CooldownRemaining().Round(time.Second))
+	}
+	err := s.db.PingContext(ctx)
+	if err != nil {
+		s.recordQueryErr(ctx, err)
+		return err
+	}
+	s.RecordDBSuccess()
+	return nil
 }
 
 func (s *Store) SearchCatalog(ctx context.Context, query string) ([]domain.SongCatalogItem, error) {
-	if s == nil || s.db == nil {
+	if s == nil || s.db == nil || s.IsResting() {
 		return nil, nil
 	}
 	clean := strings.TrimSpace(query)
@@ -725,7 +988,7 @@ LIMIT 20`
 		return nil, nil
 	}
 
-	seen := make(map[string]bool)
+	seen := make(map[string]bool, len(rows))
 	var items []domain.SongCatalogItem
 	for _, r := range rows {
 		key := strings.ToLower(r.Title) + "::" + strings.ToLower(r.Artist)
@@ -801,16 +1064,16 @@ func (s *Store) GetMetadata(ctx context.Context, title, artist, album string, du
 	if len(rows) == 0 {
 		return nil, nil
 	}
-	var candidates []similarity.SongCandidate
-	for _, r := range rows {
-		candidates = append(candidates, similarity.SongCandidate{
+	candidates := make([]similarity.SongCandidate, len(rows))
+	for i, r := range rows {
+		candidates[i] = similarity.SongCandidate{
 			Title:      r.Title,
 			Artist:     r.Artist,
 			DurationMs: r.DurationMS,
 			ISRC:       r.ISRC,
 			PlatformID: r.PlatformID,
 			Data:       r,
-		})
+		}
 	}
 	best := similarity.FindBestSongMatch(candidates, title, artist, album, durationSec, "", "")
 	if best == nil {
@@ -891,16 +1154,16 @@ func (s *Store) GetRowForSources(ctx context.Context, q domain.SearchQuery, targ
 	if len(candidateRows) == 1 {
 		bestRow = candidateRows[0]
 	} else {
-		var candidates []similarity.SongCandidate
-		for _, r := range candidateRows {
-			candidates = append(candidates, similarity.SongCandidate{
+		candidates := make([]similarity.SongCandidate, len(candidateRows))
+		for i, r := range candidateRows {
+			candidates[i] = similarity.SongCandidate{
 				Title:      r.Title,
 				Artist:     r.Artist,
 				DurationMs: r.DurationMS,
 				ISRC:       r.ISRC,
 				PlatformID: r.PlatformID,
 				Data:       r,
-			})
+			}
 		}
 		durationSec := float64(q.Duration) / 1000.0
 		best := similarity.FindBestSongMatch(candidates, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
