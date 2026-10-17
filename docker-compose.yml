@@ -7,6 +7,7 @@ services:
     image: lyricsplus-backend
     container_name: lyricsplus-backend
     restart: unless-stopped
+    mem_limit: 3g
     ports:
       - "3000:3000"
     ulimits:
@@ -27,6 +28,12 @@ services:
       JWT_SECRET: "change-me-in-production"
       LYRICSPLUS_POW_DIFFICULTY: "5"
       # Google Drive caching is disabled inside the container by default.
+      # Provider load limits sized for a 4 core / 4 GB host.
+      PROVIDER_MAX_CONCURRENT_PER_SOURCE: "24"
+      PROVIDER_MAX_CONCURRENT_FETCHES: "96"
+      PROVIDER_TIMEOUT_MS: "4000"
+      NEGATIVE_TTL_MS: "180000"
+      GOMEMLIMIT: "2800MiB"
       GDRIVE_ENABLED: "false"
       DAILY_DUMP_ENABLED: "false"
     volumes:

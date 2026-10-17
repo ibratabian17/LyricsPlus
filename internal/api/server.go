@@ -79,7 +79,7 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		metrics.Default.RegisterPlatform("database", "LyricsDB", func() bool {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			return store.Ping(ctx) == nil
+			return store.Reachable(ctx) == nil
 		}, "Local LyricsPlus UGC + Cache Database Availability")
 	}
 
@@ -91,6 +91,7 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 	racer := orchestrator.NewRacer(toOrchestratorSources(providerSet.Sources), cfg.Provider.Timeout,
 		orchestrator.WithLogger(lg),
 		orchestrator.WithLimiter(limiter),
+		orchestrator.WithBreaker(providerSet.Breaker),
 	)
 	dedup := orchestrator.NewDedup(racer)
 

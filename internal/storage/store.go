@@ -373,7 +373,7 @@ func (s *Store) recordQueryErr(ctx context.Context, err error) {
 	if err == nil {
 		return
 	}
-	if ctx != nil && errors.Is(ctx.Err(), context.Canceled) {
+	if ctx != nil && ctx.Err() != nil {
 		return
 	}
 	s.RecordDBBusy(err)
@@ -926,6 +926,16 @@ func (s *Store) Close() error {
 		}
 	})
 	return err
+}
+
+// Reachable checks that the database answers, independent of the circuit
+// breaker. Health probes use this so an open breaker (a short back-off after
+// real lock contention) is not reported as the database being down.
+func (s *Store) Reachable(ctx context.Context) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("storage: store not initialized")
+	}
+	return s.db.PingContext(ctx)
 }
 
 func (s *Store) Ping(ctx context.Context) error {

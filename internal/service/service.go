@@ -157,14 +157,21 @@ func negativeCacheKey(q domain.SearchQuery) string { return "neg::" + q.ContentK
 
 func shouldCacheNegativeResult(res *orchestrator.Result) bool {
 	if res == nil || len(res.SourcesStatus) == 0 {
-		return true
+		return false
 	}
+	sawMiss := false
 	for _, st := range res.SourcesStatus {
-		if st.Status == "BAD" {
-			return true
+		if st.Degraded {
+			return false
+		}
+		switch st.Status {
+		case "BAD":
+			sawMiss = true
+		case "RTO", "CANCEL", "WAIT":
+			return false
 		}
 	}
-	return false
+	return sawMiss
 }
 
 func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*domain.LyricsResponse, error) {

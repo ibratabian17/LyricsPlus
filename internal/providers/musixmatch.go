@@ -36,7 +36,7 @@ const (
 	androidUserAgent    = "Dalvik/2.1.0 (Linux; U; Android 16; Pixel 8 Pro Build/BP31.250502.008)"
 	mxmDefaultWebCookie = "AWSELB=55578B011601B1EF8BC274C33F9043CA947F99DCFF0A80541772015CA2B39C35C0F9E1C932D31725A7310BCAEB0C37431E024E2B45320B7F2C84490C2C97351FDE34690157"
 	mxmDefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
-	mxmTokenExpiry      = 45 * time.Minute
+	mxmTokenExpiry      = 12 * time.Hour
 	mxmSearchCacheTTL   = 5 * time.Minute
 )
 
@@ -137,6 +137,58 @@ func (p *MusixmatchProvider) debugf(format string, args ...any) {
 	p.logger.Debugf(p.name+": "+format, args...)
 }
 
+func isValidMxmToken(t string) bool {
+	t = strings.TrimSpace(t)
+	if len(t) < 10 || strings.Contains(t, "UpgradeOnly") {
+		return false
+	}
+	return strings.Trim(t, "0") != ""
+}
+
+var mxmHoneypotLyricMarkers = []string{"wob gopini den", "tefe woxica fero"}
+
+func isMxmHoneypotLyrics(text string) bool {
+	l := strings.ToLower(text)
+	for _, m := range mxmHoneypotLyricMarkers {
+		if strings.Contains(l, m) {
+			return true
+		}
+	}
+	return false
+}
+
+// isMxmHoneypotTrack reports decoy catalogue entries. A specific decoy track is
+// still allowed when the query explicitly asks for it.
+func isMxmHoneypotTrack(trackName, artistName, query string) bool {
+	artist := strings.ToLower(artistName)
+	if strings.Contains(artist, "cat music") {
+		return true
+	}
+	name := strings.ToLower(strings.TrimSpace(trackName))
+	q := strings.ToLower(query)
+	switch {
+	case name == "casual" && strings.Contains(artist, "doja cat"):
+		return !strings.Contains(q, "casual")
+	case name == "nokia" && strings.Contains(artist, "drake"):
+		return !strings.Contains(q, "nokia")
+	}
+	return false
+}
+
+func filterMxmHoneypotTracks(tracks []mxmTrack, query string) []mxmTrack {
+	if len(tracks) == 0 {
+		return tracks
+	}
+	out := make([]mxmTrack, 0, len(tracks))
+	for _, t := range tracks {
+		if isMxmHoneypotTrack(t.TrackName, t.ArtistName, query) {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out
+}
+
 func extractTokenFromCookie(cookie string) string {
 	idx := strings.Index(cookie, "musixmatchUserToken=")
 	if idx == -1 {
@@ -179,6 +231,7 @@ func (p *MusixmatchProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	accountIdx := startIdx
 	tried := 0
 	total := p.mgm.Count()
+	var lastErr error
 	for tried < total {
 		tried++
 		res, err := p.fetchLyricsWithAccount(ctx, q, accountIdx)
@@ -188,6 +241,7 @@ func (p *MusixmatchProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		if err == nil && res == nil {
 			return nil, nil
 		}
+		lastErr = err
 		p.debugf("musixmatch account %d error: %v, rotating", accountIdx, err)
 		p.mgm.MarkBad(accountIdx, 20*time.Second)
 		next, hasNext := p.mgm.Next(accountIdx)
@@ -196,7 +250,7 @@ func (p *MusixmatchProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		}
 		accountIdx = next
 	}
-	return nil, nil
+	return nil, lastErr
 }
 
 func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domain.SearchQuery, accountIdx int) (*domain.LyricsResponse, error) {
@@ -263,6 +317,13 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 	if err != nil || converted == nil || len(converted.Lyrics) == 0 {
 		p.debugf("no parseable lyrics for track %d (err=%v)", matchedTrack.TrackID, err)
 		return nil, nil
+	}
+
+	for _, ln := range converted.Lyrics {
+		if isMxmHoneypotLyrics(ln.Text) {
+			p.debugf("honeypot lyrics for track %d, discarding", matchedTrack.TrackID)
+			return nil, nil
+		}
 	}
 
 	if p.word && converted.Type != domain.SyncTypeWord {
@@ -379,7 +440,7 @@ func (p *MusixmatchProvider) getUserToken(ctx context.Context, accountIdx int) (
 	}
 
 	if !cookieDisabled {
-		if tok := extractTokenFromCookie(acc.COOKIE); tok != "" {
+		if tok := extractTokenFromCookie(acc.COOKIE); isValidMxmToken(tok) {
 			p.state.webMu.Lock()
 			p.state.webTok[accountIdx] = cachedWebToken{token: tok, expires: time.Now().Add(time.Hour)}
 			p.state.webMu.Unlock()
@@ -405,7 +466,7 @@ func (p *MusixmatchProvider) getUserToken(ctx context.Context, accountIdx int) (
 		return "", err
 	}
 	tok := res.Message.Body.UserToken
-	if tok == "" || strings.Contains(tok, "UpgradeOnly") {
+	if !isValidMxmToken(tok) {
 		p.state.webMu.Lock()
 		p.state.webTok[accountIdx] = cachedWebToken{failUntil: time.Now().Add(30 * time.Second)}
 		p.state.webMu.Unlock()
@@ -440,7 +501,7 @@ func (p *MusixmatchProvider) makeWebRequest(ctx context.Context, endpoint string
 	}
 	if err := json.Unmarshal(raw, &statusCheck); err == nil {
 		code := statusCheck.Message.Header.StatusCode
-		if code == 401 || code == 402 {
+		if code == 401 || code == 402 || statusCheck.Message.Header.Hint == "renew" {
 			p.invalidateWebToken(accountIdx)
 			if params != nil && params.Get("usertoken") != "" {
 				if newTok, tokErr := p.getUserToken(ctx, accountIdx); tokErr == nil && newTok != "" {
@@ -657,6 +718,7 @@ func (p *MusixmatchProvider) searchTrack(ctx context.Context, query string, acco
 			}
 		}
 	}
+	out = filterMxmHoneypotTracks(out, query)
 	if err == nil && p.state.searchCache != nil {
 		p.state.searchCache.Add(cacheKey, &mxmTrackCacheEntry{tracks: out, created: time.Now()})
 	}

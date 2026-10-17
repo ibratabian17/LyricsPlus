@@ -1,6 +1,9 @@
 package providers
 
 import (
+	"context"
+	"errors"
+
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/logger"
@@ -36,6 +39,31 @@ type Set struct {
 	Deezer     *DeezerProvider
 	QQMusic    *QQMusicProvider
 	LyricsPlus *LyricsPlusProvider
+	Breaker    *orchestrator.Breaker
+}
+
+var errBreakerOpen = errors.New("provider circuit breaker open")
+
+type guardedLineSource struct {
+	name string
+	src  LineSource
+	br   *orchestrator.Breaker
+}
+
+func (g guardedLineSource) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
+	if !g.br.Allow(g.name) {
+		return nil, errBreakerOpen
+	}
+	resp, err := g.src.FetchLyrics(ctx, q)
+	switch {
+	case errors.Is(err, context.Canceled):
+		g.br.Neutral(g.name)
+	case err != nil && orchestrator.IsHealthFailure(err):
+		g.br.Report(g.name, false)
+	default:
+		g.br.Report(g.name, true)
+	}
+	return resp, err
 }
 
 func (f *Factory) BuildSet() (*Set, error) {
@@ -74,7 +102,12 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 		}
 	}
 
-	qapleSvc := NewQapleService(qq, apple, mxm)
+	breaker := orchestrator.NewBreaker(orchestrator.DefaultBreakerConfig())
+	qapleSvc := NewQapleService(
+		guardedLineSource{name: "qq", src: qq, br: breaker},
+		guardedLineSource{name: "apple", src: apple, br: breaker},
+		guardedLineSource{name: "musixmatch", src: mxm, br: breaker},
+	)
 	if store != nil {
 		qapleSvc.SetStore(store)
 	}
@@ -108,6 +141,7 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 		Deezer:     dz,
 		QQMusic:    qq,
 		LyricsPlus: lp,
+		Breaker:    breaker,
 	}, nil
 }
 

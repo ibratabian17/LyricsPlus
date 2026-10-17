@@ -45,7 +45,12 @@ func (h *Health) write(w http.ResponseWriter, r *http.Request, ready bool) {
 	code := http.StatusOK
 	dbStatus := "ok"
 	if h.Store != nil {
-		if err := h.Store.Ping(ctx); err != nil {
+		ping := h.Store.Ping
+		// Prefer the breaker-independent probe when the store offers one.
+		if r, ok := h.Store.(interface{ Reachable(context.Context) error }); ok {
+			ping = r.Reachable
+		}
+		if err := ping(ctx); err != nil {
 			dbStatus = "unavailable"
 			if ready {
 				status = "degraded"

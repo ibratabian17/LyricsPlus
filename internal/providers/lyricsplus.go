@@ -73,6 +73,7 @@ func parseLyricsPayload(content []byte) *domain.LyricsResponse {
 const lyricsplusName = "lyricsplus"
 
 const (
+	qapleBudget       = 3 * time.Second
 	gdriveBudget      = 2500 * time.Millisecond
 	driveWriteTimeout = 15 * time.Second
 )
@@ -323,8 +324,10 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		}
 	}
 
-	if qp != nil {
-		qapleResult, err := qp.FetchLyrics(ctx, q)
+	if qp != nil && ctx.Err() == nil {
+		qctx, qcancel := context.WithTimeout(ctx, qapleBudget)
+		qapleResult, err := qp.FetchLyrics(qctx, q)
+		qcancel()
 		if err == nil && qapleResult != nil && len(qapleResult.Lyrics) > 0 {
 			p.debugf("qaple result lines=%d priority=%d", len(qapleResult.Lyrics), getSyncPriority(qapleResult))
 			if lpResult == nil || getSyncPriority(qapleResult) > getSyncPriority(lpResult) {

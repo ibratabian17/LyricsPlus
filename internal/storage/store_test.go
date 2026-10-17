@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
@@ -235,5 +236,42 @@ func TestStoreCircuitBreakerAndCooldown(t *testing.T) {
 	}
 	if err := st.Ping(ctx); err != nil {
 		t.Fatalf("ping failed after auto-recovery: %v", err)
+	}
+}
+
+func TestStoreBreakerIgnoresCallerContextErrors(t *testing.T) {
+	st, err := NewStore(config.Storage{
+		DBPath:                  filepath.Join(t.TempDir(), "ctx_test.db"),
+		LRUSize:                 64,
+		CircuitBreakerThreshold: 3,
+		CircuitBreakerCooldown:  time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	expired, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-expired.Done()
+	for i := 0; i < 20; i++ {
+		st.recordQueryErr(expired, context.DeadlineExceeded)
+	}
+	if st.IsResting() {
+		t.Fatal("caller-side deadline errors must not trip the DB breaker")
+	}
+
+	// Real lock contention (context still alive) must still trip it.
+	live := context.Background()
+	for i := 0; i < 3; i++ {
+		st.recordQueryErr(live, errors.New("database is locked (5) (SQLITE_BUSY)"))
+	}
+	if !st.IsResting() {
+		t.Fatal("genuine busy/locked errors must still trip the breaker")
+	}
+
+	// Health probe is independent of the breaker.
+	if err := st.Reachable(context.Background()); err != nil {
+		t.Fatalf("Reachable must work while resting: %v", err)
 	}
 }

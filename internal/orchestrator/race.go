@@ -15,6 +15,7 @@ import (
 
 var errUnavailable = errors.New("provider unavailable")
 var errOverloaded = errors.New("provider overloaded")
+var errBreakerOpen = errors.New("provider circuit breaker open")
 
 const siblingGracePeriod = 120 * time.Millisecond
 
@@ -37,6 +38,7 @@ type Result struct {
 type SourceOutcome struct {
 	Status    string
 	ElapsedMs int64
+	Degraded  bool
 }
 
 type ResultSaver func(q domain.SearchQuery, res *Result)
@@ -46,6 +48,7 @@ type Racer struct {
 	timeout time.Duration
 	logger  *logger.Logger
 	limiter *Limiter
+	breaker *Breaker
 	saver   ResultSaver
 }
 
@@ -66,6 +69,30 @@ func (s *raceSession) record(name, status string, ms int64) {
 	s.status[name] = st
 }
 
+func (s *raceSession) markDegraded(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.status[name]; ok && st.Status != "OK" {
+		st.Degraded = true
+		s.status[name] = st
+	}
+}
+
+func (s *raceSession) skipOverloaded(name string) {
+	s.record(name, "SKIP", 0)
+	s.markDegraded(name)
+	metrics.Default.RecordProviderOverload(name)
+}
+
+func (s *raceSession) breakerAllows(name string) bool {
+	if s.r.breaker.Allow(name) {
+		return true
+	}
+	s.record(name, "SKIP", 0)
+	s.markDegraded(name)
+	return false
+}
+
 func (s *raceSession) snapshot() map[string]SourceOutcome {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -84,6 +111,10 @@ func WithLogger(lg *logger.Logger) RacerOption {
 
 func WithLimiter(l *Limiter) RacerOption {
 	return func(r *Racer) { r.limiter = l }
+}
+
+func WithBreaker(b *Breaker) RacerOption {
+	return func(r *Racer) { r.breaker = b }
 }
 
 func WithSaver(s ResultSaver) RacerOption {
@@ -144,10 +175,13 @@ func (s *raceSession) tryFetch(ctx context.Context, name string, q domain.Search
 	}
 
 	if release == nil {
+		if !s.breakerAllows(name) {
+			return &Result{Source: name, Status: "SKIP", Err: errBreakerOpen}
+		}
 		r, admitted := s.r.limiter.Acquire(ctx, name)
 		if !admitted {
-			s.record(name, "SKIP", 0)
-			metrics.Default.RecordProviderOverload(name)
+			s.skipOverloaded(name)
+			s.r.breaker.Neutral(name)
 			return &Result{Source: name, Status: "SKIP", Err: errOverloaded}
 		}
 		release = r
@@ -184,6 +218,17 @@ func (s *raceSession) tryFetch(ctx context.Context, name string, q domain.Search
 		res.Status = "BAD"
 	}
 	s.record(name, res.Status, elapsed.Milliseconds())
+	switch {
+	case res.Status == "OK":
+		s.r.breaker.Report(name, true)
+	case res.Status == "CANCEL":
+		s.r.breaker.Neutral(name)
+	case res.Status == "RTO" || IsHealthFailure(err):
+		s.markDegraded(name)
+		s.r.breaker.Report(name, false)
+	default:
+		s.r.breaker.Report(name, true)
+	}
 	if res.Status != "CANCEL" {
 		metrics.Default.RecordProviderCall(name, res.Status, elapsed.Milliseconds())
 	}
@@ -223,9 +268,9 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 	if len(phase1) > 2 {
 		phase1 = phase1[:2]
 	}
-	remaining := order
-	if len(remaining) > 2 {
-		remaining = remaining[2:]
+	var remaining []string
+	if len(order) > 2 {
+		remaining = order[2:]
 	}
 
 	r.debugf("race title=%q artist=%q phase1=%v remaining=%v", q.Title, q.Artist, phase1, remaining)
@@ -303,10 +348,13 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 			s.record(n, "SKIP", 0)
 			continue
 		}
+		if !s.breakerAllows(n) {
+			continue
+		}
 		release, ok := s.r.limiter.TryAcquire(n)
 		if !ok {
-			s.record(n, "SKIP", 0)
-			metrics.Default.RecordProviderOverload(n)
+			s.skipOverloaded(n)
+			s.r.breaker.Neutral(n)
 			continue
 		}
 		launched = append(launched, n)
@@ -413,10 +461,13 @@ func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery,
 			s.record(n, "SKIP", 0)
 			continue
 		}
+		if !s.breakerAllows(n) {
+			continue
+		}
 		release, ok := s.r.limiter.TryAcquire(n)
 		if !ok {
-			s.record(n, "SKIP", 0)
-			metrics.Default.RecordProviderOverload(n)
+			s.skipOverloaded(n)
+			s.r.breaker.Neutral(n)
 			continue
 		}
 		launched = append(launched, n)
