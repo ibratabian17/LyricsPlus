@@ -156,6 +156,7 @@ func newRouter(cfg config.Config, lg *logger.Logger, l *handlers.Lyrics, c *hand
 		middleware.Tracing(lg),
 		middleware.PanicRecovery(lg),
 		middleware.CORS(),
+		middleware.ExternalScraping(cfg.ExternalScraping, lg),
 		middleware.QueryLimits(cfg.Server.MaxURLBytes, cfg.Server.MaxQueryParams, cfg.Server.MaxQueryValueLen),
 		middleware.RateLimiter(cfg.RateLimit.Requests, cfg.RateLimit.Window),
 		middleware.ConcurrencyLimiter(int64(cfg.Server.MaxConcurrency)),

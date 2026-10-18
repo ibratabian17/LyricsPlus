@@ -176,6 +176,10 @@ func shouldCacheNegativeResult(res *orchestrator.Result) bool {
 
 func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*domain.LyricsResponse, error) {
 	start := time.Now()
+	cacheOnly := domain.IsCacheOnly(ctx)
+	if cacheOnly {
+		forceReload = false
+	}
 	if !forceReload {
 		if s.fromNegativeCache(q) {
 			metrics.Default.RecordLyricsLookup("", "memory_negative", false)
@@ -194,6 +198,13 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 			metrics.Default.RecordLyricsLookup(winner, "database", true)
 			return resp, nil
 		}
+	}
+
+	if cacheOnly {
+		metrics.Default.RecordLyricsLookup("", "cache_only_miss", false)
+		nf := s.buildNotFound(q, preferredSources, nil, time.Since(start))
+		nf.Message = "Lyrics not found in cache"
+		return nil, nf
 	}
 
 	res, err := s.Dedup.Get(ctx, q, preferredSources)
@@ -244,6 +255,10 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 
 func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredSources []string, forceReload bool) (*RawResult, error) {
 	start := time.Now()
+	cacheOnly := domain.IsCacheOnly(ctx)
+	if cacheOnly {
+		forceReload = false
+	}
 	if !forceReload {
 		if s.fromNegativeCache(q) {
 			return nil, s.buildNotFound(q, preferredSources, nil, time.Since(start))
@@ -272,6 +287,12 @@ func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredS
 				return &RawResult{Source: src, Raw: resp.RawData, TotalMs: time.Since(start).Milliseconds()}, nil
 			}
 		}
+	}
+
+	if cacheOnly {
+		nf := s.buildNotFound(q, preferredSources, nil, time.Since(start))
+		nf.Message = "Raw lyrics not found in cache"
+		return nil, nf
 	}
 
 	res, err := s.Dedup.Get(ctx, q, preferredSources)

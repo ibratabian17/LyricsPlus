@@ -185,15 +185,46 @@ type GDrive struct {
 	DailyDumpDir      string
 }
 
+type ExternalScrapingThrottle struct {
+	Requests int           `json:"requests"`
+	Window   time.Duration `json:"window"`
+}
+
+type ExternalScrapingRule struct {
+	Name       string                    `json:"name"`
+	Action     string                    `json:"action"`     // "block", "cached_only", "throttle"
+	MatchMode  string                    `json:"match_mode"` // "any" (default) or "all"
+	UserAgents []string                  `json:"user_agents"`
+	IPs        []string                  `json:"ips"`
+	Countries  []string                  `json:"countries"`
+	Paths      []string                  `json:"paths"`
+	Throttle   *ExternalScrapingThrottle `json:"throttle,omitempty"`
+	StatusCode int                       `json:"status_code,omitempty"`
+	Message    string                    `json:"message,omitempty"`
+}
+
+type ExternalScraping struct {
+	Enabled              bool                   `json:"enabled"`
+	BlockEmptyUserAgent  bool                   `json:"block_empty_user_agent"`
+	BlockedIPs           []string               `json:"blocked_ips"`
+	BlockedUserAgents    []string               `json:"blocked_user_agents"`
+	BlockedCountries     []string               `json:"blocked_countries"`
+	CachedOnlyIPs        []string               `json:"cached_only_ips"`
+	CachedOnlyUserAgents []string               `json:"cached_only_user_agents"`
+	CachedOnlyCountries  []string               `json:"cached_only_countries"`
+	Rules                []ExternalScrapingRule `json:"rules"`
+}
+
 type Config struct {
-	Server     Server
-	Provider   Provider
-	LyricsPlus LyricsPlus
-	RateLimit  RateLimit
-	Storage    Storage
-	Cache      Cache
-	GDrive     GDrive
-	Logger     Logger
+	Server           Server
+	Provider         Provider
+	LyricsPlus       LyricsPlus
+	RateLimit        RateLimit
+	ExternalScraping ExternalScraping
+	Storage          Storage
+	Cache            Cache
+	GDrive           GDrive
+	Logger           Logger
 }
 
 func Default() Config {
@@ -242,6 +273,10 @@ func Default() Config {
 		RateLimit: RateLimit{
 			Requests: 300,
 			Window:   10 * time.Second,
+		},
+		ExternalScraping: ExternalScraping{
+			Enabled:             false,
+			BlockEmptyUserAgent: false,
 		},
 		Storage: Storage{
 			DBPath:                  "database/lyrics_cache.db",
@@ -704,6 +739,99 @@ func loadJSONConfig(cfg *Config, path string) error {
 			}
 		}
 	}
+	if raw, ok := rawMap["external_scraping"]; ok {
+		var as struct {
+			Enabled              *bool           `json:"enabled"`
+			BlockEmptyUserAgent  *bool           `json:"block_empty_user_agent"`
+			BlockedIPs           []string        `json:"blocked_ips"`
+			BlockedUserAgents    []string        `json:"blocked_user_agents"`
+			BlockedCountries     []string        `json:"blocked_countries"`
+			CachedOnlyIPs        []string        `json:"cached_only_ips"`
+			CachedOnlyUserAgents []string        `json:"cached_only_user_agents"`
+			CachedOnlyCountries  []string        `json:"cached_only_countries"`
+			Rules                json.RawMessage `json:"rules"`
+		}
+		if err := json.Unmarshal(raw, &as); err == nil {
+			if as.Enabled != nil {
+				cfg.ExternalScraping.Enabled = *as.Enabled
+			}
+			if as.BlockEmptyUserAgent != nil {
+				cfg.ExternalScraping.BlockEmptyUserAgent = *as.BlockEmptyUserAgent
+			}
+			if len(as.BlockedIPs) > 0 {
+				cfg.ExternalScraping.BlockedIPs = as.BlockedIPs
+			}
+			if len(as.BlockedUserAgents) > 0 {
+				cfg.ExternalScraping.BlockedUserAgents = as.BlockedUserAgents
+			}
+			if len(as.BlockedCountries) > 0 {
+				cfg.ExternalScraping.BlockedCountries = as.BlockedCountries
+			}
+			if len(as.CachedOnlyIPs) > 0 {
+				cfg.ExternalScraping.CachedOnlyIPs = as.CachedOnlyIPs
+			}
+			if len(as.CachedOnlyUserAgents) > 0 {
+				cfg.ExternalScraping.CachedOnlyUserAgents = as.CachedOnlyUserAgents
+			}
+			if len(as.CachedOnlyCountries) > 0 {
+				cfg.ExternalScraping.CachedOnlyCountries = as.CachedOnlyCountries
+			}
+			if len(as.Rules) > 0 {
+				var rawRules []struct {
+					Name       string   `json:"name"`
+					Action     string   `json:"action"`
+					MatchMode  string   `json:"match_mode"`
+					UserAgents []string `json:"user_agents"`
+					IPs        []string `json:"ips"`
+					Countries  []string `json:"countries"`
+					Paths      []string `json:"paths"`
+					Throttle   *struct {
+						Requests *int `json:"requests"`
+						WindowMS *int `json:"window_ms"`
+						Window   *int `json:"window"`
+					} `json:"throttle"`
+					StatusCode *int   `json:"status_code"`
+					Message    string `json:"message"`
+				}
+				if err := json.Unmarshal(as.Rules, &rawRules); err == nil {
+					cfg.ExternalScraping.Rules = make([]ExternalScrapingRule, 0, len(rawRules))
+					for _, r := range rawRules {
+						rule := ExternalScrapingRule{
+							Name:       r.Name,
+							Action:     r.Action,
+							MatchMode:  r.MatchMode,
+							UserAgents: r.UserAgents,
+							IPs:        r.IPs,
+							Countries:  r.Countries,
+							Paths:      r.Paths,
+							StatusCode: 0,
+							Message:    r.Message,
+						}
+						if r.StatusCode != nil {
+							rule.StatusCode = *r.StatusCode
+						}
+						if r.Throttle != nil {
+							reqs := 60
+							if r.Throttle.Requests != nil && *r.Throttle.Requests > 0 {
+								reqs = *r.Throttle.Requests
+							}
+							win := 10 * time.Second
+							if r.Throttle.WindowMS != nil && *r.Throttle.WindowMS > 0 {
+								win = time.Duration(*r.Throttle.WindowMS) * time.Millisecond
+							} else if r.Throttle.Window != nil && *r.Throttle.Window > 0 {
+								win = time.Duration(*r.Throttle.Window) * time.Millisecond
+							}
+							rule.Throttle = &ExternalScrapingThrottle{
+								Requests: reqs,
+								Window:   win,
+							}
+						}
+						cfg.ExternalScraping.Rules = append(cfg.ExternalScraping.Rules, rule)
+					}
+				}
+			}
+		}
+	}
 	if raw, ok := rawMap["storage"]; ok {
 		var st struct {
 			DBPath                  *string `json:"db_path"`
@@ -918,6 +1046,31 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 	}
 	if v, ok := m["RATE_LIMIT_WINDOW_MS"]; ok {
 		cfg.RateLimit.Window = time.Duration(parseInt(v, int(cfg.RateLimit.Window/time.Millisecond))) * time.Millisecond
+	}
+
+	if v, ok := m["EXTERNAL_SCRAPING_ENABLED"]; ok {
+		cfg.ExternalScraping.Enabled = parseBool(v, cfg.ExternalScraping.Enabled)
+	}
+	if v, ok := m["EXTERNAL_SCRAPING_BLOCK_EMPTY_UA"]; ok {
+		cfg.ExternalScraping.BlockEmptyUserAgent = parseBool(v, cfg.ExternalScraping.BlockEmptyUserAgent)
+	}
+	if v, ok := m["EXTERNAL_SCRAPING_BLOCKED_IPS"]; ok && v != "" {
+		cfg.ExternalScraping.BlockedIPs = parseCommaSlice(v)
+	}
+	if v, ok := m["EXTERNAL_SCRAPING_BLOCKED_USER_AGENTS"]; ok && v != "" {
+		cfg.ExternalScraping.BlockedUserAgents = parseCommaSlice(v)
+	}
+	if v, ok := m["EXTERNAL_SCRAPING_BLOCKED_COUNTRIES"]; ok && v != "" {
+		cfg.ExternalScraping.BlockedCountries = parseCommaSlice(v)
+	}
+	if v, ok := m["EXTERNAL_SCRAPING_CACHED_ONLY_IPS"]; ok && v != "" {
+		cfg.ExternalScraping.CachedOnlyIPs = parseCommaSlice(v)
+	}
+	if v, ok := m["EXTERNAL_SCRAPING_CACHED_ONLY_USER_AGENTS"]; ok && v != "" {
+		cfg.ExternalScraping.CachedOnlyUserAgents = parseCommaSlice(v)
+	}
+	if v, ok := m["EXTERNAL_SCRAPING_CACHED_ONLY_COUNTRIES"]; ok && v != "" {
+		cfg.ExternalScraping.CachedOnlyCountries = parseCommaSlice(v)
 	}
 
 	if v, ok := m["JWT_SECRET"]; ok && v != "" {

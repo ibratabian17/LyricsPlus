@@ -58,24 +58,27 @@ func (h *Catalog) Search(w http.ResponseWriter, r *http.Request) {
 		name string
 		call func() ([]domain.SongCatalogItem, error)
 	}
+	cacheOnly := domain.IsCacheOnly(r.Context())
 	var fns []searchFn
 	if h.Store != nil {
 		fns = append(fns, searchFn{"database", func() ([]domain.SongCatalogItem, error) { return h.Store.SearchCatalog(ctx, q) }})
 	}
-	if h.AppleMusic != nil {
-		fns = append(fns, searchFn{"apple", func() ([]domain.SongCatalogItem, error) { return h.AppleMusic.SearchCatalog(ctx, q) }})
-	}
-	if h.Spotify != nil {
-		fns = append(fns, searchFn{"spotify", func() ([]domain.SongCatalogItem, error) { return h.Spotify.SearchCatalog(ctx, q) }})
-	}
-	if h.Deezer != nil {
-		fns = append(fns, searchFn{"deezer", func() ([]domain.SongCatalogItem, error) { return h.Deezer.SearchCatalog(ctx, q) }})
-	}
-	if h.QQMusic != nil {
-		fns = append(fns, searchFn{"qq", func() ([]domain.SongCatalogItem, error) { return h.QQMusic.SearchCatalog(ctx, q) }})
-	}
-	if h.Musixmatch != nil {
-		fns = append(fns, searchFn{"musixmatch", func() ([]domain.SongCatalogItem, error) { return h.Musixmatch.SearchCatalog(ctx, q) }})
+	if !cacheOnly {
+		if h.AppleMusic != nil {
+			fns = append(fns, searchFn{"apple", func() ([]domain.SongCatalogItem, error) { return h.AppleMusic.SearchCatalog(ctx, q) }})
+		}
+		if h.Spotify != nil {
+			fns = append(fns, searchFn{"spotify", func() ([]domain.SongCatalogItem, error) { return h.Spotify.SearchCatalog(ctx, q) }})
+		}
+		if h.Deezer != nil {
+			fns = append(fns, searchFn{"deezer", func() ([]domain.SongCatalogItem, error) { return h.Deezer.SearchCatalog(ctx, q) }})
+		}
+		if h.QQMusic != nil {
+			fns = append(fns, searchFn{"qq", func() ([]domain.SongCatalogItem, error) { return h.QQMusic.SearchCatalog(ctx, q) }})
+		}
+		if h.Musixmatch != nil {
+			fns = append(fns, searchFn{"musixmatch", func() ([]domain.SongCatalogItem, error) { return h.Musixmatch.SearchCatalog(ctx, q) }})
+		}
 	}
 
 	var wg sync.WaitGroup
@@ -206,6 +209,19 @@ func (h *Catalog) Metadata(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := contextWithTimeout(r, 15*time.Second)
 	defer cancel()
+
+	cacheOnly := domain.IsCacheOnly(r.Context())
+	if cacheOnly {
+		if h.Store != nil {
+			meta, err := h.Store.GetMetadata(ctx, title, artist, album, durationSec)
+			if err == nil && len(meta) > 0 {
+				writeJSON(w, http.StatusOK, map[string]interface{}{"metadata": meta})
+				return
+			}
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "Could not find metadata in cache"})
+		return
+	}
 
 	type metaGetter struct {
 		name string

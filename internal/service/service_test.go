@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -471,5 +473,134 @@ func TestQapleResultSavedToStore(t *testing.T) {
 	rows, ok := st.GetByTitleArtist(context.Background(), "Qaple Song", "Qaple Artist")
 	if !ok || len(rows) == 0 {
 		t.Fatalf("expected Qaple results to be saved to Store, but found 0 rows")
+	}
+}
+
+type countingSource struct {
+	calls atomic.Int64
+}
+
+func (c *countingSource) Name() string { return "apple" }
+func (c *countingSource) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
+	c.calls.Add(1)
+	return &domain.LyricsResponse{
+		Type:    domain.SyncTypeLine,
+		RawData: "upstream-raw",
+		Metadata: domain.LyricsMetadata{
+			Source: "Apple",
+			Title:  q.Title,
+			Artist: q.Artist,
+		},
+		Lyrics: []domain.Line{
+			{Time: 1000, Duration: 2000, Text: "Live line from upstream"},
+		},
+	}, nil
+}
+
+func TestFetchLyrics_CacheOnly(t *testing.T) {
+	st, err := storage.NewStore(config.Storage{DBPath: filepath.Join(t.TempDir(), "cache.db"), LRUSize: 64})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	src := &countingSource{}
+	racer := orchestrator.NewRacer([]orchestrator.Source{src}, 5*time.Second)
+	dedup := orchestrator.NewDedup(racer)
+	s := &Service{
+		Dedup: dedup,
+		Store: st,
+	}
+	racer.SetSaver(s.SaveResultAsync)
+
+	q := domain.SearchQuery{Title: "Uncached Song", Artist: "Unknown Artist"}
+	cacheOnlyCtx := domain.WithCacheOnly(context.Background(), true)
+
+	// 1. Cache-only miss: should return NotFoundError immediately without invoking upstream
+	resp, err := s.FetchLyrics(cacheOnlyCtx, q, nil, false)
+	if resp != nil {
+		t.Fatalf("expected nil response on cache-only miss, got %+v", resp)
+	}
+	if err == nil {
+		t.Fatal("expected NotFoundError on cache-only miss, got nil")
+	}
+	var nf *NotFoundError
+	if !errors.As(err, &nf) {
+		t.Fatalf("expected NotFoundError, got %v", err)
+	}
+	if src.calls.Load() != 0 {
+		t.Fatalf("expected 0 upstream calls on cache-only miss, got %d", src.calls.Load())
+	}
+
+	// 2. Normal fetch: invokes upstream and caches it
+	normalResp, err := s.FetchLyrics(context.Background(), q, nil, false)
+	if err != nil || normalResp == nil {
+		t.Fatalf("normal fetch failed: %v", err)
+	}
+	if src.calls.Load() != 1 {
+		t.Fatalf("expected 1 upstream call, got %d", src.calls.Load())
+	}
+
+	// Wait for async write to store
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. Cache-only hit: should return cached lyrics without calling upstream
+	cachedResp, err := s.FetchLyrics(cacheOnlyCtx, q, nil, false)
+	if err != nil {
+		t.Fatalf("expected cached hit, got error: %v", err)
+	}
+	if cachedResp == nil || len(cachedResp.Lyrics) == 0 {
+		t.Fatalf("expected cached response lyrics, got %+v", cachedResp)
+	}
+	if src.calls.Load() != 1 {
+		t.Fatalf("expected upstream call count to stay 1, got %d", src.calls.Load())
+	}
+
+	// 4. Cache-only with forceReload=true: forceReload should be overridden / ignored
+	cachedReloadResp, err := s.FetchLyrics(cacheOnlyCtx, q, nil, true)
+	if err != nil || cachedReloadResp == nil {
+		t.Fatalf("expected forceReload in cache-only to be ignored and return cache, got err=%v", err)
+	}
+	if src.calls.Load() != 1 {
+		t.Fatalf("expected upstream call count to remain 1, got %d", src.calls.Load())
+	}
+}
+
+func TestFetchRaw_CacheOnly(t *testing.T) {
+	st, err := storage.NewStore(config.Storage{DBPath: filepath.Join(t.TempDir(), "cache.db"), LRUSize: 64})
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	src := &countingSource{}
+	racer := orchestrator.NewRacer([]orchestrator.Source{src}, 5*time.Second)
+	dedup := orchestrator.NewDedup(racer)
+	s := &Service{
+		Dedup: dedup,
+		Store: st,
+	}
+	racer.SetSaver(s.SaveResultAsync)
+
+	q := domain.SearchQuery{Title: "Raw Song", Artist: "Raw Artist"}
+	cacheOnlyCtx := domain.WithCacheOnly(context.Background(), true)
+
+	// 1. Raw cache-only miss
+	raw, err := s.FetchRaw(cacheOnlyCtx, q, nil, false)
+	if raw != nil || err == nil {
+		t.Fatalf("expected not found on raw cache-only miss, got raw=%+v, err=%v", raw, err)
+	}
+	if src.calls.Load() != 0 {
+		t.Fatalf("expected 0 calls, got %d", src.calls.Load())
+	}
+
+	// 2. Populate via normal FetchLyrics
+	_, _ = s.FetchLyrics(context.Background(), q, nil, false)
+	time.Sleep(100 * time.Millisecond)
+
+	// 3. Raw cache-only hit
+	rawHit, err := s.FetchRaw(cacheOnlyCtx, q, nil, false)
+	if err != nil || rawHit == nil || rawHit.Raw == "" {
+		t.Fatalf("expected raw cache hit, got raw=%+v, err=%v", rawHit, err)
 	}
 }

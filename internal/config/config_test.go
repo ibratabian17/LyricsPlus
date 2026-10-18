@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func clearTestEnv(t *testing.T, keys ...string) {
@@ -263,5 +264,97 @@ APPLE_MUSIC_ACCOUNTS='[{"NAMEID":"apple-android","AUTH_TYPE":"android","ANDROID_
 	}
 	if cfg.Provider.AppleAccounts[0].ANDROID_AUTH_TOKEN != "tok1" || cfg.Provider.AppleAccounts[1].MUSIC_AUTH_TOKEN != "tok2" {
 		t.Errorf("unexpected apple accounts: %+v", cfg.Provider.AppleAccounts)
+	}
+}
+
+func TestLoadJSONConfig_ExternalScraping(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "config.json")
+
+	content := `{
+		"external_scraping": {
+			"enabled": true,
+			"block_empty_user_agent": true,
+			"blocked_ips": ["136.54.146.44", "3.228.31.30"],
+			"blocked_user_agents": ["ktor-client"],
+			"blocked_countries": ["KP"],
+			"cached_only_ips": ["10.0.0.1"],
+			"cached_only_user_agents": ["BitChord", "ArchiveTune"],
+			"cached_only_countries": ["IN"],
+			"rules": [
+				{
+					"name": "Custom BitChord Throttle",
+					"action": "cached_only",
+					"user_agents": ["BitChord"],
+					"throttle": {
+						"requests": 50,
+						"window_ms": 10000
+					}
+				}
+			]
+		}
+	}`
+
+	if err := os.WriteFile(jsonPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write config.json: %v", err)
+	}
+
+	cfg := Default()
+	if err := loadJSONConfig(&cfg, jsonPath); err != nil {
+		t.Fatalf("loadJSONConfig failed: %v", err)
+	}
+
+	if !cfg.ExternalScraping.Enabled {
+		t.Errorf("expected ExternalScraping.Enabled=true")
+	}
+	if !cfg.ExternalScraping.BlockEmptyUserAgent {
+		t.Errorf("expected BlockEmptyUserAgent=true")
+	}
+	if len(cfg.ExternalScraping.BlockedIPs) != 2 || cfg.ExternalScraping.BlockedIPs[0] != "136.54.146.44" {
+		t.Errorf("unexpected BlockedIPs: %+v", cfg.ExternalScraping.BlockedIPs)
+	}
+	if len(cfg.ExternalScraping.CachedOnlyUserAgents) != 2 || cfg.ExternalScraping.CachedOnlyUserAgents[0] != "BitChord" {
+		t.Errorf("unexpected CachedOnlyUserAgents: %+v", cfg.ExternalScraping.CachedOnlyUserAgents)
+	}
+	if len(cfg.ExternalScraping.Rules) != 1 {
+		t.Fatalf("expected 1 rule, got %d", len(cfg.ExternalScraping.Rules))
+	}
+	r := cfg.ExternalScraping.Rules[0]
+	if r.Name != "Custom BitChord Throttle" || r.Action != "cached_only" {
+		t.Errorf("unexpected rule: %+v", r)
+	}
+	if r.Throttle == nil || r.Throttle.Requests != 50 || r.Throttle.Window != 10*time.Second {
+		t.Errorf("unexpected rule throttle: %+v", r.Throttle)
+	}
+}
+
+func TestLoad_ExternalScrapingEnvOverrides(t *testing.T) {
+	dir := t.TempDir()
+	envPath := filepath.Join(dir, ".env")
+
+	content := `
+EXTERNAL_SCRAPING_ENABLED=true
+EXTERNAL_SCRAPING_BLOCK_EMPTY_UA=true
+EXTERNAL_SCRAPING_BLOCKED_IPS="1.2.3.4,5.6.7.8"
+EXTERNAL_SCRAPING_CACHED_ONLY_USER_AGENTS="BitChord,ArchiveTune"
+`
+	if err := os.WriteFile(envPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+
+	clearTestEnv(t, "EXTERNAL_SCRAPING_ENABLED", "EXTERNAL_SCRAPING_BLOCK_EMPTY_UA", "EXTERNAL_SCRAPING_BLOCKED_IPS", "EXTERNAL_SCRAPING_CACHED_ONLY_USER_AGENTS")
+
+	cfg := Load(envPath)
+	if !cfg.ExternalScraping.Enabled {
+		t.Errorf("expected ExternalScraping.Enabled=true from env")
+	}
+	if !cfg.ExternalScraping.BlockEmptyUserAgent {
+		t.Errorf("expected BlockEmptyUserAgent=true from env")
+	}
+	if len(cfg.ExternalScraping.BlockedIPs) != 2 || cfg.ExternalScraping.BlockedIPs[0] != "1.2.3.4" {
+		t.Errorf("unexpected BlockedIPs from env: %+v", cfg.ExternalScraping.BlockedIPs)
+	}
+	if len(cfg.ExternalScraping.CachedOnlyUserAgents) != 2 || cfg.ExternalScraping.CachedOnlyUserAgents[0] != "BitChord" {
+		t.Errorf("unexpected CachedOnlyUserAgents from env: %+v", cfg.ExternalScraping.CachedOnlyUserAgents)
 	}
 }

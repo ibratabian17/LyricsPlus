@@ -79,5 +79,16 @@
   },
   "lyricsplus": {
     "jwt_secret": "your-secure-jwt-secret"
+  },
+  "external_scraping": {
+    "enabled": false,
+    "block_empty_user_agent": false,
+    "blocked_ips": [],
+    "blocked_user_agents": [],
+    "blocked_countries": [],
+    "cached_only_ips": [],
+    "cached_only_user_agents": [],
+    "cached_only_countries": [],
+    "rules": []
   }
 }

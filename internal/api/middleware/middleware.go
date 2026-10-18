@@ -239,6 +239,19 @@ func ClientIP(r *http.Request) string {
 	return host
 }
 
+func ClientCountry(r *http.Request) string {
+	if v := r.Header.Get("CF-IPCountry"); v != "" {
+		return strings.ToUpper(strings.TrimSpace(v))
+	}
+	if v := r.Header.Get("X-Country-Code"); v != "" {
+		return strings.ToUpper(strings.TrimSpace(v))
+	}
+	if v := r.Header.Get("X-GeoIP-Country-Code"); v != "" {
+		return strings.ToUpper(strings.TrimSpace(v))
+	}
+	return ""
+}
+
 const numShards = 64
 
 type ipEntry struct {
@@ -269,12 +282,7 @@ func fnv32(key string) uint32 {
 	return hash
 }
 
-func RateLimiter(max int, window time.Duration) func(http.Handler) http.Handler {
-	if max <= 0 {
-		return func(next http.Handler) http.Handler {
-			return next
-		}
-	}
+func newShardedRateLimiter(max int, window time.Duration) *shardedRateLimiter {
 	if window <= 0 {
 		window = 10 * time.Second
 	}
@@ -288,6 +296,16 @@ func RateLimiter(max int, window time.Duration) func(http.Handler) http.Handler 
 		l.shards[i].perIP = make(map[string]*ipEntry, 32)
 		l.shards[i].lastPrune = now
 	}
+	return l
+}
+
+func RateLimiter(max int, window time.Duration) func(http.Handler) http.Handler {
+	if max <= 0 {
+		return func(next http.Handler) http.Handler {
+			return next
+		}
+	}
+	l := newShardedRateLimiter(max, window)
 	return l.middleware
 }
 
