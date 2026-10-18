@@ -143,104 +143,11 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	var lpResult *domain.LyricsResponse
 
 	if !q.ForceReload && st != nil {
-		var row *storage.Row
-		if q.ISRC != "" || q.PlatformID != "" {
-			if r, ok := st.GetExactUser(ctx, q.ISRC, q.PlatformID); ok && r != nil {
-				row = r
-			}
-		}
-		if row == nil && (q.Title != "" && q.Artist != "") {
-			if rows, ok := st.GetByTitleArtist(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
-				row = matchBestUserRow(rows, q)
-			}
-		}
-		if row == nil && (q.Title != "" || q.Artist != "") {
-			if rows, ok := st.GetByFTS5(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
-				row = matchBestUserRow(rows, q)
-			}
-		}
-
-		if row != nil && row.Source == "lyricsplus" {
-			content := row.ContentJSON
-			if len(content) == 0 {
-				c, err := st.GetContent(ctx, row.ID)
-				if err == nil {
-					content = c
-				}
-			}
-			if len(content) > 0 {
-				if parsed := parseLyricsPayload(content); parsed != nil && len(parsed.Lyrics) > 0 {
-					norm := parsers.NormalizeV2(parsed)
-					norm.Metadata.Source = "Lyrics+"
-					norm.Cached = domain.CacheUserJSON
-					norm.RawData = string(content)
-
-					var pf storage.ParsedFilename
-					if row.Filename != "" {
-						pf = storage.ParseFilename(row.Filename)
-					}
-					title := row.Title
-					if title == "" && pf.Title != "" {
-						title = pf.Title
-					}
-					if title == "" {
-						title = q.Title
-					}
-					artist := row.Artist
-					if artist == "" && pf.Artist != "" {
-						artist = pf.Artist
-					}
-					if artist == "" {
-						artist = q.Artist
-					}
-					album := pf.Album
-					if album == "" {
-						album = q.Album
-					}
-					isrc := row.ISRC
-					if isrc == "" && pf.ISRC != "" {
-						isrc = pf.ISRC
-					}
-					if isrc == "" {
-						isrc = q.ISRC
-					}
-					platID := row.PlatformID
-					if platID == "" && pf.PlatformID != "" {
-						platID = pf.PlatformID
-					}
-					if platID == "" {
-						platID = q.PlatformID
-					}
-					var durSec *float64
-					durMs := row.DurationMS
-					if durMs <= 0 && pf.DurationMS > 0 {
-						durMs = pf.DurationMS
-					}
-					if durMs <= 0 && q.Duration > 0 {
-						durMs = q.Duration
-					}
-					if durMs > 0 {
-						s := float64(durMs) / 1000.0
-						durSec = &s
-					}
-					norm.ProcessingTime = &domain.ProcessTiming{
-						SelectedSongMetadata: &domain.PickedSongMetadata{
-							Source:         "Lyrics+",
-							Title:          title,
-							Artist:         artist,
-							Album:          album,
-							Duration:       durSec,
-							SongISRC:       isrc,
-							SongPlatformID: platID,
-						},
-					}
-
-					lpResult = norm
-					p.debugf("hit user store row=%d lines=%d word=%t", row.ID, len(norm.Lyrics), hasWordSync(norm))
-					if hasWordSync(norm) {
-						return norm, nil
-					}
-				}
+		if norm, ok := p.GetUserLyrics(ctx, q); ok && norm != nil {
+			lpResult = norm
+			p.debugf("hit user store lines=%d word=%t", len(norm.Lyrics), hasWordSync(norm))
+			if hasWordSync(norm) {
+				return norm, nil
 			}
 		}
 	}
@@ -345,6 +252,127 @@ func (p *LyricsPlusProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 		return len(lpResult.Lyrics)
 	}())
 	return lpResult, nil
+}
+
+// HasUserLyrics checks if user lyrics already exist in the lyricsplus store for the query.
+func (p *LyricsPlusProvider) HasUserLyrics(ctx context.Context, q domain.SearchQuery) bool {
+	res, ok := p.GetUserLyrics(ctx, q)
+	return ok && res != nil
+}
+
+// GetUserLyrics retrieves existing lyricsplus user lyrics from the store without querying external sources or GDrive.
+func (p *LyricsPlusProvider) GetUserLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, bool) {
+	p.mu.RLock()
+	st := p.store
+	p.mu.RUnlock()
+
+	if st == nil {
+		return nil, false
+	}
+
+	var row *storage.Row
+	if q.ISRC != "" || q.PlatformID != "" {
+		if r, ok := st.GetExactUser(ctx, q.ISRC, q.PlatformID); ok && r != nil {
+			row = r
+		}
+	}
+	if row == nil && (q.Title != "" && q.Artist != "") {
+		if rows, ok := st.GetByTitleArtist(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
+			row = matchBestUserRow(rows, q)
+		}
+	}
+	if row == nil && (q.Title != "" || q.Artist != "") {
+		if rows, ok := st.GetByFTS5(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
+			row = matchBestUserRow(rows, q)
+		}
+	}
+
+	if row == nil || row.Source != "lyricsplus" {
+		return nil, false
+	}
+
+	content := row.ContentJSON
+	if len(content) == 0 {
+		c, err := st.GetContent(ctx, row.ID)
+		if err == nil {
+			content = c
+		}
+	}
+	if len(content) == 0 {
+		return nil, false
+	}
+
+	parsed := parseLyricsPayload(content)
+	if parsed == nil || len(parsed.Lyrics) == 0 {
+		return nil, false
+	}
+
+	norm := parsers.NormalizeV2(parsed)
+	norm.Metadata.Source = "Lyrics+"
+	norm.Cached = domain.CacheUserJSON
+	norm.RawData = string(content)
+
+	var pf storage.ParsedFilename
+	if row.Filename != "" {
+		pf = storage.ParseFilename(row.Filename)
+	}
+	title := row.Title
+	if title == "" && pf.Title != "" {
+		title = pf.Title
+	}
+	if title == "" {
+		title = q.Title
+	}
+	artist := row.Artist
+	if artist == "" && pf.Artist != "" {
+		artist = pf.Artist
+	}
+	if artist == "" {
+		artist = q.Artist
+	}
+	album := pf.Album
+	if album == "" {
+		album = q.Album
+	}
+	isrc := row.ISRC
+	if isrc == "" && pf.ISRC != "" {
+		isrc = pf.ISRC
+	}
+	if isrc == "" {
+		isrc = q.ISRC
+	}
+	platID := row.PlatformID
+	if platID == "" && pf.PlatformID != "" {
+		platID = pf.PlatformID
+	}
+	if platID == "" {
+		platID = q.PlatformID
+	}
+	var durSec *float64
+	durMs := row.DurationMS
+	if durMs <= 0 && pf.DurationMS > 0 {
+		durMs = pf.DurationMS
+	}
+	if durMs <= 0 && q.Duration > 0 {
+		durMs = q.Duration
+	}
+	if durMs > 0 {
+		s := float64(durMs) / 1000.0
+		durSec = &s
+	}
+	norm.ProcessingTime = &domain.ProcessTiming{
+		SelectedSongMetadata: &domain.PickedSongMetadata{
+			Source:         "Lyrics+",
+			Title:          title,
+			Artist:         artist,
+			Album:          album,
+			Duration:       durSec,
+			SongISRC:       isrc,
+			SongPlatformID: platID,
+		},
+	}
+
+	return norm, true
 }
 
 func hasWordSync(resp *domain.LyricsResponse) bool {

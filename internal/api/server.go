@@ -117,6 +117,7 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 	powH := &handlers.Pow{
 		Issuer:           lyricsplus.NewIssuer(cfg.LyricsPlus.JWTSecret, cfg.LyricsPlus.ChallengeTTL),
 		Verifier:         lyricsplus.NewVerifier(cfg.LyricsPlus.JWTSecret, cfg.LyricsPlus.PoWDifficulty),
+		LyricsPlus:       providerSet.LyricsPlus,
 		Store:            store,
 		GDrive:           gdrive,
 		MaxBodyBytes:     cfg.LyricsPlus.MaxBodyBytes,

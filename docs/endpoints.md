@@ -166,5 +166,6 @@ Request body (`application/json`, limit `MAX_BODY_BYTES` default 1 MiB → `413`
 Responses:
 - `200` — `{"success": true, "message": "Lyrics submitted successfully", "filename": "<canonical>"}`.
 - `400` — missing PoW, invalid proof, missing required fields, invalid lyrics data, or suspected vandalism.
+- `409` — lyrics already exist for this track and `forceUpload` is disabled (`{"error": "Lyrics already exist for this track. Use forceUpload to overwrite."}`).
 - `503` — submissions disabled (`ALLOW_SUBMISSIONS=false`).
 - `413` — body exceeds the limit.

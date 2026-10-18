@@ -279,6 +279,10 @@ func (g *GDriveClient) Authenticate(ctx context.Context, forceRefresh bool) (str
 	return res.AccessToken, nil
 }
 
+func EscapeQueryLiteral(s string) string {
+	return escapeQueryLiteral(s)
+}
+
 func escapeQueryLiteral(s string) string {
 	s = strings.ReplaceAll(s, "\\", "\\\\")
 	s = strings.ReplaceAll(s, "'", "\\'")
@@ -530,17 +534,187 @@ func (g *GDriveClient) doUploadMultipart(ctx context.Context, folderID, fileName
 	return &item, nil
 }
 
+func (g *GDriveClient) doUpdateMultipart(ctx context.Context, fileID, fileName, mimeType string, data []byte) (*FileItem, error) {
+	tok, err := g.Authenticate(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	metaHeader := make(textproto.MIMEHeader)
+	metaHeader.Set("Content-Type", "application/json; charset=UTF-8")
+	metaPart, err := writer.CreatePart(metaHeader)
+	if err != nil {
+		return nil, err
+	}
+
+	metaObj := map[string]interface{}{
+		"name": fileName,
+	}
+	metaBytes, _ := json.Marshal(metaObj)
+	_, _ = metaPart.Write(metaBytes)
+
+	mediaHeader := make(textproto.MIMEHeader)
+	mediaHeader.Set("Content-Type", mimeType)
+	mediaPart, err := writer.CreatePart(mediaHeader)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = mediaPart.Write(data)
+	_ = writer.Close()
+
+	updateURL := fmt.Sprintf("https://www.googleapis.com/upload/drive/v3/files/%s?uploadType=multipart", fileID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, updateURL, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+		g.recordRateLimitError()
+		g.rotateAccount()
+		return nil, fmt.Errorf("gdrive update rate limited (%d)", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gdrive update error (%d): %s", resp.StatusCode, string(respBytes))
+	}
+
+	g.recordSuccess()
+	g.fileCache.Remove(fileID)
+
+	var item FileItem
+	if err := json.Unmarshal(respBytes, &item); err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (g *GDriveClient) DeleteFile(ctx context.Context, fileID string) error {
+	tok, err := g.Authenticate(ctx, false)
+	if err != nil {
+		return err
+	}
+	reqURL := fmt.Sprintf("https://www.googleapis.com/drive/v3/files/%s", fileID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, reqURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+
+	resp, err := g.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusForbidden {
+		g.recordRateLimitError()
+		g.rotateAccount()
+		return fmt.Errorf("gdrive delete rate limited (%d)", resp.StatusCode)
+	}
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
+		return fmt.Errorf("gdrive delete error (%d)", resp.StatusCode)
+	}
+
+	g.recordSuccess()
+	g.fileCache.Remove(fileID)
+	return nil
+}
+
+func (g *GDriveClient) findFilesInFolderByName(ctx context.Context, folderID, fileName string) ([]FileItem, error) {
+	var folderIDs []string
+	if strings.TrimSpace(folderID) != "" {
+		folderIDs = []string{folderID}
+	}
+	query := fmt.Sprintf("name = '%s'", escapeQueryLiteral(fileName))
+	res, err := g.SearchFiles(ctx, folderIDs, query, 50, "")
+	if err != nil {
+		return nil, err
+	}
+	if res == nil {
+		return nil, nil
+	}
+	return res.Files, nil
+}
+
+func (g *GDriveClient) UploadFileOverwrite(ctx context.Context, folderIDs []string, fileName, mimeType string, data []byte) (*FileItem, error) {
+	if g.isCircuitOpen() {
+		return nil, ErrCircuitBreakerOpen
+	}
+
+	folders := folderIDs
+	if len(folders) == 0 {
+		folders = []string{""}
+	}
+
+	var lastErr error
+	for _, folderID := range folders {
+		// 1. Check if file(s) with exact fileName already exist in folderID
+		existingFiles, err := g.findFilesInFolderByName(ctx, folderID, fileName)
+		if err == nil && len(existingFiles) > 0 {
+			primary := existingFiles[0]
+			res, err := g.doUpdateMultipart(ctx, primary.ID, fileName, mimeType, data)
+			if err == nil && res != nil {
+				for _, dup := range existingFiles[1:] {
+					_ = g.DeleteFile(ctx, dup.ID)
+				}
+				if g.searchCache != nil {
+					g.searchCache.Purge()
+				}
+				return res, nil
+			}
+			lastErr = err
+			if isQuotaOrFolderFull(err) {
+				continue
+			}
+			break
+		}
+
+		// 2. No existing file found, do standard multipart upload
+		res, err := g.doUploadMultipart(ctx, folderID, fileName, mimeType, data)
+		if err == nil && res != nil {
+			if g.searchCache != nil {
+				g.searchCache.Purge()
+			}
+			return res, nil
+		}
+		lastErr = err
+
+		if isQuotaOrFolderFull(err) {
+			continue
+		}
+		break
+	}
+	return nil, lastErr
+}
+
 func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []string, isrc, platformID, mimeType string) (*FileItem, error) {
 	if isrc == "" && platformID == "" {
 		return nil, nil
 	}
 
 	cacheKey := fmt.Sprintf("exact:%s:%s:%s", strings.ToLower(isrc), strings.ToLower(platformID), mimeType)
-	if cached, ok := g.searchCache.Get(cacheKey); ok {
-		if len(cached) == 0 {
-			return nil, nil
+	if g.searchCache != nil {
+		if cached, ok := g.searchCache.Get(cacheKey); ok {
+			if len(cached) == 0 {
+				return nil, nil
+			}
+			return &cached[0], nil
 		}
-		return &cached[0], nil
 	}
 
 	var searchTerms []string
@@ -572,17 +746,21 @@ func (g *GDriveClient) FindExactMatchByIds(ctx context.Context, folderIDs []stri
 		for _, f := range res.Files {
 			parsed := ParseFilename(f.Name)
 			if isrc != "" && strings.EqualFold(parsed.ISRC, isrc) {
-				g.searchCache.Add(cacheKey, []FileItem{f})
+				if g.searchCache != nil {
+					g.searchCache.Add(cacheKey, []FileItem{f})
+				}
 				return &f, nil
 			}
 			if platformID != "" && strings.EqualFold(parsed.PlatformID, platformID) {
-				g.searchCache.Add(cacheKey, []FileItem{f})
+				if g.searchCache != nil {
+					g.searchCache.Add(cacheKey, []FileItem{f})
+				}
 				return &f, nil
 			}
 		}
 	}
 
-	if hadErr == nil {
+	if hadErr == nil && g.searchCache != nil {
 		g.searchCache.Add(cacheKey, []FileItem{})
 	}
 	return nil, hadErr
@@ -603,9 +781,12 @@ func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string,
 
 	cacheKey := fmt.Sprintf("kw:%s:%s", strings.ToLower(strings.Join(keywords, ",")), mimeType)
 	var files []FileItem
-	if cached, ok := g.searchCache.Get(cacheKey); ok {
-		files = cached
-	} else {
+	if g.searchCache != nil {
+		if cached, ok := g.searchCache.Get(cacheKey); ok {
+			files = cached
+		}
+	}
+	if files == nil {
 		var qParts []string
 		if mimeType != "" {
 			qParts = append(qParts, fmt.Sprintf("mimeType = '%s'", escapeQueryLiteral(mimeType)))
@@ -621,8 +802,12 @@ func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string,
 		}
 		if res != nil && len(res.Files) > 0 {
 			files = res.Files
+		} else {
+			files = []FileItem{}
 		}
-		g.searchCache.Add(cacheKey, files)
+		if g.searchCache != nil {
+			g.searchCache.Add(cacheKey, files)
+		}
 	}
 
 	if len(files) == 0 {
@@ -659,7 +844,7 @@ func (g *GDriveClient) FindExistingFile(ctx context.Context, folderIDs []string,
 
 func (g *GDriveClient) UploadUserLyrics(ctx context.Context, fileName string, data []byte) (*FileItem, error) {
 	folders := g.cfg.FolderUserTML
-	return g.UploadFile(ctx, folders, fileName, "application/json", data)
+	return g.UploadFileOverwrite(ctx, folders, fileName, "application/json", data)
 }
 
 func (g *GDriveClient) UploadBackupFile(ctx context.Context, fileName string, data []byte) (*FileItem, error) {

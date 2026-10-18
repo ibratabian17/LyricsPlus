@@ -87,15 +87,27 @@ func sampleWordLyrics() *domain.LyricsResponse {
 
 func buildTestRouter(t *testing.T, cfg config.Config, f *fakeSource) http.Handler {
 	t.Helper()
+	dbPath := filepath.Join(t.TempDir(), "router_test.db")
+	st, err := storage.NewStore(config.Storage{DBPath: dbPath, LRUSize: 64})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
 	racer := orchestrator.NewRacer([]orchestrator.Source{f}, cfg.Provider.Timeout)
 	dedup := orchestrator.NewDedup(racer)
-	svc := &service.Service{Dedup: dedup, Logger: nil}
+	svc := &service.Service{Dedup: dedup, Store: st, Logger: nil}
 
 	lyricsH := &handlers.Lyrics{Service: svc, Logger: nil, KpoeInfo: "lyricsplus"}
-	catalogH := &handlers.Catalog{Logger: nil}
+	catalogH := &handlers.Catalog{Store: st, Logger: nil}
+	lp := lyricsplus.NewLyricsPlus(nil)
+	lp.SetStore(st)
+
 	powH := &handlers.Pow{
 		Issuer:           lyricsplus.NewIssuer(cfg.LyricsPlus.JWTSecret, cfg.LyricsPlus.ChallengeTTL),
 		Verifier:         lyricsplus.NewVerifier(cfg.LyricsPlus.JWTSecret, cfg.LyricsPlus.PoWDifficulty),
+		LyricsPlus:       lp,
+		Store:            st,
 		MaxBodyBytes:     cfg.LyricsPlus.MaxBodyBytes,
 		AcceptVandal:     cfg.LyricsPlus.AcceptVandalism,
 		AllowSubmissions: cfg.LyricsPlus.AllowSubmissions,
@@ -495,6 +507,83 @@ func TestPowSubmit(t *testing.T) {
 	}
 	if resp["filename"] == nil {
 		t.Fatalf("expected filename in response")
+	}
+}
+
+func TestPowSubmitForceUpload(t *testing.T) {
+	cfg := baseTestConfig()
+	h := buildTestRouter(t, cfg, &fakeSource{resp: sampleWordLyrics()})
+
+	issuer := lyricsplus.NewIssuer(cfg.LyricsPlus.JWTSecret, cfg.LyricsPlus.ChallengeTTL)
+
+	makePayload := func(forceUpload *bool, snake *bool) []byte {
+		token, challenge, err := issuer.Issue(time.Now())
+		if err != nil {
+			t.Fatalf("issue challenge: %v", err)
+		}
+		nonce := solvePow(challenge, cfg.LyricsPlus.PoWDifficulty)
+		p := map[string]interface{}{
+			"proofOfWorkToken": token,
+			"nonce":            nonce,
+			"songTitle":        "Force Song",
+			"songArtist":       "Force Artist",
+			"songAlbum":        "Force Album",
+			"songDuration":     "180.5",
+			"songISRC":         "USRC12345678",
+			"lyricsData":       sampleWordLyrics(),
+		}
+		if forceUpload != nil {
+			p["forceUpload"] = *forceUpload
+		}
+		if snake != nil {
+			p["force_upload"] = *snake
+		}
+		b, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal payload: %v", err)
+		}
+		return b
+	}
+
+	// First submit (track doesn't exist yet): succeeds with 200 OK
+	req := httptest.NewRequest(http.MethodPost, "/v1/lyricsplus/submit", bytes.NewReader(makePayload(nil, nil)))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first submit expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Give async write queue a moment to persist
+	time.Sleep(100 * time.Millisecond)
+
+	// Second submit without forceUpload: denied with 409 Conflict
+	fFalse := false
+	req = httptest.NewRequest(http.MethodPost, "/v1/lyricsplus/submit", bytes.NewReader(makePayload(&fFalse, nil)))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second submit without forceUpload expected 409 Conflict, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Third submit with forceUpload=true: succeeds with 200 OK
+	fTrue := true
+	req = httptest.NewRequest(http.MethodPost, "/v1/lyricsplus/submit", bytes.NewReader(makePayload(&fTrue, nil)))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("third submit with forceUpload=true expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// Fourth submit with force_upload=true (snake_case): succeeds with 200 OK
+	req = httptest.NewRequest(http.MethodPost, "/v1/lyricsplus/submit", bytes.NewReader(makePayload(nil, &fTrue)))
+	req.Header.Set("Content-Type", "application/json")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("fourth submit with force_upload=true expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
 

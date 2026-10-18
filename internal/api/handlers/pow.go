@@ -21,6 +21,7 @@ import (
 type Pow struct {
 	Issuer           *lyricsplus.Issuer
 	Verifier         *lyricsplus.Verifier
+	LyricsPlus       *providers.LyricsPlusProvider
 	Store            *storage.Store
 	GDrive           *storage.GDriveClient
 	MaxBodyBytes     int64
@@ -78,6 +79,11 @@ type submitPayload struct {
 	SongPlatformID   string          `json:"songPlatformId"`
 	LyricsData       json.RawMessage `json:"lyricsData"`
 	ForceUpload      bool            `json:"forceUpload"`
+	ForceUploadSnake bool            `json:"force_upload"`
+}
+
+func (p *submitPayload) isForceUpload() bool {
+	return p.ForceUpload || p.ForceUploadSnake
 }
 
 func (h *Pow) Submit(w http.ResponseWriter, r *http.Request) {
@@ -134,11 +140,6 @@ func (h *Pow) Submit(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := contextWithTimeout(r, 15*time.Second)
 	defer cancel()
 
-	if !h.AcceptVandal && h.isVandalism(ctx, payload, norm) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Suspected vandalism"})
-		return
-	}
-
 	durMS := durationToMS(payload.SongDuration)
 	query := domain.SearchQuery{
 		Title:      strings.TrimSpace(payload.SongTitle),
@@ -154,6 +155,20 @@ func (h *Pow) Submit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fileName := storage.CanonicalFilename(query.Artist, query.Title, query.Album, query.Duration, query.ISRC, query.PlatformID, "json")
+
+	// Check if lyricsplus lyrics already exist for this track
+	existingLyrics := h.findExistingLyricsPlus(ctx, query)
+	if existingLyrics != nil && !payload.isForceUpload() {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "Lyrics already exist for this track. Use forceUpload to overwrite.",
+		})
+		return
+	}
+
+	if !h.AcceptVandal && providers.IsVandalismUpdate(existingLyrics, norm) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Suspected vandalism"})
+		return
+	}
 
 	if h.Store != nil {
 		h.Store.SaveUserLyricsAsync(query, content, 15*time.Second)
@@ -177,34 +192,20 @@ func (h *Pow) Submit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Pow) isVandalism(ctx context.Context, payload submitPayload, next *domain.LyricsResponse) bool {
-	if h.Store == nil {
-		return providers.IsVandalismUpdate(nil, next)
-	}
-	var prev *domain.LyricsResponse
-	if payload.SongISRC != "" || payload.SongPlatformID != "" {
-		if row, ok := h.Store.GetExact(ctx, payload.SongISRC, payload.SongPlatformID); ok && row != nil {
-			content, err := h.Store.GetContent(ctx, row.ID)
-			if err == nil && len(content) > 0 {
-				var pr domain.LyricsResponse
-				if json.Unmarshal(content, &pr) == nil {
-					prev = &pr
-				}
-			}
+func (h *Pow) findExistingLyricsPlus(ctx context.Context, q domain.SearchQuery) *domain.LyricsResponse {
+	if h.LyricsPlus != nil {
+		if res, ok := h.LyricsPlus.GetUserLyrics(ctx, q); ok && res != nil {
+			return res
 		}
 	}
-	if prev == nil && strings.TrimSpace(payload.SongTitle) != "" && strings.TrimSpace(payload.SongArtist) != "" {
-		if rows, ok := h.Store.GetByTitleArtist(ctx, payload.SongTitle, payload.SongArtist); ok && len(rows) > 0 {
-			content, err := h.Store.GetContent(ctx, rows[0].ID)
-			if err == nil && len(content) > 0 {
-				var pr domain.LyricsResponse
-				if json.Unmarshal(content, &pr) == nil {
-					prev = &pr
-				}
-			}
+	if h.Store != nil {
+		lp := providers.NewLyricsPlus(nil)
+		lp.SetStore(h.Store)
+		if res, ok := lp.GetUserLyrics(ctx, q); ok && res != nil {
+			return res
 		}
 	}
-	return providers.IsVandalismUpdate(prev, next)
+	return nil
 }
 
 func durationToMS(ds string) int {

@@ -349,6 +349,8 @@ paths:
                     description: Canonical cache filename of the submission.
         "400":
           $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Lyrics already exist for this track and forceUpload is not enabled.
         "413":
           description: Request body exceeds the configured limit (1 MiB default).
         "429":
