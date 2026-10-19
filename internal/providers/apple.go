@@ -399,6 +399,7 @@ func (p *AppleMusicProvider) getAuthHeaders(ctx context.Context, accountIdx int)
 	h.Set("Origin", "https://music.apple.com")
 	h.Set("Referer", "https://music.apple.com")
 	if acc.MUSIC_AUTH_TOKEN != "" {
+		h.Set("music-user-token", acc.MUSIC_AUTH_TOKEN)
 		h.Set("media-user-token", acc.MUSIC_AUTH_TOKEN)
 	}
 	return h, nil
@@ -489,7 +490,7 @@ func (p *AppleMusicProvider) makeAppleMusicRequest(ctx context.Context, urlstr s
 var (
 	reScriptTag   = regexp.MustCompile(`<script[^>]+src="(/assets/index[^"]+\.js)"`)
 	reTokenVar    = regexp.MustCompile(`\.headers\.Authorization\s*=\s*` + "`" + `Bearer\s*\$\{([^}]+)\}` + "`")
-	reDirectJWT   = regexp.MustCompile(`"(eyJhbGciOiJFUzI1NiIsImtpZCI6[^"]+)"`)
+	reDirectJWT   = regexp.MustCompile(`"(eyJ(?:0eXAi|hbGci)[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+)"`)
 	reMultiArtist = regexp.MustCompile(`(?i)\s*(?:&|and|feat\.?|ft\.?|featuring|with|,)\s*`)
 )
 
