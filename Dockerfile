@@ -6,10 +6,22 @@ ARG COMMIT=none
 ARG BUILD_DATE=unknown
 
 WORKDIR /src
+
+# Download modules in their own layer, cached by go.mod/go.sum hash.
+# This layer is only invalidated when dependencies change, not on every
+# source edit, and a BuildKit cache mount persists the module cache
+# across builds instead of re-downloading every time.
 COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
 COPY . .
 
-RUN set -e; \
+# Cache Go's build cache across builds too, so unchanged packages are
+# never recompiled from scratch.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -e; \
     if [ -z "$BUILD_DATE" ] || [ "$BUILD_DATE" = "unknown" ]; then \
         BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
     fi; \
