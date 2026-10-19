@@ -71,6 +71,7 @@ type AppleMusicProvider struct {
 	searchCache      *lru.Cache[string, *appleSongCacheEntry]
 	suggestionsCache *lru.Cache[string, *appleSongCacheEntry]
 	isrcCache        *lru.Cache[string, *appleISRCCacheEntry]
+	idCache          *lru.Cache[string, *appleISRCCacheEntry]
 }
 
 func NewAppleMusic(client *proxy.Client) *AppleMusicProvider {
@@ -112,12 +113,14 @@ func NewAppleMusicWithConfig(client *proxy.Client, cfg config.Provider) *AppleMu
 	searchCache, _ := lru.New[string, *appleSongCacheEntry](1024)
 	suggestionsCache, _ := lru.New[string, *appleSongCacheEntry](1024)
 	isrcCache, _ := lru.New[string, *appleISRCCacheEntry](1024)
+	idCache, _ := lru.New[string, *appleISRCCacheEntry](1024)
 	return &AppleMusicProvider{
 		client:           client,
 		mgm:              newAccountManager(accounts),
 		searchCache:      searchCache,
 		suggestionsCache: suggestionsCache,
 		isrcCache:        isrcCache,
+		idCache:          idCache,
 	}
 }
 
@@ -181,17 +184,24 @@ func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 }
 
 func (p *AppleMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
-	storefront, err := p.GetStorefront(ctx)
-	if err != nil || storefront == "" {
-		if acc, ok := p.mgm.At(p.mgm.CurrentIndex()); ok && acc.STOREFRONT != "" {
-			storefront = acc.STOREFRONT
-		} else {
-			storefront = "us"
-		}
+	storefront := p.getAccountStorefront(ctx, p.mgm.CurrentIndex())
+	if storefront == "" {
+		p.debugf("no storefront configured or detected for apple music")
+		return nil, nil
 	}
 
 	var bestMatch *appleSong
-	if q.ISRC != "" {
+	if q.PlatformID != "" {
+		song, err := p.GetSongByID(ctx, q.PlatformID, storefront)
+		if err == nil && song != nil {
+			bestMatch = song
+			p.debugf("platformID lookup %s matched song %q (storefront %s)", q.PlatformID, song.Attributes.Name, storefront)
+		} else if err != nil {
+			p.debugf("platformID lookup %s failed (err=%v)", q.PlatformID, err)
+		}
+	}
+
+	if bestMatch == nil && q.ISRC != "" {
 		song, err := p.SearchByISRC(ctx, q.ISRC, storefront)
 		if err == nil && song != nil {
 			bestMatch = song
@@ -223,23 +233,64 @@ func (p *AppleMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQ
 		return nil, nil
 	}
 
-	lyricURL := fmt.Sprintf("%s/catalog/%s/songs/%s/syllable-lyrics?l%%5Blyrics%%5D=en-US&extend=ttmlLocalizations&l%%5Bscript%%5D=en-Latn",
-		appleBaseURL, storefront, bestMatch.ID)
+	var (
+		resp       *http.Response
+		err        error
+		failedIdxs []int
+	)
 
-	resp, err := p.makeAppleMusicRequest(ctx, lyricURL, nil, 0, 0, p.mgm.CurrentIndex())
-	if err != nil {
+	maxAttempts := p.mgm.Count()
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+
+	currIdx := p.mgm.CurrentIndex()
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		accStorefront := p.getAccountStorefront(ctx, currIdx)
+		if accStorefront == "" {
+			accStorefront = storefront
+		}
+		if accStorefront == "" {
+			continue
+		}
+		lyricURL := fmt.Sprintf("%s/catalog/%s/songs/%s/syllable-lyrics?l%%5Blyrics%%5D=en-US&extend=ttmlLocalizations&l%%5Bscript%%5D=en-Latn",
+			appleBaseURL, accStorefront, bestMatch.ID)
+
+		resp, err = p.makeAppleMusicRequest(ctx, lyricURL, nil, 0, 0, currIdx)
+		if err == nil && resp != nil && resp.StatusCode == http.StatusOK {
+			for _, badIdx := range failedIdxs {
+				p.debugf("account %d silent-failed on syllable-lyrics, marking bad (cooldown)", badIdx)
+				p.mgm.MarkBad(badIdx, 30*time.Second)
+			}
+			break
+		}
+
+		if resp != nil {
+			_ = resp.Body.Close()
+			resp = nil
+		}
+
 		if isAppleStatus(err, http.StatusNotFound) {
-			p.debugf("lyrics 404 for song %q", bestMatch.Attributes.Name)
+			failedIdxs = append(failedIdxs, currIdx)
+			if nextIdx, hasNext := p.mgm.Next(currIdx); hasNext && attempt+1 < maxAttempts {
+				p.debugf("lyrics 404 on account %d for song %q; rotating to account %d", currIdx, bestMatch.Attributes.Name, nextIdx)
+				currIdx = nextIdx
+				continue
+			}
+			p.debugf("lyrics 404 for song %q across attempted accounts", bestMatch.Attributes.Name)
 			return nil, nil
 		}
-		p.debugf("lyrics request failed for song %q (err=%v)", bestMatch.Attributes.Name, err)
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusOK {
+		if err != nil {
+			p.debugf("lyrics request failed for song %q on account %d (err=%v)", bestMatch.Attributes.Name, currIdx, err)
+			return nil, err
+		}
+	}
+
+	if resp == nil || resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("apple music lyrics returned status %d", resp.StatusCode)
 	}
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -581,44 +632,56 @@ func (p *AppleMusicProvider) getWebToken(ctx context.Context) (string, error) {
 	return p.cachedWebToken, nil
 }
 
-func (p *AppleMusicProvider) GetStorefront(ctx context.Context) (string, error) {
+func (p *AppleMusicProvider) getAccountStorefront(ctx context.Context, accountIdx int) string {
+	if acc, ok := p.mgm.At(accountIdx); ok && strings.TrimSpace(acc.STOREFRONT) != "" {
+		return strings.TrimSpace(acc.STOREFRONT)
+	}
+
 	p.storefrontMu.Lock()
-	defer p.storefrontMu.Unlock()
 	if p.cachedStorefront != "" {
-		return p.cachedStorefront, nil
+		sf := p.cachedStorefront
+		p.storefrontMu.Unlock()
+		return sf
 	}
+	p.storefrontMu.Unlock()
 
-	for i := 0; i < p.mgm.Count(); i++ {
-		if acc, ok := p.mgm.At(i); ok && acc.STOREFRONT != "" {
-			p.cachedStorefront = acc.STOREFRONT
-			return p.cachedStorefront, nil
-		}
-	}
-
-	current, ok := p.mgm.First()
-	if ok && strings.EqualFold(current.AUTH_TYPE, "web") {
-		headers, err := p.getAuthHeaders(ctx, 0)
+	headers, err := p.getAuthHeaders(ctx, accountIdx)
+	if err == nil {
+		resp, err := p.client.Get(ctx, "https://api.music.apple.com/v1/me/storefront", headers)
 		if err == nil {
-			resp, err := p.client.Get(ctx, "https://api.music.apple.com/v1/me/storefront", headers)
-			if err == nil {
-				defer func() { _ = resp.Body.Close() }()
-				if resp.StatusCode == http.StatusOK {
-					var sfResp struct {
-						Data []struct {
-							ID string `json:"id"`
-						} `json:"data"`
-					}
-					if json.NewDecoder(resp.Body).Decode(&sfResp) == nil && len(sfResp.Data) > 0 && sfResp.Data[0].ID != "" {
-						p.cachedStorefront = sfResp.Data[0].ID
-						return p.cachedStorefront, nil
-					}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode == http.StatusOK {
+				var sfResp struct {
+					Data []struct {
+						ID string `json:"id"`
+					} `json:"data"`
+				}
+				if json.NewDecoder(resp.Body).Decode(&sfResp) == nil && len(sfResp.Data) > 0 && sfResp.Data[0].ID != "" {
+					sf := strings.TrimSpace(sfResp.Data[0].ID)
+					p.storefrontMu.Lock()
+					p.cachedStorefront = sf
+					p.storefrontMu.Unlock()
+					return sf
 				}
 			}
 		}
 	}
 
-	p.cachedStorefront = "us"
-	return p.cachedStorefront, nil
+	for i := 0; i < p.mgm.Count(); i++ {
+		if acc, ok := p.mgm.At(i); ok && strings.TrimSpace(acc.STOREFRONT) != "" {
+			return strings.TrimSpace(acc.STOREFRONT)
+		}
+	}
+
+	return ""
+}
+
+func (p *AppleMusicProvider) GetStorefront(ctx context.Context) (string, error) {
+	sf := p.getAccountStorefront(ctx, p.mgm.CurrentIndex())
+	if sf == "" {
+		return "", fmt.Errorf("no storefront configured or detected for apple music account")
+	}
+	return sf, nil
 }
 
 func (p *AppleMusicProvider) SearchByISRC(ctx context.Context, isrc, storefront string) (*appleSong, error) {
@@ -655,6 +718,54 @@ func (p *AppleMusicProvider) SearchByISRC(ctx context.Context, isrc, storefront 
 	}
 	if p.isrcCache != nil {
 		p.isrcCache.Add(cacheKey, &appleISRCCacheEntry{song: matched, created: time.Now()})
+	}
+	return matched, nil
+}
+
+func (p *AppleMusicProvider) GetSongByID(ctx context.Context, id, storefront string) (*appleSong, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return nil, nil
+	}
+	cacheKey := storefront + ":" + id
+	if p.idCache != nil {
+		if entry, ok := p.idCache.Get(cacheKey); ok && entry != nil {
+			if time.Since(entry.created) < appleSearchCacheTTL {
+				return entry.song, nil
+			}
+		}
+	}
+
+	songURL := fmt.Sprintf("%s/catalog/%s/songs/%s", appleBaseURL, storefront, url.PathEscape(id))
+
+	resp, err := p.makeAppleMusicRequest(ctx, songURL, nil, 0, 0, p.mgm.CurrentIndex())
+	if err != nil {
+		if isAppleStatus(err, http.StatusNotFound) {
+			if p.idCache != nil {
+				p.idCache.Add(cacheKey, &appleISRCCacheEntry{song: nil, created: time.Now()})
+			}
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+
+	var res struct {
+		Data []appleSong `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
+		return nil, err
+	}
+	var matched *appleSong
+	if len(res.Data) > 0 {
+		matched = &res.Data[0]
+	}
+	if p.idCache != nil {
+		p.idCache.Add(cacheKey, &appleISRCCacheEntry{song: matched, created: time.Now()})
 	}
 	return matched, nil
 }
@@ -774,13 +885,9 @@ func (p *AppleMusicProvider) SearchSong(ctx context.Context, query, storefront s
 }
 
 func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist, album string, durationSec float64, songISRC, songPlatformID string) (*appleSong, error) {
-	storefront, err := p.GetStorefront(ctx)
-	if err != nil || storefront == "" {
-		if acc, ok := p.mgm.At(p.mgm.CurrentIndex()); ok && acc.STOREFRONT != "" {
-			storefront = acc.STOREFRONT
-		} else {
-			storefront = "us"
-		}
+	storefront := p.getAccountStorefront(ctx, p.mgm.CurrentIndex())
+	if storefront == "" {
+		return nil, nil
 	}
 
 	queries := buildSearchQueries(title, artist, album)
@@ -933,7 +1040,7 @@ func (p *AppleMusicProvider) NormalizeSong(track appleSong) domain.SongCatalogIt
 func (p *AppleMusicProvider) SearchCatalog(ctx context.Context, query string) ([]domain.SongCatalogItem, error) {
 	storefront, err := p.GetStorefront(ctx)
 	if err != nil || storefront == "" {
-		storefront = "us"
+		return nil, err
 	}
 	songs, err := p.SearchSong(ctx, query, storefront)
 	if err != nil {
@@ -953,7 +1060,7 @@ func (p *AppleMusicProvider) SearchCatalog(ctx context.Context, query string) ([
 func (p *AppleMusicProvider) GetMetadata(ctx context.Context, title, artist, album string, durationSec float64) (map[string]interface{}, error) {
 	storefront, err := p.GetStorefront(ctx)
 	if err != nil || storefront == "" {
-		storefront = "us"
+		return nil, err
 	}
 
 	searchQueries := buildMetadataQueries(title, artist, album)
