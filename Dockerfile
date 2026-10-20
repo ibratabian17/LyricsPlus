@@ -34,7 +34,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 FROM alpine:3.20
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata dumb-init
 WORKDIR /app
 
 COPY --from=build /out/server /usr/local/bin/lyricsplus-server
@@ -55,4 +55,4 @@ EXPOSE 3000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget -q -O /dev/null http://127.0.0.1:3000/health || exit 1
 
-ENTRYPOINT ["/usr/local/bin/lyricsplus-server"]
+ENTRYPOINT ["/usr/bin/dumb-init", "--", "/usr/local/bin/lyricsplus-server"]
