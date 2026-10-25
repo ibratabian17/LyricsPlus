@@ -32,6 +32,7 @@ type Server struct {
 	gdrive   *storage.GDriveClient
 	httpSrv  *http.Server
 	powH     *handlers.Pow
+	adminH   *handlers.Admin
 }
 
 func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
@@ -137,7 +138,17 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		dumper = storage.NewDumper(cfg, store, gdrive, lg)
 	}
 
-	router := newRouter(cfg, lg, lyricsH, catalogH, powH, healthH)
+	effectiveAdminToken := cfg.LyricsPlus.EffectiveAdminToken()
+	adminH := &handlers.Admin{
+		Store:       store,
+		Service:     svc,
+		ProviderSet: providerSet,
+		Racer:       racer,
+		JWTSecret:   effectiveAdminToken,
+		Logger:      lg,
+	}
+
+	router := newRouter(cfg, lg, lyricsH, catalogH, powH, healthH, adminH)
 
 	return &Server{
 		cfg:      cfg,
@@ -148,10 +159,18 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		dumper:   dumper,
 		gdrive:   gdrive,
 		powH:     powH,
+		adminH:   adminH,
 	}, nil
 }
 
-func newRouter(cfg config.Config, lg *logger.Logger, l *handlers.Lyrics, c *handlers.Catalog, p *handlers.Pow, h *handlers.Health) http.Handler {
+func newRouter(cfg config.Config, lg *logger.Logger, l *handlers.Lyrics, c *handlers.Catalog, p *handlers.Pow, h *handlers.Health, adminHandler ...*handlers.Admin) http.Handler {
+	var adm *handlers.Admin
+	if len(adminHandler) > 0 && adminHandler[0] != nil {
+		adm = adminHandler[0]
+	} else {
+		adm = &handlers.Admin{JWTSecret: cfg.LyricsPlus.JWTSecret, Logger: lg}
+	}
+
 	r := chi.NewRouter()
 	r.Use(
 		middleware.Tracing(lg),
@@ -189,6 +208,21 @@ func newRouter(cfg config.Config, lg *logger.Logger, l *handlers.Lyrics, c *hand
 	r.Post("/v1/lyricsplus/submit", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		middleware.BodyLimit(cfg.LyricsPlus.MaxBodyBytes)(http.HandlerFunc(p.Submit)).ServeHTTP(w, r)
 	}))
+
+	r.Route("/v1/admin/database", func(admin chi.Router) {
+		admin.Use(middleware.BodyLimit(1 << 20)) // 1MB payload limit
+		admin.Use(middleware.AdminAuth(cfg.LyricsPlus.AdminToken, cfg.LyricsPlus.JWTSecret))
+		admin.Get("/", adm.Stats)
+		admin.Get("/stats", adm.Stats)
+		admin.Get("/lyrics", adm.ListLyrics)
+		admin.Post("/lyrics", adm.CreateLyrics)
+		admin.Get("/lyrics/{id}", adm.GetLyric)
+		admin.Put("/lyrics/{id}", adm.UpdateLyric)
+		admin.Delete("/lyrics/{id}", adm.DeleteLyric)
+		admin.Post("/lyrics/batch-delete", adm.BatchDeleteLyrics)
+		admin.Post("/scrape", adm.ManualScrape)
+		admin.Post("/scrape-sources", adm.ScrapeSources)
+	})
 
 	return r
 }

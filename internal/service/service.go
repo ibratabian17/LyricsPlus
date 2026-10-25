@@ -267,13 +267,21 @@ func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredS
 			if e, ok := s.MemCache.Get(rawCacheKey(q)); ok && e != nil {
 				if entry, ok := e.Parsed.(*rawCacheEntry); ok && entry != nil && entry.Raw != "" {
 					if matchSource(entry.Source, preferredSources) {
-						return &RawResult{Source: entry.Source, Raw: entry.Raw, TotalMs: time.Since(start).Milliseconds()}, nil
+						if isAppleSource(entry.Source) && strings.HasPrefix(strings.TrimSpace(entry.Raw), "{") {
+							// skip stale raw cache entry containing normalized JSON
+						} else {
+							return &RawResult{Source: entry.Source, Raw: entry.Raw, TotalMs: time.Since(start).Milliseconds()}, nil
+						}
 					}
 				}
 				var entry rawCacheEntry
 				if len(e.Body) > 0 && json.Unmarshal(e.Body, &entry) == nil && entry.Raw != "" {
 					if matchSource(entry.Source, preferredSources) {
-						return &RawResult{Source: entry.Source, Raw: entry.Raw, TotalMs: time.Since(start).Milliseconds()}, nil
+						if isAppleSource(entry.Source) && strings.HasPrefix(strings.TrimSpace(entry.Raw), "{") {
+							// skip stale raw cache entry containing normalized JSON
+						} else {
+							return &RawResult{Source: entry.Source, Raw: entry.Raw, TotalMs: time.Since(start).Milliseconds()}, nil
+						}
 					}
 				}
 			}
@@ -488,6 +496,11 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		if parsed != nil && len(parsed.Lyrics) > 0 {
 			parsed = parsers.NormalizeV2(parsed)
 			parsed.RawData = string(content)
+			if (isAppleSource(cand.Source) || isAppleSource(rowSource(cand))) && !strings.HasPrefix(strings.TrimSpace(parsed.RawData), "<") {
+				if ttml, err := parsers.JSONToTTML(parsed); err == nil && len(ttml) > 0 {
+					parsed.RawData = string(ttml)
+				}
+			}
 			if cand.ID > 0 && globalParsedRowCache != nil {
 				globalParsedRowCache.Add(cacheKey, cloneLyricsResponse(parsed))
 			}
@@ -514,6 +527,11 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	}
 	if resp.RawData == "" && len(rawContent) > 0 {
 		resp.RawData = string(rawContent)
+	}
+	if isAppleSource(winner) && !strings.HasPrefix(strings.TrimSpace(resp.RawData), "<") {
+		if ttml, err := parsers.JSONToTTML(resp); err == nil && len(ttml) > 0 {
+			resp.RawData = string(ttml)
+		}
 	}
 	resp.Cached = domain.CacheDatabase
 	switch {
@@ -1122,17 +1140,40 @@ func (s *Service) SaveResultAsync(q domain.SearchQuery, res *orchestrator.Result
 			album = m.Album
 		}
 	}
-	contentJSON, err := json.Marshal(resp)
-	if err != nil {
-		return
-	}
 	source := res.Source
 	if source == "" {
 		source = resp.Metadata.Source
 	}
+
+	var contentToSave []byte
+	trimmedRaw := strings.TrimSpace(resp.RawData)
+	if resp.RawData != "" && (isAppleSource(resp.Metadata.Source) || isAppleSource(source)) && strings.HasPrefix(trimmedRaw, "<") {
+		contentToSave = []byte(resp.RawData)
+	} else if resp.RawData != "" && (strings.EqualFold(source, "qq") || strings.EqualFold(resp.Metadata.Source, "qq")) && strings.HasPrefix(trimmedRaw, "<") {
+		contentToSave = []byte(resp.RawData)
+	} else if resp.RawData != "" {
+		testRow := &storage.Row{
+			Source:     source,
+			Title:      title,
+			Artist:     artist,
+			DurationMS: q.Duration,
+			ISRC:       q.ISRC,
+			PlatformID: q.PlatformID,
+		}
+		if p := parseStoredContent(testRow, []byte(resp.RawData)); p != nil && len(p.Lyrics) > 0 {
+			contentToSave = []byte(resp.RawData)
+		}
+	}
+	if len(contentToSave) == 0 {
+		var err error
+		contentToSave, err = json.Marshal(resp)
+		if err != nil {
+			return
+		}
+	}
 	s.Store.SaveLyricsAsync(&storage.Row{
 		Filename:    storage.CanonicalFilename(artist, title, album, q.Duration, q.ISRC, q.PlatformID, extFor(resp.Metadata.Source)),
-		ContentJSON: contentJSON,
+		ContentJSON: contentToSave,
 		ISRC:        q.ISRC,
 		PlatformID:  q.PlatformID,
 		Source:      source,
@@ -1141,4 +1182,9 @@ func (s *Service) SaveResultAsync(q domain.SearchQuery, res *orchestrator.Result
 		DurationMS:  q.Duration,
 		CreatedAt:   time.Now(),
 	}, backgroundWriteTimeout)
+}
+
+func isAppleSource(source string) bool {
+	s := strings.ToLower(strings.TrimSpace(source))
+	return strings.Contains(s, "apple")
 }

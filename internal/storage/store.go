@@ -813,7 +813,7 @@ func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
 		s.recordQueryErr(ctx, err)
 		return err
 	}
-	row.ContentJSON = compressed
+	row.ID = id
 	s.RecordDBSuccess()
 	s.invalidate(row, id)
 	return nil

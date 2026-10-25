@@ -13,6 +13,8 @@ info:
 servers:
   - url: /
 tags:
+  - name: Admin Database
+    description: Database inspection, lyrics management, and proactive manual scraping.
   - name: Lyrics
     description: Synchronized lyrics retrieval (V1, V2, TTML, raw).
   - name: Catalog
@@ -357,6 +359,107 @@ paths:
           $ref: "#/components/responses/RateLimited"
         "503":
           description: Submissions disabled or server busy.
+  /v1/admin/database/stats:
+    get:
+      tags: [Admin Database]
+      summary: Retrieve database overview and provider statistics
+      description: Returns lyrics record counts by source, database file size, and resting status. Requires JWT Secret as token.
+      responses:
+        "200":
+          description: Database statistics.
+        "401":
+          description: Missing or invalid admin token.
+  /v1/admin/database/lyrics:
+    get:
+      tags: [Admin Database]
+      summary: List and search database lyrics entries
+      description: Paginated search with filtering by query, source, isrc, and platform_id.
+      parameters:
+        - name: query
+          in: query
+          schema: { type: string }
+        - name: source
+          in: query
+          schema: { type: string }
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 20 }
+        - name: sort_by
+          in: query
+          schema: { type: string }
+        - name: sort_dir
+          in: query
+          schema: { type: string, enum: [asc, desc] }
+      responses:
+        "200":
+          description: Paginated lyrics list.
+        "401":
+          description: Missing or invalid admin token.
+    post:
+      tags: [Admin Database]
+      summary: Manually create a lyrics database entry
+      responses:
+        "201":
+          description: Created lyrics entry.
+        "401":
+          description: Missing or invalid admin token.
+  /v1/admin/database/lyrics/{id}:
+    get:
+      tags: [Admin Database]
+      summary: Get detailed lyrics entry by ID
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Full lyrics details with decompressed content.
+        "404":
+          description: Lyric record not found.
+    put:
+      tags: [Admin Database]
+      summary: Update a lyrics database entry
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Updated lyrics entry.
+    delete:
+      tags: [Admin Database]
+      summary: Delete a lyrics database entry
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer }
+      responses:
+        "200":
+          description: Deleted lyrics entry.
+  /v1/admin/database/scrape:
+    post:
+      tags: [Admin Database]
+      summary: Manually scrape lyrics from upstream providers
+      description: Bypasses cache, performs live scraping from specified providers, and saves result immediately into the database.
+      responses:
+        "200":
+          description: Scraped lyrics result and saved database record ID.
+        "404":
+          description: Lyrics not found across searched providers.
+  /v1/admin/database/scrape-sources:
+    post:
+      tags: [Admin Database]
+      summary: Compare live scraping results across all or selected providers
+      description: Proactively queries each provider individually and returns side-by-side results.
+      responses:
+        "200":
+          description: Comparison results per provider.
 components:
   parameters:
     Title:

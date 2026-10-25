@@ -334,6 +334,7 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 
 	converted.Metadata.Source = "Musixmatch"
 	converted.Cached = domain.CacheNone
+	converted.RawData = string(envelopeJSON)
 	var durSec *float64
 	if matchedTrack.TrackLength > 0 {
 		s := float64(matchedTrack.TrackLength)

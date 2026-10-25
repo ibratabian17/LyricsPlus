@@ -128,11 +128,25 @@ type Provider struct {
 
 type LyricsPlus struct {
 	JWTSecret        string
+	AdminToken       string
 	ChallengeTTL     time.Duration
 	PoWDifficulty    int
 	MaxBodyBytes     int64
 	AcceptVandalism  bool
 	AllowSubmissions bool
+}
+
+const DefaultInsecureJWTSecret = "lyricsplus-submit-opensource-yes-yes-yes"
+
+func (l LyricsPlus) EffectiveAdminToken() string {
+	if strings.TrimSpace(l.AdminToken) != "" {
+		return strings.TrimSpace(l.AdminToken)
+	}
+	trimmedJWT := strings.TrimSpace(l.JWTSecret)
+	if trimmedJWT != "" && trimmedJWT != DefaultInsecureJWTSecret {
+		return trimmedJWT
+	}
+	return ""
 }
 
 type RateLimit struct {
@@ -455,6 +469,17 @@ func loadJSONConfig(cfg *Config, path string) error {
 			cfg.LyricsPlus.JWTSecret = s
 		}
 	}
+	if raw, ok := rawMap["admin_token"]; ok {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+			cfg.LyricsPlus.AdminToken = s
+		}
+	} else if raw, ok := rawMap["admin_secret"]; ok {
+		var s string
+		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
+			cfg.LyricsPlus.AdminToken = s
+		}
+	}
 	if raw, ok := rawMap["port"]; ok {
 		var s string
 		if err := json.Unmarshal(raw, &s); err == nil && s != "" {
@@ -723,7 +748,41 @@ func loadJSONConfig(cfg *Config, path string) error {
 	}
 
 	if raw, ok := rawMap["lyricsplus"]; ok {
-		_ = json.Unmarshal(raw, &cfg.LyricsPlus)
+		var lp struct {
+			JWTSecret        *string `json:"jwt_secret"`
+			AdminToken       *string `json:"admin_token"`
+			AdminSecret      *string `json:"admin_secret"`
+			ChallengeTTLMS   *int    `json:"challenge_ttl_ms"`
+			PoWDifficulty    *int    `json:"pow_difficulty"`
+			MaxBodyBytes     *int64  `json:"max_body_bytes"`
+			AcceptVandalism  *bool   `json:"accept_vandalism"`
+			AllowSubmissions *bool   `json:"allow_submissions"`
+		}
+		if err := json.Unmarshal(raw, &lp); err == nil {
+			if lp.JWTSecret != nil && *lp.JWTSecret != "" {
+				cfg.LyricsPlus.JWTSecret = *lp.JWTSecret
+			}
+			if lp.AdminToken != nil && *lp.AdminToken != "" {
+				cfg.LyricsPlus.AdminToken = *lp.AdminToken
+			} else if lp.AdminSecret != nil && *lp.AdminSecret != "" {
+				cfg.LyricsPlus.AdminToken = *lp.AdminSecret
+			}
+			if lp.ChallengeTTLMS != nil && *lp.ChallengeTTLMS > 0 {
+				cfg.LyricsPlus.ChallengeTTL = time.Duration(*lp.ChallengeTTLMS) * time.Millisecond
+			}
+			if lp.PoWDifficulty != nil {
+				cfg.LyricsPlus.PoWDifficulty = *lp.PoWDifficulty
+			}
+			if lp.MaxBodyBytes != nil {
+				cfg.LyricsPlus.MaxBodyBytes = *lp.MaxBodyBytes
+			}
+			if lp.AcceptVandalism != nil {
+				cfg.LyricsPlus.AcceptVandalism = *lp.AcceptVandalism
+			}
+			if lp.AllowSubmissions != nil {
+				cfg.LyricsPlus.AllowSubmissions = *lp.AllowSubmissions
+			}
+		}
 	}
 	if raw, ok := rawMap["rate_limit"]; ok {
 		var rl struct {
@@ -1075,6 +1134,11 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 
 	if v, ok := m["JWT_SECRET"]; ok && v != "" {
 		cfg.LyricsPlus.JWTSecret = v
+	}
+	if v, ok := m["ADMIN_TOKEN"]; ok && v != "" {
+		cfg.LyricsPlus.AdminToken = v
+	} else if v, ok := m["ADMIN_SECRET"]; ok && v != "" {
+		cfg.LyricsPlus.AdminToken = v
 	}
 	if v, ok := m["LYRICSPLUS_CHALLENGE_TTL_MS"]; ok {
 		cfg.LyricsPlus.ChallengeTTL = time.Duration(parseInt(v, int(cfg.LyricsPlus.ChallengeTTL/time.Millisecond))) * time.Millisecond

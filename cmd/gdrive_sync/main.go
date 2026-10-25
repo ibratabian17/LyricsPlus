@@ -265,10 +265,7 @@ func main() {
 				if strings.HasPrefix(trimmed, "<") {
 					if job.source == "apple" || strings.HasSuffix(strings.ToLower(job.item.Name), ".ttml") {
 						if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
-							p.RawData = string(content)
-							if b, err := json.Marshal(p); err == nil {
-								contentToStore = b
-							}
+							contentToStore = content
 						}
 					} else if job.source == "qq" || strings.HasSuffix(strings.ToLower(job.item.Name), ".qrc") {
 						p := parsers.ParseQQQRC(trimmed, parsers.ExactMetadata{
@@ -455,10 +452,7 @@ func main() {
 					if strings.HasPrefix(trimmed, "<") {
 						if job.source == "apple" || strings.HasSuffix(strings.ToLower(job.item.Name), ".ttml") {
 							if p, err := parsers.TTMLToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
-								p.RawData = string(content)
-								if b, err := json.Marshal(p); err == nil {
-									contentToStore = b
-								}
+								contentToStore = content
 							}
 						} else if job.source == "qq" || strings.HasSuffix(strings.ToLower(job.item.Name), ".qrc") {
 							p := parsers.ParseQQQRC(trimmed, parsers.ExactMetadata{

@@ -369,6 +369,9 @@ func resolveRawContentType(source, raw string) string {
 		return "application/xml"
 	}
 	if strings.Contains(src, "deezer") {
+		if strings.HasPrefix(trimmed, "{") {
+			return "application/json"
+		}
 		return "text/plain"
 	}
 
