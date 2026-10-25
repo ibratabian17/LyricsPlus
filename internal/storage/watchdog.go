@@ -2,6 +2,7 @@ package storage
 
 import (
 	"log"
+	"runtime"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -67,9 +68,14 @@ func (w *Watchdog) check() {
 
 	log.Printf("memory watchdog: RSS %dMB exceeds %dMB, shedding caches", used>>20, w.limitBytes>>20)
 	for _, c := range w.caches {
-		c.Shed()
+		if c != nil {
+			c.Shed()
+		}
 	}
-	debug.FreeOSMemory()
+	runtime.GC()
+	if int64(rssBytes()) > w.limitBytes {
+		debug.FreeOSMemory()
+	}
 	after := rssBytes()
 	log.Printf("memory watchdog: RSS after shed %dMB", after>>20)
 }

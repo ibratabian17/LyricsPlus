@@ -197,6 +197,7 @@ func (h *Pow) findExistingLyricsPlus(ctx context.Context, q domain.SearchQuery) 
 		if res, ok := h.LyricsPlus.GetUserLyrics(ctx, q); ok && res != nil {
 			return res
 		}
+		return nil
 	}
 	if h.Store != nil {
 		lp := providers.NewLyricsPlus(nil)

@@ -25,7 +25,7 @@ type parsedRowCacheKey struct {
 	createdAt int64
 }
 
-var globalParsedRowCache, _ = lru.New[parsedRowCacheKey, *domain.LyricsResponse](4096)
+var globalParsedRowCache, _ = lru.New[parsedRowCacheKey, *domain.LyricsResponse](8192)
 
 type Service struct {
 	Dedup       *orchestrator.Dedup
@@ -33,6 +33,16 @@ type Service struct {
 	MemCache    *storage.MemoryCache
 	Logger      *logger.Logger
 	NegativeTTL time.Duration
+}
+
+func (s *Service) Shed() {
+	if globalParsedRowCache == nil {
+		return
+	}
+	toRemove := globalParsedRowCache.Len() / 2
+	for i := 0; i < toRemove; i++ {
+		globalParsedRowCache.RemoveOldest()
+	}
 }
 
 type RawResult struct {
@@ -209,11 +219,11 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 
 	res, err := s.Dedup.Get(ctx, q, preferredSources)
 	if err != nil {
-		metrics.Default.RecordLyricsLookup("", "", false)
+		metrics.Default.RecordLyricsLookup("", "none", false)
 		return nil, err
 	}
 	if res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
-		metrics.Default.RecordLyricsLookup("", "", false)
+		metrics.Default.RecordLyricsLookup("", "none", false)
 		if shouldCacheNegativeResult(res) {
 			s.cacheNegative(q)
 		}
@@ -327,9 +337,11 @@ func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredS
 	}
 	if s.MemCache != nil {
 		entry := &rawCacheEntry{Source: res.Source, Raw: res.Resp.RawData}
-		if b, err := json.Marshal(entry); err == nil {
-			s.MemCache.Set(rawCacheKey(q), &storage.CacheEntry{Body: b, Parsed: entry, StoredAt: time.Now()})
-		}
+		s.MemCache.Set(rawCacheKey(q), &storage.CacheEntry{
+			Size:     int64(len(res.Resp.RawData)),
+			Parsed:   entry,
+			StoredAt: time.Now(),
+		})
 	}
 	return raw, nil
 }
@@ -689,7 +701,7 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			return p
 		}
 		return nil
-	case strings.EqualFold(src, "musixmatch"):
+	case strings.EqualFold(src, "musixmatch"), strings.EqualFold(src, "musixmatch-word"):
 		if res := parseNormalizedJSON(trimmedRaw); res != nil {
 			res.Metadata.Source = "Musixmatch"
 			return res
@@ -713,7 +725,7 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			return p
 		}
 		return nil
-	case strings.EqualFold(src, "lyricsplus"), src == "":
+	case strings.EqualFold(src, "lyricsplus"), strings.EqualFold(src, "qaple"), src == "":
 		if strings.Contains(trimmedRaw, `"isLineEnding"`) {
 			coerced := coercedForKpoe(trimmedRaw)
 			var v1 domain.V1Response
@@ -802,15 +814,33 @@ func (s *Service) cacheResponse(ctx context.Context, q domain.SearchQuery, resp 
 		return
 	}
 	cloned := cloneLyricsResponse(resp)
-	if b, err := json.Marshal(resp); err == nil {
-		s.MemCache.Set(lyricsCacheKey(q), &storage.CacheEntry{Body: b, Parsed: cloned, StoredAt: time.Now()})
-	}
+	s.MemCache.Set(lyricsCacheKey(q), &storage.CacheEntry{
+		Size:     int64(estimateLyricsBytes(cloned)),
+		Parsed:   cloned,
+		StoredAt: time.Now(),
+	})
 	if resp.RawData != "" {
 		rawEntry := &rawCacheEntry{Source: winner, Raw: resp.RawData}
-		if b, err := json.Marshal(rawEntry); err == nil {
-			s.MemCache.Set(rawCacheKey(q), &storage.CacheEntry{Body: b, Parsed: rawEntry, StoredAt: time.Now()})
-		}
+		s.MemCache.Set(rawCacheKey(q), &storage.CacheEntry{
+			Size:     int64(len(resp.RawData)),
+			Parsed:   rawEntry,
+			StoredAt: time.Now(),
+		})
 	}
+}
+
+func estimateLyricsBytes(resp *domain.LyricsResponse) int {
+	if resp == nil {
+		return 256
+	}
+	size := 256 + len(resp.RawData)
+	for _, l := range resp.Lyrics {
+		size += 64 + len(l.Text) + len(l.Syllabus)*32
+	}
+	if size > 64<<10 {
+		size = 64 << 10
+	}
+	return size
 }
 
 func (s *Service) cacheNegative(q domain.SearchQuery) {
@@ -819,7 +849,7 @@ func (s *Service) cacheNegative(q domain.SearchQuery) {
 	}
 	ttl := s.NegativeTTL
 	if ttl <= 0 {
-		ttl = 30 * time.Second
+		ttl = 3 * time.Minute
 	}
 	s.MemCache.Set(negativeCacheKey(q), &storage.CacheEntry{
 		Status:   404,
@@ -1121,13 +1151,16 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 }
 
 func (s *Service) SaveResultAsync(q domain.SearchQuery, res *orchestrator.Result) {
-	if s == nil || s.Store == nil || res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
+	if s == nil || s.Store == nil || s.Store.IsResting() || res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
 		return
 	}
 	resp := res.Resp
 	title := q.Title
 	artist := q.Artist
 	album := q.Album
+	isrc := q.ISRC
+	platID := q.PlatformID
+	durMS := q.Duration
 	if pt := resp.ProcessingTime; pt != nil && pt.SelectedSongMetadata != nil {
 		m := pt.SelectedSongMetadata
 		if m.Title != "" {
@@ -1139,28 +1172,40 @@ func (s *Service) SaveResultAsync(q domain.SearchQuery, res *orchestrator.Result
 		if m.Album != "" {
 			album = m.Album
 		}
+		if isrc == "" && m.SongISRC != "" {
+			isrc = m.SongISRC
+		}
+		if platID == "" && m.SongPlatformID != "" {
+			platID = m.SongPlatformID
+		}
+		if durMS <= 0 && m.Duration != nil && *m.Duration > 0 {
+			durMS = int(*m.Duration * 1000.0)
+		}
 	}
 	source := res.Source
 	if source == "" {
 		source = resp.Metadata.Source
 	}
 
+	filename := storage.CanonicalFilename(artist, title, album, durMS, isrc, platID, extFor(resp.Metadata.Source))
+	if !s.Store.MarkRecentSave(source, filename) {
+		return
+	}
+
 	var contentToSave []byte
 	trimmedRaw := strings.TrimSpace(resp.RawData)
-	if resp.RawData != "" && (isAppleSource(resp.Metadata.Source) || isAppleSource(source)) && strings.HasPrefix(trimmedRaw, "<") {
-		contentToSave = []byte(resp.RawData)
-	} else if resp.RawData != "" && (strings.EqualFold(source, "qq") || strings.EqualFold(resp.Metadata.Source, "qq")) && strings.HasPrefix(trimmedRaw, "<") {
-		contentToSave = []byte(resp.RawData)
-	} else if resp.RawData != "" {
-		testRow := &storage.Row{
-			Source:     source,
-			Title:      title,
-			Artist:     artist,
-			DurationMS: q.Duration,
-			ISRC:       q.ISRC,
-			PlatformID: q.PlatformID,
-		}
-		if p := parseStoredContent(testRow, []byte(resp.RawData)); p != nil && len(p.Lyrics) > 0 {
+	if trimmedRaw != "" {
+		srcLower := strings.ToLower(strings.TrimSpace(source))
+		switch {
+		case (isAppleSource(resp.Metadata.Source) || isAppleSource(source)) && strings.HasPrefix(trimmedRaw, "<"):
+			contentToSave = []byte(resp.RawData)
+		case (srcLower == "qq" || strings.EqualFold(resp.Metadata.Source, "qq")) && strings.HasPrefix(trimmedRaw, "<"):
+			contentToSave = []byte(resp.RawData)
+		case strings.HasPrefix(srcLower, "musixmatch") && strings.Contains(trimmedRaw, `"message"`):
+			contentToSave = []byte(resp.RawData)
+		case srcLower == "spotify" && strings.Contains(trimmedRaw, `"lines"`):
+			contentToSave = []byte(resp.RawData)
+		case srcLower == "deezer" && strings.HasPrefix(trimmedRaw, "{"):
 			contentToSave = []byte(resp.RawData)
 		}
 	}
@@ -1171,15 +1216,15 @@ func (s *Service) SaveResultAsync(q domain.SearchQuery, res *orchestrator.Result
 			return
 		}
 	}
-	s.Store.SaveLyricsAsync(&storage.Row{
-		Filename:    storage.CanonicalFilename(artist, title, album, q.Duration, q.ISRC, q.PlatformID, extFor(resp.Metadata.Source)),
+	s.Store.SubmitLyricsPreDeduped(&storage.Row{
+		Filename:    filename,
 		ContentJSON: contentToSave,
-		ISRC:        q.ISRC,
-		PlatformID:  q.PlatformID,
+		ISRC:        isrc,
+		PlatformID:  platID,
 		Source:      source,
 		Title:       title,
 		Artist:      artist,
-		DurationMS:  q.Duration,
+		DurationMS:  durMS,
 		CreatedAt:   time.Now(),
 	}, backgroundWriteTimeout)
 }

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
@@ -79,7 +80,10 @@ CREATE TRIGGER IF NOT EXISTS lyrics_fts_delete AFTER DELETE ON lyrics BEGIN
   INSERT INTO lyrics_fts(lyrics_fts, rowid, title, artist) VALUES ('delete', old.id, old.title, old.artist);
 END;
 
-CREATE TRIGGER IF NOT EXISTS lyrics_fts_update AFTER UPDATE ON lyrics BEGIN
+DROP TRIGGER IF EXISTS lyrics_fts_update;
+CREATE TRIGGER IF NOT EXISTS lyrics_fts_update AFTER UPDATE OF title, artist ON lyrics
+WHEN old.title IS NOT new.title OR old.artist IS NOT new.artist
+BEGIN
   INSERT INTO lyrics_fts(lyrics_fts, rowid, title, artist) VALUES ('delete', old.id, old.title, old.artist);
   INSERT INTO lyrics_fts(rowid, title, artist) VALUES (new.id, new.title, new.artist);
 END;
@@ -101,8 +105,9 @@ type Store struct {
 	miss       *expirable.LRU[string, struct{}]
 	recentSave *expirable.LRU[string, struct{}]
 
-	writes    *writeQueue
-	closeOnce sync.Once
+	writes     *writeQueue
+	writeCount atomic.Int64
+	closeOnce  sync.Once
 
 	cbMu              sync.RWMutex
 	cbOpen            bool
@@ -134,7 +139,7 @@ func NewStore(cfg config.Storage) (*Store, error) {
 	}
 	db.SetMaxOpenConns(readConns)
 	db.SetMaxIdleConns(readConns)
-	db.SetConnMaxIdleTime(5 * time.Minute)
+	db.SetConnMaxIdleTime(15 * time.Minute)
 
 	wdb, err := sql.Open("sqlite", writeDSN)
 	if err != nil {
@@ -143,9 +148,9 @@ func NewStore(cfg config.Storage) (*Store, error) {
 	}
 	wdb.SetMaxOpenConns(1)
 	wdb.SetMaxIdleConns(1)
-	wdb.SetConnMaxLifetime(time.Hour)
+	wdb.SetConnMaxLifetime(0)
 
-	if err := initStoreSchema(db); err != nil {
+	if err := initStoreSchema(wdb); err != nil {
 		_ = db.Close()
 		_ = wdb.Close()
 		return nil, fmt.Errorf("storage: init schema: %w", err)
@@ -153,7 +158,7 @@ func NewStore(cfg config.Storage) (*Store, error) {
 
 	size := cfg.LRUSize
 	if size <= 0 {
-		size = 4096
+		size = 16384
 	}
 	exact, _ := lru.New[string, *Row](size)
 	exactTitle, _ := lru.New[string, []*Row](size)
@@ -166,14 +171,14 @@ func NewStore(cfg config.Storage) (*Store, error) {
 
 	negSize := cfg.MissMemoSize
 	if negSize <= 0 {
-		negSize = size
+		negSize = size * 2
 	}
 	negTTL := cfg.NegativeTTL
 	if negTTL <= 0 {
-		negTTL = 30 * time.Second
+		negTTL = 3 * time.Minute
 	}
 	miss := expirable.NewLRU[string, struct{}](negSize, nil, negTTL)
-	recentSave := expirable.NewLRU[string, struct{}](2048, nil, 30*time.Second)
+	recentSave := expirable.NewLRU[string, struct{}](8192, nil, 5*time.Minute)
 
 	cbThreshold := cfg.CircuitBreakerThreshold
 	if cbThreshold <= 0 {
@@ -204,17 +209,18 @@ func NewStore(cfg config.Storage) (*Store, error) {
 const (
 	defaultReadConns = 8
 	readCacheKB      = -8192
-	writeCacheKB     = -2000
+	writeCacheKB     = -4096
 )
 
 func buildDSN(path string, cacheKB int) string {
 	return fmt.Sprintf(
-		"file:%s?_pragma=busy_timeout(10000)"+
+		"file:%s?_pragma=busy_timeout(15000)"+
 			"&_pragma=journal_mode(WAL)"+
 			"&_pragma=synchronous(NORMAL)"+
 			"&_pragma=cache_size(%d)"+
 			"&_pragma=mmap_size(67108864)"+
 			"&_pragma=journal_size_limit(67108864)"+
+			"&_pragma=wal_autocheckpoint(1000)"+
 			"&_pragma=temp_store(MEMORY)"+
 			"&_pragma=foreign_keys(ON)",
 		path, cacheKB,
@@ -226,17 +232,18 @@ func (s *Store) BackfillFTS5() {
 	if err := s.db.QueryRow(`SELECT count(*) FROM lyrics_fts`).Scan(&count); err == nil && count > 0 {
 		return
 	}
-	_, _ = s.db.Exec(`INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild')`)
+	_, _ = s.wdb.Exec(`INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild')`)
 }
 
 func initStoreSchema(db *sql.DB) error {
 	pragmas := []string{
 		"PRAGMA journal_mode = WAL;",
 		"PRAGMA synchronous = NORMAL;",
-		"PRAGMA busy_timeout = 10000;",
+		"PRAGMA busy_timeout = 15000;",
 		"PRAGMA cache_size = -8192;",
 		"PRAGMA mmap_size = 67108864;",
 		"PRAGMA journal_size_limit = 67108864;",
+		"PRAGMA wal_autocheckpoint = 1000;",
 		"PRAGMA temp_store = MEMORY;",
 		"PRAGMA foreign_keys = ON;",
 	}
@@ -251,6 +258,7 @@ func initStoreSchema(db *sql.DB) error {
 	if _, err := db.Exec(lyricsFTS5Setup); err != nil {
 		return err
 	}
+	_, _ = db.Exec("PRAGMA wal_checkpoint(PASSIVE);")
 	_, _ = db.Exec("ANALYZE;")
 	_, _ = db.Exec("PRAGMA optimize;")
 	return nil
@@ -497,15 +505,23 @@ func buildFTSQuery(title, artist string) string {
 
 	var clauses []string
 
-	if cleanTitle != "" {
+	if cleanTitle != "" && cleanArtist != "" {
+		clauses = append(clauses, fmt.Sprintf(`(title: "%s" AND artist: "%s")`, cleanTitle, cleanArtist))
+		if strings.Contains(cleanTitle, " ") {
+			clauses = append(clauses, fmt.Sprintf(`(title: "%s"* AND artist: "%s"*)`, cleanTitle, cleanArtist))
+		}
+		artistWords := strings.Fields(cleanArtist)
+		if len(artistWords) > 0 && len(artistWords[0]) >= 2 {
+			clauses = append(clauses, fmt.Sprintf(`(title: "%s" AND artist: "%s"*)`, cleanTitle, artistWords[0]))
+		}
+		if len(cleanTitle) >= 5 || strings.Contains(cleanTitle, " ") {
+			clauses = append(clauses, fmt.Sprintf(`title: "%s"`, cleanTitle))
+		}
+	} else if cleanTitle != "" {
 		clauses = append(clauses, fmt.Sprintf(`title: "%s"`, cleanTitle))
 		if strings.Contains(cleanTitle, " ") {
 			clauses = append(clauses, fmt.Sprintf(`title: "%s"*`, cleanTitle))
 		}
-	}
-
-	if cleanTitle != "" && cleanArtist != "" {
-		clauses = append(clauses, fmt.Sprintf(`(title: "%s" AND artist: "%s")`, cleanTitle, cleanArtist))
 	} else if cleanArtist != "" {
 		clauses = append(clauses, fmt.Sprintf(`artist: "%s"`, cleanArtist))
 	}
@@ -816,7 +832,28 @@ func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
 	row.ID = id
 	s.RecordDBSuccess()
 	s.invalidate(row, id)
+	if len(row.ContentJSON) > 0 && id > 0 {
+		s.content.Add(id, row.ContentJSON)
+	}
+	if s.writeCount.Add(1)%250 == 0 {
+		_, _ = s.wdb.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE);")
+	}
 	return nil
+}
+
+// MarkRecentSave checks whether (source, filename) was recently queued for persistence,
+// and if not, marks it as queued. This allows callers to skip expensive payload marshaling
+// or validation before submitting to the async write queue.
+func (s *Store) MarkRecentSave(source, filename string) bool {
+	if s == nil || s.recentSave == nil {
+		return true
+	}
+	dedupKey := strings.ToLower(strings.TrimSpace(source)) + "::" + filename
+	if _, exists := s.recentSave.Get(dedupKey); exists {
+		return false
+	}
+	s.recentSave.Add(dedupKey, struct{}{})
+	return true
 }
 
 func (s *Store) SaveLyricsAsync(row *Row, timeout time.Duration) {
@@ -833,6 +870,20 @@ func (s *Store) SaveLyricsAsync(row *Row, timeout time.Duration) {
 		}
 		s.recentSave.Add(dedupKey, struct{}{})
 	}
+	s.submitSaveLyrics(row, timeout)
+}
+
+func (s *Store) SubmitLyricsPreDeduped(row *Row, timeout time.Duration) {
+	if row == nil || s.IsResting() {
+		return
+	}
+	if row.Filename == "" {
+		row.Filename = CanonicalFilename(row.Artist, row.Title, "", row.DurationMS, row.ISRC, row.PlatformID, "json")
+	}
+	s.submitSaveLyrics(row, timeout)
+}
+
+func (s *Store) submitSaveLyrics(row *Row, timeout time.Duration) {
 	s.writes.Submit(context.Background(), func(ctx context.Context) {
 		if s.IsResting() {
 			return

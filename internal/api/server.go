@@ -45,11 +45,23 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 	}
 
 	httpCache := storage.NewMemoryCache(cfg.Cache)
-	watchdog := storage.NewWatchdog(cfg.Cache.MemoryWatchdogByte, 10*time.Second, httpCache, store)
+
+	limiter := orchestrator.NewLimiter(orchestrator.LimiterConfig{
+		Global:    cfg.Provider.MaxConcurrentFetches,
+		PerSource: cfg.Provider.MaxConcurrentPerSource,
+		Wait:      cfg.Provider.FetchAdmissionWait,
+	})
 
 	proxyClient := proxy.New(cfg.Server)
 	gdrive := storage.NewGDriveClient(cfg.GDrive, nil)
-	factory := &providers.Factory{Client: proxyClient, Store: store, GDrive: gdrive, Config: &cfg, Logger: lg}
+	factory := &providers.Factory{
+		Client:  proxyClient,
+		Store:   store,
+		GDrive:  gdrive,
+		Limiter: limiter,
+		Config:  &cfg,
+		Logger:  lg,
+	}
 	providerSet, err := factory.BuildSet()
 	if err != nil {
 		return nil, err
@@ -84,11 +96,6 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		}, "Local LyricsPlus UGC + Cache Database Availability")
 	}
 
-	limiter := orchestrator.NewLimiter(orchestrator.LimiterConfig{
-		Global:    cfg.Provider.MaxConcurrentFetches,
-		PerSource: cfg.Provider.MaxConcurrentPerSource,
-		Wait:      cfg.Provider.FetchAdmissionWait,
-	})
 	racer := orchestrator.NewRacer(toOrchestratorSources(providerSet.Sources), cfg.Provider.Timeout,
 		orchestrator.WithLogger(lg),
 		orchestrator.WithLimiter(limiter),
@@ -104,6 +111,8 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		NegativeTTL: cfg.Storage.NegativeTTL,
 	}
 	racer.SetSaver(svc.SaveResultAsync)
+
+	watchdog := storage.NewWatchdog(cfg.Cache.MemoryWatchdogByte, 10*time.Second, httpCache, store, svc)
 
 	lyricsH := &handlers.Lyrics{Service: svc, Logger: lg, KpoeInfo: "lyricsplus"}
 	catalogH := &handlers.Catalog{

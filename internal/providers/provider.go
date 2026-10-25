@@ -24,11 +24,12 @@ type Source interface {
 }
 
 type Factory struct {
-	Client *proxy.Client
-	Store  *storage.Store
-	GDrive *storage.GDriveClient
-	Config *config.Config
-	Logger *logger.Logger
+	Client  *proxy.Client
+	Store   *storage.Store
+	GDrive  *storage.GDriveClient
+	Limiter *orchestrator.Limiter
+	Config  *config.Config
+	Logger  *logger.Logger
 }
 
 type Set struct {
@@ -40,6 +41,7 @@ type Set struct {
 	QQMusic    *QQMusicProvider
 	LyricsPlus *LyricsPlusProvider
 	Breaker    *orchestrator.Breaker
+	Limiter    *orchestrator.Limiter
 }
 
 var errBreakerOpen = errors.New("provider circuit breaker open")
@@ -56,7 +58,7 @@ func (g guardedLineSource) FetchLyrics(ctx context.Context, q domain.SearchQuery
 	}
 	resp, err := g.src.FetchLyrics(ctx, q)
 	switch {
-	case errors.Is(err, context.Canceled):
+	case errors.Is(err, context.Canceled) || ctx.Err() == context.Canceled:
 		g.br.Neutral(g.name)
 	case err != nil && orchestrator.IsHealthFailure(err):
 		g.br.Report(g.name, false)
@@ -67,7 +69,7 @@ func (g guardedLineSource) FetchLyrics(ctx context.Context, q domain.SearchQuery
 }
 
 func (f *Factory) BuildSet() (*Set, error) {
-	return buildAll(f.Client, f.Store, f.GDrive, f.Config, f.Logger)
+	return buildAll(f.Client, f.Store, f.GDrive, f.Limiter, f.Config, f.Logger)
 }
 
 func (f *Factory) Build() ([]Source, error) {
@@ -78,12 +80,20 @@ func (f *Factory) Build() ([]Source, error) {
 	return set.Sources, nil
 }
 
-func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDriveClient, cfg *config.Config, lg *logger.Logger) (*Set, error) {
+func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDriveClient, limiter *orchestrator.Limiter, cfg *config.Config, lg *logger.Logger) (*Set, error) {
 	var pcfg config.Provider
 	if cfg != nil {
 		pcfg = cfg.Provider
 	} else {
 		pcfg = config.Load().Provider
+	}
+
+	if limiter == nil {
+		limiter = orchestrator.NewLimiter(orchestrator.LimiterConfig{
+			Global:    pcfg.MaxConcurrentFetches,
+			PerSource: pcfg.MaxConcurrentPerSource,
+			Wait:      pcfg.FetchAdmissionWait,
+		})
 	}
 
 	apple := NewAppleMusicWithConfig(client, pcfg)
@@ -142,6 +152,7 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 		QQMusic:    qq,
 		LyricsPlus: lp,
 		Breaker:    breaker,
+		Limiter:    limiter,
 	}, nil
 }
 

@@ -156,7 +156,7 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 		tracks, err := p.SearchTrack(ctx, query, 10)
 		if err != nil || len(tracks) == 0 {
 			p.debugf("search %q returned no tracks (err=%v)", query, err)
-			return nil, nil
+			return nil, err
 		}
 		p.debugf("search %q returned %d tracks", query, len(tracks))
 
@@ -205,7 +205,7 @@ func (p *DeezerProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 	lyricsJSON, err := p.getLyrics(ctx, trackID, 0)
 	if err != nil || lyricsJSON == nil {
 		p.debugf("lyrics fetch failed for track %s (err=%v)", trackID, err)
-		return nil, nil
+		return nil, err
 	}
 
 	converted, err := parsers.NormalizeDeezerLyrics(lyricsJSON)

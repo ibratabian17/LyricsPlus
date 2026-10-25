@@ -16,8 +16,19 @@ type CacheEntry struct {
 	Parsed   any
 	Header   map[string][]string
 	Status   int
+	Size     int64
 	StoredAt time.Time
 	TTL      time.Duration
+}
+
+func entrySize(e *CacheEntry) int64 {
+	if e == nil {
+		return 0
+	}
+	if e.Size > 0 {
+		return e.Size
+	}
+	return int64(len(e.Body))
 }
 
 type MemoryCache struct {
@@ -66,7 +77,7 @@ func (c *MemoryCache) Get(key string) (*CacheEntry, bool) {
 		ttl = defaultCacheEntryTTL
 	}
 	if !e.StoredAt.IsZero() && time.Since(e.StoredAt) > ttl {
-		c.bytes -= int64(len(e.Body))
+		c.bytes -= entrySize(e)
 		if c.bytes < 0 {
 			c.bytes = 0
 		}
@@ -82,7 +93,7 @@ func (c *MemoryCache) Set(key string, entry *CacheEntry) {
 	if c == nil || c.entries == nil || entry == nil {
 		return
 	}
-	bodyLen := int64(len(entry.Body))
+	bodyLen := entrySize(entry)
 	if c.maxBody > 0 && bodyLen > c.maxBody {
 		return
 	}
@@ -92,19 +103,19 @@ func (c *MemoryCache) Set(key string, entry *CacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if prev, ok := c.entries.Peek(key); ok && prev != nil {
-		c.bytes -= int64(len(prev.Body))
+		c.bytes -= entrySize(prev)
 		c.entries.Remove(key)
 	}
 	if c.maxBytes > 0 {
 		for c.bytes+bodyLen > c.maxBytes && c.entries.Len() > 0 {
 			if _, v, ok := c.entries.RemoveOldest(); ok && v != nil {
-				c.bytes -= int64(len(v.Body))
+				c.bytes -= entrySize(v)
 			}
 		}
 	}
 	if c.entries.Len() >= c.maxKeys && c.entries.Len() > 0 {
 		if _, v, ok := c.entries.RemoveOldest(); ok && v != nil {
-			c.bytes -= int64(len(v.Body))
+			c.bytes -= entrySize(v)
 		}
 	}
 	if c.bytes < 0 {
@@ -137,7 +148,7 @@ func (c *MemoryCache) Shed() {
 				ttl = defaultCacheEntryTTL
 			}
 			if !v.StoredAt.IsZero() && now.Sub(v.StoredAt) > ttl {
-				c.bytes -= int64(len(v.Body))
+				c.bytes -= entrySize(v)
 				c.entries.Remove(k)
 			}
 		}
@@ -148,7 +159,7 @@ func (c *MemoryCache) Shed() {
 	}
 	for i := 0; i < toRemove; i++ {
 		if _, v, ok := c.entries.RemoveOldest(); ok && v != nil {
-			c.bytes -= int64(len(v.Body))
+			c.bytes -= entrySize(v)
 		}
 	}
 	if c.bytes < 0 {

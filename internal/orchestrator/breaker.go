@@ -26,10 +26,10 @@ type BreakerConfig struct {
 
 func DefaultBreakerConfig() BreakerConfig {
 	return BreakerConfig{
-		Threshold:    8,
-		BaseCooldown: 20 * time.Second,
+		Threshold:    6,
+		BaseCooldown: 25 * time.Second,
 		MaxCooldown:  5 * time.Minute,
-		ProbeTimeout: 15 * time.Second,
+		ProbeTimeout: 12 * time.Second,
 	}
 }
 
@@ -180,7 +180,7 @@ func (b *Breaker) Status(name string) BreakerStatus {
 	return out
 }
 
-var healthStatusRe = regexp.MustCompile(`(?:status|error|code)\s*\(?\s*(?:401|403|407|429|5\d\d)\b`)
+var healthStatusRe = regexp.MustCompile(`(?:status|error|code)\s*\(?\s*(?:401|402|403|407|429|5\d\d)\b`)
 
 var healthMarkers = []string{
 	"cooldown",
@@ -190,6 +190,8 @@ var healthMarkers = []string{
 	"invalid user token",
 	"empty android auth token",
 	"empty access token",
+	"returned no token",
+	"empty jwt",
 	"token error",
 	"token request failed",
 	"requires email",
@@ -205,6 +207,9 @@ var healthMarkers = []string{
 	"tls:",
 	"unexpected eof",
 	"proxy",
+	"circuit breaker is open",
+	"i/o timeout",
+	"context deadline exceeded",
 }
 
 // IsHealthFailure reports whether err says something about the provider being

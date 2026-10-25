@@ -17,7 +17,7 @@ var errUnavailable = errors.New("provider unavailable")
 var errOverloaded = errors.New("provider overloaded")
 var errBreakerOpen = errors.New("provider circuit breaker open")
 
-const siblingGracePeriod = 120 * time.Millisecond
+const siblingGracePeriod = 80 * time.Millisecond
 
 type Source interface {
 	Name() string
@@ -191,7 +191,7 @@ func (s *raceSession) tryFetch(ctx context.Context, name string, q domain.Search
 	start := time.Now()
 	timeout := s.r.timeout
 	if timeout <= 0 {
-		timeout = 8 * time.Second
+		timeout = 6 * time.Second
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -366,15 +366,47 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 
 	fetchTimeout := s.r.timeout
 	if fetchTimeout <= 0 {
-		fetchTimeout = 8 * time.Second
+		fetchTimeout = 6 * time.Second
 	}
 
+	phaseCtx, cancelPhase := context.WithTimeout(context.Background(), fetchTimeout)
+	var cancelOnce sync.Once
+	var activeFetches atomic.Int32
+	activeFetches.Store(int32(len(launched)))
+
+	stopPhaseAfter := func(d time.Duration) {
+		cancelOnce.Do(func() {
+			if d <= 0 || activeFetches.Load() <= 0 {
+				cancelPhase()
+				return
+			}
+			t := time.AfterFunc(d, cancelPhase)
+			if activeFetches.Load() <= 0 {
+				t.Stop()
+				cancelPhase()
+			}
+		})
+	}
+
+	stopCallerMonitor := make(chan struct{})
 	var winnerFound atomic.Bool
-	winnerCh := make(chan struct{})
-	var closeWinnerOnce sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			if winnerFound.Load() {
+				stopPhaseAfter(siblingGracePeriod)
+			} else {
+				stopPhaseAfter(0)
+			}
+		case <-stopCallerMonitor:
+		case <-phaseCtx.Done():
+		}
+	}()
+	defer close(stopCallerMonitor)
+
 	markWinner := func() {
 		winnerFound.Store(true)
-		closeWinnerOnce.Do(func() { close(winnerCh) })
+		stopPhaseAfter(siblingGracePeriod)
 	}
 
 	type phaseOutcome struct {
@@ -385,41 +417,12 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 	for i, n := range launched {
 		rel := releases[i]
 		go func(name string, release func()) {
-			fetchCtx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-			defer cancel()
-
-			stopMonitor := make(chan struct{})
-			go func() {
-				select {
-				case <-ctx.Done():
-					if !winnerFound.Load() {
-						cancel()
-						return
-					}
-					t := time.NewTimer(siblingGracePeriod)
-					defer t.Stop()
-					select {
-					case <-t.C:
-						cancel()
-					case <-stopMonitor:
-					case <-fetchCtx.Done():
-					}
-				case <-winnerCh:
-					t := time.NewTimer(siblingGracePeriod)
-					defer t.Stop()
-					select {
-					case <-t.C:
-						cancel()
-					case <-stopMonitor:
-					case <-fetchCtx.Done():
-					}
-				case <-stopMonitor:
-				case <-fetchCtx.Done():
+			defer func() {
+				if activeFetches.Add(-1) <= 0 {
+					cancelPhase()
 				}
 			}()
-			defer close(stopMonitor)
-
-			res := s.tryFetch(fetchCtx, name, q, release)
+			res := s.tryFetch(phaseCtx, name, q, release)
 			ch <- phaseOutcome{name: name, res: res}
 			if res != nil && res.Resp != nil && len(res.Resp.Lyrics) > 0 {
 				s.r.saveAsync(q, res)
@@ -433,6 +436,7 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 		select {
 		case out = <-ch:
 		case <-ctx.Done():
+			stopPhaseAfter(0)
 			return pickWinner(results, names)
 		}
 		finished++
@@ -446,6 +450,7 @@ func (s *raceSession) runPhase(ctx context.Context, q domain.SearchQuery, names 
 		markWinner()
 		return w
 	}
+	cancelPhase()
 	return nil
 }
 
@@ -479,56 +484,59 @@ func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery,
 
 	fetchTimeout := s.r.timeout
 	if fetchTimeout <= 0 {
-		fetchTimeout = 8 * time.Second
+		fetchTimeout = 6 * time.Second
 	}
 
+	phaseCtx, cancelPhase := context.WithTimeout(context.Background(), fetchTimeout)
+	var cancelOnce sync.Once
+	var activeFetches atomic.Int32
+	activeFetches.Store(int32(len(launched)))
+
+	stopPhaseAfter := func(d time.Duration) {
+		cancelOnce.Do(func() {
+			if d <= 0 || activeFetches.Load() <= 0 {
+				cancelPhase()
+				return
+			}
+			t := time.AfterFunc(d, cancelPhase)
+			if activeFetches.Load() <= 0 {
+				t.Stop()
+				cancelPhase()
+			}
+		})
+	}
+
+	stopCallerMonitor := make(chan struct{})
 	var winnerFound atomic.Bool
-	winnerCh := make(chan struct{})
-	var closeWinnerOnce sync.Once
+	go func() {
+		select {
+		case <-ctx.Done():
+			if winnerFound.Load() {
+				stopPhaseAfter(siblingGracePeriod)
+			} else {
+				stopPhaseAfter(0)
+			}
+		case <-stopCallerMonitor:
+		case <-phaseCtx.Done():
+		}
+	}()
+	defer close(stopCallerMonitor)
+
 	markWinner := func() {
 		winnerFound.Store(true)
-		closeWinnerOnce.Do(func() { close(winnerCh) })
+		stopPhaseAfter(siblingGracePeriod)
 	}
 
 	ch := make(chan *Result, len(launched))
 	for i, n := range launched {
 		rel := releases[i]
 		go func(name string, release func()) {
-			fetchCtx, cancel := context.WithTimeout(context.Background(), fetchTimeout)
-			defer cancel()
-
-			stopMonitor := make(chan struct{})
-			go func() {
-				select {
-				case <-ctx.Done():
-					if !winnerFound.Load() {
-						cancel()
-						return
-					}
-					t := time.NewTimer(siblingGracePeriod)
-					defer t.Stop()
-					select {
-					case <-t.C:
-						cancel()
-					case <-stopMonitor:
-					case <-fetchCtx.Done():
-					}
-				case <-winnerCh:
-					t := time.NewTimer(siblingGracePeriod)
-					defer t.Stop()
-					select {
-					case <-t.C:
-						cancel()
-					case <-stopMonitor:
-					case <-fetchCtx.Done():
-					}
-				case <-stopMonitor:
-				case <-fetchCtx.Done():
+			defer func() {
+				if activeFetches.Add(-1) <= 0 {
+					cancelPhase()
 				}
 			}()
-			defer close(stopMonitor)
-
-			res := s.tryFetch(fetchCtx, name, q, release)
+			res := s.tryFetch(phaseCtx, name, q, release)
 			ch <- res
 			if res != nil && res.Resp != nil && len(res.Resp.Lyrics) > 0 {
 				s.r.saveAsync(q, res)
@@ -541,6 +549,7 @@ func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery,
 		select {
 		case res = <-ch:
 		case <-ctx.Done():
+			stopPhaseAfter(0)
 			return nil
 		}
 		if res != nil && res.Priority >= want {
@@ -548,6 +557,7 @@ func (s *raceSession) raceForPriority(ctx context.Context, q domain.SearchQuery,
 			return res
 		}
 	}
+	cancelPhase()
 	return nil
 }
 

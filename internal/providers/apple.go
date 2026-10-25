@@ -165,7 +165,13 @@ func (p *AppleMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQue
 	}
 	sfKey := q.ContentKey()
 	ch := p.flightGroup.DoChan(sfKey, func() (any, error) {
-		runCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		timeout := 6 * time.Second
+		if dl, ok := ctx.Deadline(); ok {
+			if rem := time.Until(dl); rem > 0 && rem < timeout {
+				timeout = rem
+			}
+		}
+		runCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		return p.doFetchLyrics(runCtx, q)
 	})
@@ -187,16 +193,22 @@ func (p *AppleMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQ
 	storefront := p.getAccountStorefront(ctx, p.mgm.CurrentIndex())
 	if storefront == "" {
 		p.debugf("no storefront configured or detected for apple music")
-		return nil, nil
+		return nil, fmt.Errorf("apple music token fetch failed: no storefront")
 	}
 
-	var bestMatch *appleSong
+	var (
+		bestMatch     *appleSong
+		lastSearchErr error
+	)
 	if q.PlatformID != "" {
 		song, err := p.GetSongByID(ctx, q.PlatformID, storefront)
 		if err == nil && song != nil {
 			bestMatch = song
 			p.debugf("platformID lookup %s matched song %q (storefront %s)", q.PlatformID, song.Attributes.Name, storefront)
 		} else if err != nil {
+			if !isAppleStatus(err, http.StatusNotFound) {
+				lastSearchErr = err
+			}
 			p.debugf("platformID lookup %s failed (err=%v)", q.PlatformID, err)
 		}
 	}
@@ -207,6 +219,9 @@ func (p *AppleMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQ
 			bestMatch = song
 			p.debugf("ISRC search isrc:%s matched song %q", q.ISRC, song.Attributes.Name)
 		} else if err != nil {
+			if !isAppleStatus(err, http.StatusNotFound) {
+				lastSearchErr = err
+			}
 			p.debugf("ISRC search isrc:%s failed (err=%v)", q.ISRC, err)
 		}
 	}
@@ -214,10 +229,14 @@ func (p *AppleMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQ
 	if bestMatch == nil {
 		if q.IDOnly() {
 			p.debugf("id-only query, no song resolved")
-			return nil, nil
+			return nil, lastSearchErr
 		}
 		durationSec := float64(q.Duration) / 1000.0
-		bestMatch, _ = p.SearchBestMatch(ctx, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
+		var searchErr error
+		bestMatch, searchErr = p.SearchBestMatch(ctx, q.Title, q.Artist, q.Album, durationSec, q.ISRC, q.PlatformID)
+		if searchErr != nil && !isAppleStatus(searchErr, http.StatusNotFound) {
+			lastSearchErr = searchErr
+		}
 		if bestMatch != nil {
 			p.debugf("best match song %q id=%s", bestMatch.Attributes.Name, bestMatch.ID)
 		}
@@ -225,7 +244,7 @@ func (p *AppleMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQ
 
 	if bestMatch == nil {
 		p.debugf("no song matched for %q / %q", q.Title, q.Artist)
-		return nil, nil
+		return nil, lastSearchErr
 	}
 
 	if bestMatch.Attributes.HasLyrics != nil && !*bestMatch.Attributes.HasLyrics {
@@ -900,8 +919,13 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 	if maxTry > 2 {
 		maxTry = 2
 	}
+	var lastErr error
 	for i := 0; i < maxTry; i++ {
-		if sugSongs, err := p.SearchSongBySuggestions(ctx, queries[i], storefront); err == nil && len(sugSongs) > 0 {
+		sugSongs, err := p.SearchSongBySuggestions(ctx, queries[i], storefront)
+		if err != nil && !isAppleStatus(err, http.StatusNotFound) {
+			lastErr = err
+		}
+		if err == nil && len(sugSongs) > 0 {
 			candidates = append(candidates, sugSongs...)
 			if best := matchAppleSongs(candidates, title, artist, album, durationSec); best != nil {
 				return best, nil
@@ -911,6 +935,9 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 
 	for i := 0; i < maxTry; i++ {
 		songs, err := p.SearchSong(ctx, queries[i], storefront)
+		if err != nil && !isAppleStatus(err, http.StatusNotFound) {
+			lastErr = err
+		}
 		if err == nil && len(songs) > 0 {
 			candidates = append(candidates, songs...)
 			if best := matchAppleSongs(candidates, title, artist, album, durationSec); best != nil {
@@ -919,6 +946,9 @@ func (p *AppleMusicProvider) SearchBestMatch(ctx context.Context, title, artist,
 		}
 	}
 
+	if len(candidates) == 0 && lastErr != nil {
+		return nil, lastErr
+	}
 	return nil, nil
 }
 

@@ -86,7 +86,13 @@ func (p *QQMusicProvider) Configured() bool { return true }
 func (p *QQMusicProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
 	sfKey := q.ContentKey()
 	ch := p.flightGroup.DoChan(sfKey, func() (any, error) {
-		runCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		timeout := 6 * time.Second
+		if dl, ok := ctx.Deadline(); ok {
+			if rem := time.Until(dl); rem > 0 && rem < timeout {
+				timeout = rem
+			}
+		}
+		runCtx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		return p.doFetchLyrics(runCtx, q)
 	})
@@ -135,10 +141,17 @@ func (p *QQMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQuer
 			queries = append(queries, a)
 		}
 
-		var best *similarity.BestMatchResult
+		var (
+			best          *similarity.BestMatchResult
+			lastSearchErr error
+		)
 		for _, query := range queries {
 			songs, err := p.search(ctx, query)
-			if err != nil || len(songs) == 0 {
+			if err != nil {
+				lastSearchErr = err
+				continue
+			}
+			if len(songs) == 0 {
 				continue
 			}
 			candidates := make([]similarity.SongCandidate, 0, len(songs))
@@ -182,7 +195,7 @@ func (p *QQMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQuer
 
 		if best == nil {
 			p.debugf("no similarity match for %q / %q across queries", q.Title, q.Artist)
-			return nil, nil
+			return nil, lastSearchErr
 		}
 		p.debugf("matched song %q mid=%s", best.Candidate.Title, best.Candidate.PlatformID)
 
@@ -214,7 +227,7 @@ func (p *QQMusicProvider) doFetchLyrics(ctx context.Context, q domain.SearchQuer
 	qrcContent, err := p.fetchQRC(ctx, songMid, songID)
 	if err != nil || qrcContent == "" {
 		p.debugf("QRC fetch failed for mid=%s id=%d (err=%v)", songMid, songID, err)
-		return nil, nil
+		return nil, err
 	}
 
 	platID := songMid
@@ -565,29 +578,38 @@ func (p *QQMusicProvider) fetchQRC(ctx context.Context, songMid string, songID i
 		}
 	}
 
+	var lastErr error
 	if songMid != "" {
 		p1 := baseParams()
 		p1["songMid"] = songMid
-		if content, err := tryFetch(p1); err == nil && content != "" {
+		content, err := tryFetch(p1)
+		if err == nil && content != "" {
 			if p.qrcCache != nil {
 				p.qrcCache.Add(cacheKey, &qqQRCCacheEntry{qrc: content, created: time.Now()})
 			}
 			return content, nil
+		}
+		if err != nil {
+			lastErr = err
 		}
 	}
 
 	if songID > 0 {
 		p2 := baseParams()
 		p2["songId"] = songID
-		if content, err := tryFetch(p2); err == nil && content != "" {
+		content, err := tryFetch(p2)
+		if err == nil && content != "" {
 			if p.qrcCache != nil {
 				p.qrcCache.Add(cacheKey, &qqQRCCacheEntry{qrc: content, created: time.Now()})
 			}
 			return content, nil
 		}
+		if err != nil {
+			lastErr = err
+		}
 	}
 
-	return "", nil
+	return "", lastErr
 }
 
 func processLyric(content string) (string, error) {

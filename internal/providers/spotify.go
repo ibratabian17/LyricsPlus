@@ -166,11 +166,17 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	var songDurationMs int
 
 	if trackID == "" {
-		var tracks []spotifyTrack
+		var (
+			tracks        []spotifyTrack
+			lastSearchErr error
+		)
 		if q.ISRC != "" {
 			var err error
 			tracks, err = p.SearchTrack(ctx, "isrc:"+q.ISRC)
 			if err != nil || len(tracks) == 0 {
+				if err != nil {
+					lastSearchErr = err
+				}
 				p.debugf("no ISRC match for isrc:%s (err=%v)", q.ISRC, err)
 				tracks = nil
 			} else {
@@ -180,7 +186,7 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 		if len(tracks) == 0 {
 			if q.IDOnly() {
 				p.debugf("id-only query, no track resolved")
-				return nil, nil
+				return nil, lastSearchErr
 			}
 			searchQ := q.Title
 			if q.Artist != "" {
@@ -189,8 +195,11 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 			var err error
 			tracks, err = p.SearchTrack(ctx, searchQ)
 			if err != nil || len(tracks) == 0 {
+				if err != nil {
+					lastSearchErr = err
+				}
 				p.debugf("search %q returned no tracks (err=%v)", searchQ, err)
-				return nil, nil
+				return nil, lastSearchErr
 			}
 			p.debugf("search %q returned %d tracks", searchQ, len(tracks))
 		}
@@ -244,6 +253,9 @@ func (p *SpotifyProvider) FetchLyrics(ctx context.Context, q domain.SearchQuery)
 	lyricsJSON, err := p.fetchColorLyrics(ctx, trackID)
 	if err != nil || lyricsJSON == nil {
 		p.debugf("color lyrics fetch failed for track %s (err=%v)", trackID, err)
+		if err != nil && !strings.Contains(err.Error(), "status 404") {
+			return nil, err
+		}
 		return nil, nil
 	}
 

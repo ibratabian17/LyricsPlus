@@ -53,6 +53,13 @@ func (t *authFailureTracker) recordFailure(ip string) {
 	defer t.mu.Unlock()
 
 	now := time.Now()
+	if len(t.failures) > 256 {
+		for k, v := range t.failures {
+			if now.After(v.lockedUntil) && now.Sub(v.firstFail) > 1*time.Minute {
+				delete(t.failures, k)
+			}
+		}
+	}
 	entry, ok := t.failures[ip]
 	if !ok || now.Sub(entry.firstFail) > 1*time.Minute {
 		t.failures[ip] = &ipFailEntry{
