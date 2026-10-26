@@ -216,7 +216,7 @@ func (h *Admin) CreateLyrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	row := &storage.Row{
-		Filename:    storage.CanonicalFilename(artist, title, req.Album, durMS, req.ISRC, req.PlatformID, "json"),
+		Filename:    storage.CanonicalFilename(artist, title, req.Album, durMS, req.ISRC, req.PlatformID, extForSource(source)),
 		ContentJSON: contentBytes,
 		ISRC:        strings.TrimSpace(req.ISRC),
 		PlatformID:  strings.TrimSpace(req.PlatformID),
@@ -332,7 +332,7 @@ func (h *Admin) BatchCreateLyrics(w http.ResponseWriter, r *http.Request) {
 		}
 
 		rows = append(rows, &storage.Row{
-			Filename:    storage.CanonicalFilename(artist, title, req.Album, durMS, req.ISRC, req.PlatformID, "json"),
+			Filename:    storage.CanonicalFilename(artist, title, req.Album, durMS, req.ISRC, req.PlatformID, extForSource(source)),
 			ContentJSON: contentBytes,
 			ISRC:        strings.TrimSpace(req.ISRC),
 			PlatformID:  strings.TrimSpace(req.PlatformID),
