@@ -1,11 +1,13 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -238,6 +240,132 @@ func (h *Admin) CreateLyrics(w http.ResponseWriter, r *http.Request) {
 		"message": "Lyrics record created successfully",
 		"id":      row.ID,
 		"item":    row,
+	})
+}
+
+type AdminBatchCreateRequest struct {
+	Items []AdminCreateRequest `json:"items"`
+}
+
+func (h *Admin) BatchCreateLyrics(w http.ResponseWriter, r *http.Request) {
+	if h.Store == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]interface{}{
+			"error":   "Service Unavailable",
+			"message": "Storage is uninitialized",
+		})
+		return
+	}
+
+	bodyBytes, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error":   "Bad Request",
+			"message": "Failed to read request body: " + err.Error(),
+		})
+		return
+	}
+
+	var items []AdminCreateRequest
+	trimmed := bytes.TrimSpace(bodyBytes)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &items); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"error":   "Bad Request",
+				"message": "Invalid JSON array: " + err.Error(),
+			})
+			return
+		}
+	} else {
+		var req AdminBatchCreateRequest
+		if err := json.Unmarshal(trimmed, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+				"error":   "Bad Request",
+				"message": "Invalid JSON body: " + err.Error(),
+			})
+			return
+		}
+		items = req.Items
+	}
+
+	if len(items) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error":   "Bad Request",
+			"message": "No items provided in batch",
+		})
+		return
+	}
+
+	if len(items) > 500 {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error":   "Bad Request",
+			"message": "Batch size exceeds maximum allowed limit (maximum 500 items per request)",
+		})
+		return
+	}
+
+	rows := make([]*storage.Row, 0, len(items))
+	now := time.Now()
+	for _, req := range items {
+		title := strings.TrimSpace(req.Title)
+		artist := strings.TrimSpace(req.Artist)
+		if (title == "" || artist == "") && req.ISRC == "" && req.PlatformID == "" {
+			continue
+		}
+
+		durMS := req.DurationMS
+		if durMS <= 0 && req.Duration != nil {
+			durMS = parseDurationInput(req.Duration)
+		}
+
+		source := strings.TrimSpace(req.Source)
+		if source == "" {
+			source = "lyricsplus"
+		}
+
+		var contentBytes []byte
+		if len(req.Content) > 0 {
+			contentBytes = req.Content
+		} else if req.ContentText != "" {
+			contentBytes = []byte(req.ContentText)
+		} else {
+			contentBytes = []byte("{}")
+		}
+
+		rows = append(rows, &storage.Row{
+			Filename:    storage.CanonicalFilename(artist, title, req.Album, durMS, req.ISRC, req.PlatformID, "json"),
+			ContentJSON: contentBytes,
+			ISRC:        strings.TrimSpace(req.ISRC),
+			PlatformID:  strings.TrimSpace(req.PlatformID),
+			Source:      source,
+			Title:       title,
+			Artist:      artist,
+			DurationMS:  durMS,
+			CreatedAt:   now,
+		})
+	}
+
+	if len(rows) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error":   "Bad Request",
+			"message": "All items in batch were missing valid metadata (title/artist, isrc, or platform_id)",
+		})
+		return
+	}
+
+	count, err := h.Store.AdminCreateBatch(r.Context(), rows)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"error":   "Internal Server Error",
+			"message": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"success":        true,
+		"message":        fmt.Sprintf("Successfully saved %d lyrics records in batch", count),
+		"inserted_count": count,
+		"received_count": len(items),
 	})
 }
 

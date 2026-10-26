@@ -841,6 +841,86 @@ func (s *Store) SaveLyrics(ctx context.Context, row *Row) error {
 	return nil
 }
 
+// SaveLyricsBatch inserts or updates multiple lyric rows inside a single database transaction.
+func (s *Store) SaveLyricsBatch(ctx context.Context, rows []*Row) (int64, error) {
+	if s.IsResting() {
+		return 0, fmt.Errorf("storage: database resting")
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	tx, err := s.wdb.BeginTx(ctx, nil)
+	if err != nil {
+		s.recordQueryErr(ctx, err)
+		return 0, fmt.Errorf("begin batch tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const upsert = `INSERT INTO lyrics (filename, content, isrc, platform_id, source, title, artist, duration_ms, created_at)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(filename, source) DO UPDATE SET
+	  content = excluded.content,
+	  isrc = excluded.isrc,
+	  platform_id = excluded.platform_id,
+	  title = excluded.title,
+	  artist = excluded.artist,
+	  duration_ms = excluded.duration_ms,
+	  created_at = excluded.created_at
+	RETURNING id`
+
+	stmt, err := tx.PrepareContext(ctx, upsert)
+	if err != nil {
+		s.recordQueryErr(ctx, err)
+		return 0, fmt.Errorf("prepare batch stmt: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	var successCount int64
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		if row.Filename == "" {
+			row.Filename = CanonicalFilename(row.Artist, row.Title, "", row.DurationMS, row.ISRC, row.PlatformID, "json")
+		}
+		if row.CreatedAt.IsZero() {
+			row.CreatedAt = time.Now()
+		}
+		if row.Source == "" {
+			row.Source = "lyricsplus"
+		}
+		compressed := CompressContent(row.ContentJSON)
+
+		var id int64
+		if err := stmt.QueryRowContext(ctx,
+			row.Filename, compressed, row.ISRC, row.PlatformID, row.Source,
+			row.Title, row.Artist, row.DurationMS, row.CreatedAt.UnixMilli(),
+		).Scan(&id); err != nil {
+			s.recordQueryErr(ctx, err)
+			return successCount, fmt.Errorf("batch insert row %s: %w", row.Filename, err)
+		}
+		row.ID = id
+		s.invalidate(row, id)
+		if len(row.ContentJSON) > 0 && id > 0 {
+			s.content.Add(id, row.ContentJSON)
+		}
+		successCount++
+	}
+
+	if err := tx.Commit(); err != nil {
+		s.recordQueryErr(ctx, err)
+		return 0, fmt.Errorf("commit batch tx: %w", err)
+	}
+
+	s.RecordDBSuccess()
+	if s.writeCount.Add(successCount)%250 < successCount {
+		_, _ = s.wdb.ExecContext(ctx, "PRAGMA wal_checkpoint(PASSIVE);")
+	}
+
+	return successCount, nil
+}
+
 // MarkRecentSave checks whether (source, filename) was recently queued for persistence,
 // and if not, marks it as queued. This allows callers to skip expensive payload marshaling
 // or validation before submitting to the async write queue.

@@ -219,12 +219,13 @@ func newRouter(cfg config.Config, lg *logger.Logger, l *handlers.Lyrics, c *hand
 	}))
 
 	r.Route("/v1/admin/database", func(admin chi.Router) {
-		admin.Use(middleware.BodyLimit(1 << 20)) // 1MB payload limit
+		admin.Use(middleware.BodyLimit(32 << 20)) // 32MB payload limit for batch admin uploads
 		admin.Use(middleware.AdminAuth(cfg.LyricsPlus.AdminToken, cfg.LyricsPlus.JWTSecret))
 		admin.Get("/", adm.Stats)
 		admin.Get("/stats", adm.Stats)
 		admin.Get("/lyrics", adm.ListLyrics)
 		admin.Post("/lyrics", adm.CreateLyrics)
+		admin.Post("/lyrics/batch", adm.BatchCreateLyrics)
 		admin.Get("/lyrics/{id}", adm.GetLyric)
 		admin.Put("/lyrics/{id}", adm.UpdateLyric)
 		admin.Delete("/lyrics/{id}", adm.DeleteLyric)

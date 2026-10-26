@@ -183,6 +183,26 @@ func TestAdminHandlersCRUD(t *testing.T) {
 			t.Fatalf("expected 0 lyrics after batch delete, got %d", stats.TotalLyrics)
 		}
 	}
+
+	// 8. Batch Create
+	{
+		batchPayload := []AdminCreateRequest{
+			{Title: "Batch Song 1", Artist: "Batch Artist 1", Source: "apple", ContentText: "<tt>Lyrics 1</tt>"},
+			{Title: "Batch Song 2", Artist: "Batch Artist 2", Source: "apple", ContentText: "<tt>Lyrics 2</tt>"},
+		}
+		buf, _ := json.Marshal(batchPayload)
+		req := httptest.NewRequest(http.MethodPost, "/v1/admin/database/lyrics/batch", bytes.NewReader(buf))
+		rr := httptest.NewRecorder()
+		adminH.BatchCreateLyrics(rr, req)
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("expected 201 on batch create, got %d: %s", rr.Code, rr.Body.String())
+		}
+
+		stats, _ := st.AdminStats(ctx)
+		if stats.TotalLyrics != 2 {
+			t.Fatalf("expected 2 lyrics after batch create, got %d", stats.TotalLyrics)
+		}
+	}
 }
 
 func TestAdminManualScrapeValidation(t *testing.T) {

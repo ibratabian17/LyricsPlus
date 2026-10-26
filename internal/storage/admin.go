@@ -325,6 +325,10 @@ func (s *Store) AdminCreate(ctx context.Context, row *Row) error {
 	return s.SaveLyrics(ctx, row)
 }
 
+func (s *Store) AdminCreateBatch(ctx context.Context, rows []*Row) (int64, error) {
+	return s.SaveLyricsBatch(ctx, rows)
+}
+
 func (s *Store) AdminUpdate(ctx context.Context, id int64, req AdminUpdateRequest) (*Row, error) {
 	if s.IsResting() {
 		return nil, fmt.Errorf("storage: database resting")
