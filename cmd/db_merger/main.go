@@ -66,7 +66,7 @@ func runMerge(args []string) {
 	sourceArg := fs.String("source", "", "Source SQLite DB path or glob pattern (e.g. apple_lyrics.db, dumps/*.db)")
 	targetArg := fs.String("target", "", "Target SQLite DB path (default from config or database/lyrics_cache.db)")
 	strategyArg := fs.String("strategy", "quality", "Conflict strategy: quality (syllable > line > plain), newer, insert-only, force")
-	batchSize := fs.Int("batch-size", 1000, "Number of rows per transaction batch")
+	batchSize := fs.Int("batch-size", 100000, "Number of rows per chunk batch")
 	vacuum := fs.Bool("vacuum", false, "Run WAL checkpoint & VACUUM on target after merge")
 	rebuildFTS := fs.Bool("rebuild-fts", false, "Rebuild FTS5 full-text index after merge")
 	configPath := fs.String("config", "", "Path to configuration file (.env or config.json)")
@@ -103,7 +103,7 @@ func runMerge(args []string) {
 	fmt.Println("=================================================================")
 	fmt.Printf("Target Database: %s\n", targetDB)
 	fmt.Printf("Merge Strategy:  %s\n", *strategyArg)
-	fmt.Printf("Batch Size:      %d\n", *batchSize)
+	fmt.Printf("Chunk Size:      %d\n", *batchSize)
 	fmt.Printf("Sources Found:   %d\n", len(sources))
 	for i, s := range sources {
 		fmt.Printf("  [%d] %s\n", i+1, s)
@@ -130,10 +130,15 @@ func runMerge(args []string) {
 		os.Exit(1)
 	}
 
+	var rate float64
+	if stats.Duration.Seconds() > 0 {
+		rate = float64(stats.TotalExamined) / stats.Duration.Seconds()
+	}
+
 	fmt.Println("\n=================================================================")
 	fmt.Println("                       Merge Completed!                          ")
 	fmt.Println("=================================================================")
-	fmt.Printf("Elapsed Time:    %v\n", stats.Duration.Round(time.Millisecond))
+	fmt.Printf("Elapsed Time:    %v (%.0f rows/sec)\n", stats.Duration.Round(time.Millisecond), rate)
 	fmt.Printf("Total Examined:  %d records\n", stats.TotalExamined)
 	fmt.Printf("Inserted (New):  %d\n", stats.Inserted)
 	fmt.Printf("Upgraded:        %d (better lyrics quality or newer timestamp)\n", stats.Upgraded)
@@ -162,7 +167,7 @@ func runStats(args []string) {
 		targetDB = "database/lyrics_cache.db"
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	fmt.Printf("[*] Analyzing database: %s ...\n", targetDB)
