@@ -24,6 +24,8 @@ func main() {
 	switch command {
 	case "merge":
 		runMerge(os.Args[2:])
+	case "repair", "optimize":
+		runRepair(os.Args[2:])
 	case "stats":
 		runStats(os.Args[2:])
 	case "help", "-h", "--help":
@@ -46,6 +48,7 @@ func printUsage() {
 	fmt.Println("=================================================================")
 	fmt.Println("Usage:")
 	fmt.Println("  db_merger merge [options]    Merge one or more databases into target DB")
+	fmt.Println("  db_merger repair [options]   Rebuild missing indexes/FTS5 & normalize durations")
 	fmt.Println("  db_merger stats [options]    Display lyrics count, quality & source stats")
 	fmt.Println("  db_merger help               Show this help message")
 	fmt.Println()
@@ -53,12 +56,46 @@ func printUsage() {
 	fmt.Println("  # Quality-first merge of Apple Music scraper DB into main cache:")
 	fmt.Println("  db_merger merge --source=apple-music-scraper/apple_lyrics.db")
 	fmt.Println()
-	fmt.Println("  # Merge multiple external dump files with vacuum:")
-	fmt.Println("  db_merger merge --source=\"data/dumps/*.db\" --target=database/lyrics_cache.db --vacuum")
+	fmt.Println("  # Repair indexes, FTS5, and duration units on existing 9M database:")
+	fmt.Println("  db_merger repair --db=database/lyrics_cache.db")
 	fmt.Println()
 	fmt.Println("  # Inspect database metrics and sync type distribution:")
 	fmt.Println("  db_merger stats --db=database/lyrics_cache.db")
 	fmt.Println()
+}
+
+func runRepair(args []string) {
+	fs := flag.NewFlagSet("repair", flag.ExitOnError)
+	dbArg := fs.String("db", "", "Path to SQLite database (default: from config or database/lyrics_cache.db)")
+	configPath := fs.String("config", "", "Path to configuration file (.env or config.json)")
+	_ = fs.Parse(args)
+
+	cfg := config.Load(*configPath)
+	targetDB := *dbArg
+	if targetDB == "" {
+		targetDB = cfg.Storage.DBPath
+	}
+	if targetDB == "" {
+		targetDB = "database/lyrics_cache.db"
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	logFunc := func(format string, args ...any) {
+		fmt.Printf("[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
+	}
+
+	fmt.Println("=================================================================")
+	fmt.Println("          LyricsPlus - Database Index & FTS5 Repair              ")
+	fmt.Println("=================================================================")
+	fmt.Printf("Target Database: %s\n", targetDB)
+	fmt.Println("-----------------------------------------------------------------")
+
+	if err := storage.RepairDatabase(ctx, targetDB, logFunc); err != nil {
+		fmt.Printf("\n[!] Repair failed: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func runMerge(args []string) {
@@ -186,6 +223,7 @@ func runStats(args []string) {
 		fmt.Printf("WAL Size:        %.2f MB\n", float64(stats.WALSize)/(1024*1024))
 	}
 	fmt.Printf("Total Lyrics:    %d\n", stats.TotalRows)
+	fmt.Printf("FTS5 Indexed:    %d\n", stats.FTSIndexed)
 	fmt.Println("-----------------------------------------------------------------")
 	fmt.Println("Source Breakdown:")
 	if len(stats.Sources) == 0 {

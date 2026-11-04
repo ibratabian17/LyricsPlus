@@ -219,10 +219,28 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 
 	res, err := s.Dedup.Get(ctx, q, preferredSources)
 	if err != nil {
+		if !forceReload && len(q.Sources) > 0 {
+			if fallbackResp, ok := s.fromStoreWithOpts(ctx, q, false); ok && fallbackResp != nil {
+				decorateCacheHit(fallbackResp, q, preferredSources, time.Since(start))
+				winner := providerNameForSource(fallbackResp.Metadata.Source)
+				s.cacheResponse(ctx, q, fallbackResp, winner)
+				metrics.Default.RecordLyricsLookup(winner, "database", true)
+				return fallbackResp, nil
+			}
+		}
 		metrics.Default.RecordLyricsLookup("", "none", false)
 		return nil, err
 	}
 	if res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
+		if !forceReload && len(q.Sources) > 0 {
+			if fallbackResp, ok := s.fromStoreWithOpts(ctx, q, false); ok && fallbackResp != nil {
+				decorateCacheHit(fallbackResp, q, preferredSources, time.Since(start))
+				winner := providerNameForSource(fallbackResp.Metadata.Source)
+				s.cacheResponse(ctx, q, fallbackResp, winner)
+				metrics.Default.RecordLyricsLookup(winner, "database", true)
+				return fallbackResp, nil
+			}
+		}
 		metrics.Default.RecordLyricsLookup("", "none", false)
 		if shouldCacheNegativeResult(res) {
 			s.cacheNegative(q)
@@ -318,6 +336,17 @@ func (s *Service) FetchRaw(ctx context.Context, q domain.SearchQuery, preferredS
 		return nil, err
 	}
 	if res == nil || res.Resp == nil || len(res.Resp.Lyrics) == 0 {
+		if !forceReload && len(q.Sources) > 0 {
+			if resp, ok := s.fromStoreWithOpts(ctx, q, false); ok && resp != nil && resp.RawData != "" {
+				src := providerNameForSource(resp.Metadata.Source)
+				if resp.ProcessingTime != nil && resp.ProcessingTime.WinnerSource != nil && *resp.ProcessingTime.WinnerSource != "" {
+					src = *resp.ProcessingTime.WinnerSource
+				}
+				if matchSource(src, preferredSources) {
+					return &RawResult{Source: src, Raw: resp.RawData, TotalMs: time.Since(start).Milliseconds()}, nil
+				}
+			}
+		}
 		if shouldCacheNegativeResult(res) {
 			s.cacheNegative(q)
 		}
@@ -421,6 +450,10 @@ func (s *Service) fromMemory(ctx context.Context, q domain.SearchQuery) (*domain
 }
 
 func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, bool) {
+	return s.fromStoreWithOpts(ctx, q, !domain.IsCacheOnly(ctx))
+}
+
+func (s *Service) fromStoreWithOpts(ctx context.Context, q domain.SearchQuery, requireTopPriority bool) (*domain.LyricsResponse, bool) {
 	if s.Store == nil || s.Store.IsResting() {
 		return nil, false
 	}
@@ -432,12 +465,21 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 	var candidates []*storage.Row
 
 	if q.ISRC != "" || q.PlatformID != "" {
-		if r, ok := s.Store.GetExact(dbCtx, q.ISRC, q.PlatformID); ok && r != nil {
-			src := rowSource(r)
-			prio := sourcePriority(src, q.Sources)
-			if prio >= 0 {
-				row = r
-				bestPrio = prio
+		if rows, ok := s.Store.GetExactRows(dbCtx, q.ISRC, q.PlatformID); ok && len(rows) > 0 {
+			candidates = append(candidates, rows...)
+			for _, r := range rows {
+				if r == nil {
+					continue
+				}
+				src := rowSource(r)
+				prio := sourcePriority(src, q.Sources)
+				if prio >= 0 && (bestPrio == -1 || prio < bestPrio) {
+					row = r
+					bestPrio = prio
+					if bestPrio == 0 {
+						break
+					}
+				}
 			}
 		} else if q.IDOnly() {
 			return nil, false
@@ -471,7 +513,7 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		return nil, false
 	}
 
-	if len(q.Sources) > 0 && bestPrio > 0 {
+	if requireTopPriority && len(q.Sources) > 0 && bestPrio > 0 {
 		return nil, false
 	}
 
@@ -486,6 +528,13 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 			continue
 		}
 		seen[cand.ID] = struct{}{}
+
+		if len(q.Sources) > 0 {
+			candPrio := sourcePriority(rowSource(cand), q.Sources)
+			if candPrio < 0 || (requireTopPriority && candPrio > 0) {
+				continue
+			}
+		}
 
 		cacheKey := parsedRowCacheKey{id: cand.ID, createdAt: cand.CreatedAt.UnixMilli()}
 		if cand.ID > 0 && globalParsedRowCache != nil {
@@ -534,7 +583,7 @@ func (s *Service) fromStore(ctx context.Context, q domain.SearchQuery) (*domain.
 		}
 	}
 	finalPrio := sourcePriority(winner, q.Sources)
-	if finalPrio < 0 || (len(q.Sources) > 0 && finalPrio > 0) {
+	if finalPrio < 0 || (requireTopPriority && len(q.Sources) > 0 && finalPrio > 0) {
 		return nil, false
 	}
 	if resp.RawData == "" && len(rawContent) > 0 {
@@ -676,8 +725,8 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 		res := parseNormalizedJSON(trimmedRaw)
 		if res != nil {
 			res.Metadata.Source = "Apple"
+			return res
 		}
-		return res
 	case strings.EqualFold(src, "qq"):
 		if isXML {
 			p := parsers.ParseQQQRC(trimmedRaw, parsers.ExactMetadata{
@@ -690,7 +739,9 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 				return p
 			}
 		}
-		return parseNormalizedJSON(trimmedRaw)
+		if res := parseNormalizedJSON(trimmedRaw); res != nil {
+			return res
+		}
 	case strings.EqualFold(src, "deezer"):
 		if res := parseNormalizedJSON(trimmedRaw); res != nil {
 			res.Metadata.Source = "Deezer"
@@ -700,7 +751,6 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			p.Metadata.Source = "Deezer"
 			return p
 		}
-		return nil
 	case strings.EqualFold(src, "musixmatch"), strings.EqualFold(src, "musixmatch-word"):
 		if res := parseNormalizedJSON(trimmedRaw); res != nil {
 			res.Metadata.Source = "Musixmatch"
@@ -710,7 +760,6 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			p.Metadata.Source = "Musixmatch"
 			return p
 		}
-		return nil
 	case strings.EqualFold(src, "spotify"):
 		if res := parseNormalizedJSON(trimmedRaw); res != nil {
 			if res.Metadata.Source == "" {
@@ -724,7 +773,6 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			}
 			return p
 		}
-		return nil
 	case strings.EqualFold(src, "lyricsplus"), strings.EqualFold(src, "qaple"), src == "":
 		if strings.Contains(trimmedRaw, `"isLineEnding"`) {
 			coerced := coercedForKpoe(trimmedRaw)
@@ -737,10 +785,12 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			}
 		}
 		res := parseNormalizedJSON(trimmedRaw)
-		if res != nil && strings.EqualFold(src, "lyricsplus") && !strings.HasPrefix(res.Metadata.Source, "Lyrics+") {
-			res.Metadata.Source = "Lyrics+"
+		if res != nil {
+			if strings.EqualFold(src, "lyricsplus") && !strings.HasPrefix(res.Metadata.Source, "Lyrics+") {
+				res.Metadata.Source = "Lyrics+"
+			}
+			return res
 		}
-		return res
 	}
 
 	if isXML {
@@ -778,7 +828,10 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			}
 		}
 	}
-	return parseNormalizedJSON(trimmedRaw)
+	if res := parseNormalizedJSON(trimmedRaw); res != nil {
+		return res
+	}
+	return nil
 }
 
 func parseNormalizedJSON(trimmedRaw string) *domain.LyricsResponse {
@@ -1103,10 +1156,18 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 	if q.Title != "" {
 		candidates := make([]similarity.SongCandidate, len(valid))
 		for i, r := range valid {
+			title := r.Title
+			artist := r.Artist
 			album := ""
 			durMs := r.DurationMS
-			if r.Filename != "" && (q.Album != "" || (durMs <= 0 && q.Duration > 0)) {
+			if r.Filename != "" && (title == "" || artist == "" || q.Album != "" || (durMs <= 0 && q.Duration > 0)) {
 				pf := storage.ParseFilename(r.Filename)
+				if title == "" && pf.Title != "" {
+					title = pf.Title
+				}
+				if artist == "" && pf.Artist != "" {
+					artist = pf.Artist
+				}
 				if pf.Album != "" {
 					album = pf.Album
 				}
@@ -1115,8 +1176,8 @@ func pickBestRow(rows []*storage.Row, q domain.SearchQuery) (*storage.Row, int) 
 				}
 			}
 			candidates[i] = similarity.SongCandidate{
-				Title:      r.Title,
-				Artist:     r.Artist,
+				Title:      title,
+				Artist:     artist,
 				Album:      album,
 				DurationMs: durMs,
 				ISRC:       r.ISRC,

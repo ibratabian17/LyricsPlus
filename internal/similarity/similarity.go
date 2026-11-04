@@ -860,7 +860,7 @@ func FindBestSongMatch(candidates []SongCandidate, queryTitle, queryArtist, quer
 			return si.Score > sj.Score
 		}
 		hasDurI := scoredList[i].cand.DurationMs > 0
-		hasDurJ := scoredList[j].cand.DurationMs > 0
+		hasDurJ := scoredList[i].cand.DurationMs > 0
 		if hasDurI != hasDurJ {
 			return hasDurI
 		}

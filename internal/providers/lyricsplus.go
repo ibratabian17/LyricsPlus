@@ -271,17 +271,19 @@ func (p *LyricsPlusProvider) GetUserLyrics(ctx context.Context, q domain.SearchQ
 	}
 
 	var row *storage.Row
+	checkedTA := false
 	if q.ISRC != "" || q.PlatformID != "" {
 		if r, ok := st.GetExactUser(ctx, q.ISRC, q.PlatformID); ok && r != nil {
 			row = r
 		}
 	}
 	if row == nil && (q.Title != "" && q.Artist != "") {
+		checkedTA = true
 		if rows, ok := st.GetByTitleArtist(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
 			row = matchBestUserRow(rows, q)
 		}
 	}
-	if row == nil && (q.Title != "" || q.Artist != "") {
+	if row == nil && !checkedTA && (q.Title != "" || q.Artist != "") {
 		if rows, ok := st.GetByFTS5(ctx, q.Title, q.Artist); ok && len(rows) > 0 {
 			row = matchBestUserRow(rows, q)
 		}

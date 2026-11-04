@@ -26,6 +26,8 @@ var (
 	errQueueFull  = errors.New("storage: write-back queue full")
 )
 
+const ftsRepairEstimatedDuration = 2 * time.Minute
+
 type Row struct {
 	ID          int64
 	Filename    string
@@ -99,15 +101,18 @@ type Store struct {
 	wdb *sql.DB
 
 	exact      *lru.Cache[string, *Row]
+	exactRows  *lru.Cache[string, []*Row]
 	exactTitle *lru.Cache[string, []*Row]
 	exist      *lru.Cache[string, []*Row]
 	content    *lru.Cache[int64, []byte]
 	miss       *expirable.LRU[string, struct{}]
 	recentSave *expirable.LRU[string, struct{}]
 
-	writes     *writeQueue
-	writeCount atomic.Int64
-	closeOnce  sync.Once
+	writes       *writeQueue
+	writeCount   atomic.Int64
+	ftsRepairing atomic.Bool
+	closeOnce    sync.Once
+	ftsDone      chan struct{}
 
 	cbMu              sync.RWMutex
 	cbOpen            bool
@@ -161,6 +166,7 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		size = 16384
 	}
 	exact, _ := lru.New[string, *Row](size)
+	exactRows, _ := lru.New[string, []*Row](size)
 	exactTitle, _ := lru.New[string, []*Row](size)
 	exist, _ := lru.New[string, []*Row](size)
 	contentSize := size / 2
@@ -194,6 +200,7 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		db:          db,
 		wdb:         wdb,
 		exact:       exact,
+		exactRows:   exactRows,
 		exactTitle:  exactTitle,
 		exist:       exist,
 		content:     content,
@@ -201,15 +208,22 @@ func NewStore(cfg config.Storage) (*Store, error) {
 		recentSave:  recentSave,
 		cbThreshold: cbThreshold,
 		cbCooldown:  cbCooldown,
+		ftsDone:     make(chan struct{}),
 	}
 	st.writes = newWriteQueue(1, cfg.WriteQueueSize)
+
+	go func() {
+		defer close(st.ftsDone)
+		st.BackfillFTS5()
+	}()
+
 	return st, nil
 }
 
 const (
-	defaultReadConns = 8
-	readCacheKB      = -8192
-	writeCacheKB     = -4096
+	defaultReadConns = 16
+	readCacheKB      = -16384
+	writeCacheKB     = -8192
 )
 
 func buildDSN(path string, cacheKB int) string {
@@ -221,18 +235,87 @@ func buildDSN(path string, cacheKB int) string {
 			"&_pragma=mmap_size(67108864)"+
 			"&_pragma=journal_size_limit(67108864)"+
 			"&_pragma=wal_autocheckpoint(1000)"+
-			"&_pragma=temp_store(MEMORY)"+
+			"&_pragma=temp_store(DEFAULT)"+
 			"&_pragma=foreign_keys(ON)",
 		path, cacheKB,
 	)
 }
 
 func (s *Store) BackfillFTS5() {
-	var count int64
-	if err := s.db.QueryRow(`SELECT count(*) FROM lyrics_fts`).Scan(&count); err == nil && count > 0 {
+	s.repairFTS5(false)
+}
+
+func (s *Store) repairFTS5(forceReset bool) {
+	if s == nil || s.db == nil || s.wdb == nil {
 		return
 	}
-	_, _ = s.wdb.Exec(`INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild')`)
+	if !s.ftsRepairing.CompareAndSwap(false, true) {
+		return
+	}
+	defer s.ftsRepairing.Store(false)
+
+	var maxLyricsID int64
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM lyrics`).Scan(&maxLyricsID); err != nil || maxLyricsID == 0 {
+		return
+	}
+
+	var maxFTSID int64
+	if err := s.db.QueryRow(`SELECT COALESCE(MAX(id), 0) FROM lyrics_fts_docsize`).Scan(&maxFTSID); err != nil {
+		forceReset = true
+	}
+
+	if !forceReset && maxFTSID > 0 {
+		var probeID int64
+		err := s.db.QueryRow(`SELECT rowid FROM lyrics_fts WHERE lyrics_fts MATCH '"a"*' LIMIT 1`).Scan(&probeID)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) && isFTSCorruptError(err) {
+			forceReset = true
+		}
+	}
+
+	if forceReset || maxFTSID > maxLyricsID {
+		_, _ = s.wdb.Exec(`DROP TRIGGER IF EXISTS lyrics_fts_insert; DROP TRIGGER IF EXISTS lyrics_fts_delete; DROP TRIGGER IF EXISTS lyrics_fts_update; DROP TABLE IF EXISTS lyrics_fts;`)
+		if _, err := s.wdb.Exec(lyricsFTS5Setup); err != nil {
+			return
+		}
+		maxFTSID = 0
+	}
+
+	if maxFTSID >= maxLyricsID {
+		return
+	}
+
+	const batchSize = int64(100000)
+	for cur := maxFTSID; cur < maxLyricsID; {
+		next := cur + batchSize
+		if next > maxLyricsID {
+			next = maxLyricsID
+		}
+		if _, err := s.wdb.Exec(
+			`INSERT INTO lyrics_fts(rowid, title, artist) SELECT id, title, artist FROM lyrics WHERE id > ? AND id <= ?`,
+			cur, next,
+		); err != nil {
+			_, _ = s.wdb.Exec(`INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild')`)
+			break
+		}
+		cur = next
+	}
+	if s.miss != nil {
+		s.miss.Purge()
+	}
+}
+
+func isFTSCorruptError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "malformed") ||
+		strings.Contains(msg, "corrupt") ||
+		strings.Contains(msg, "vtable") ||
+		strings.Contains(msg, "missing row") ||
+		strings.Contains(msg, "no such table: main.lyrics_fts") ||
+		strings.Contains(msg, "no such table: lyrics_fts") ||
+		strings.Contains(msg, "fts5")
 }
 
 func initStoreSchema(db *sql.DB) error {
@@ -240,11 +323,11 @@ func initStoreSchema(db *sql.DB) error {
 		"PRAGMA journal_mode = WAL;",
 		"PRAGMA synchronous = NORMAL;",
 		"PRAGMA busy_timeout = 15000;",
-		"PRAGMA cache_size = -8192;",
+		"PRAGMA cache_size = -16384;",
 		"PRAGMA mmap_size = 67108864;",
 		"PRAGMA journal_size_limit = 67108864;",
 		"PRAGMA wal_autocheckpoint = 1000;",
-		"PRAGMA temp_store = MEMORY;",
+		"PRAGMA temp_store = DEFAULT;",
 		"PRAGMA foreign_keys = ON;",
 	}
 	for _, p := range pragmas {
@@ -259,6 +342,7 @@ func initStoreSchema(db *sql.DB) error {
 		return err
 	}
 	_, _ = db.Exec("PRAGMA wal_checkpoint(PASSIVE);")
+	_, _ = db.Exec("PRAGMA analysis_limit = 1000;")
 	_, _ = db.Exec("ANALYZE;")
 	_, _ = db.Exec("PRAGMA optimize;")
 	return nil
@@ -289,6 +373,7 @@ func (s *Store) Shed() {
 	shedLRU(s.content)
 	shedLRU(s.exist)
 	shedLRU(s.exactTitle)
+	shedLRU(s.exactRows)
 	shedLRU(s.exact)
 }
 
@@ -300,6 +385,27 @@ func shedLRU[K comparable, V any](c *lru.Cache[K, V]) {
 	for i := 0; i < toRemove; i++ {
 		c.RemoveOldest()
 	}
+}
+
+func (s *Store) IsFTSRepairing() bool {
+	if s == nil {
+		return false
+	}
+	return s.ftsRepairing.Load()
+}
+
+func (s *Store) SetFTSRepairing(v bool) {
+	if s == nil {
+		return
+	}
+	s.ftsRepairing.Store(v)
+}
+
+func (s *Store) FTSRepairEstimate() time.Duration {
+	if s == nil {
+		return ftsRepairEstimatedDuration
+	}
+	return ftsRepairEstimatedDuration
 }
 
 func (s *Store) IsResting() bool {
@@ -428,6 +534,38 @@ func (s *Store) GetExact(ctx context.Context, isrc, platformID string) (*Row, bo
 	return row, row != nil
 }
 
+func (s *Store) GetExactRows(ctx context.Context, isrc, platformID string) ([]*Row, bool) {
+	isrc = strings.TrimSpace(isrc)
+	platformID = strings.TrimSpace(platformID)
+	if isrc == "" && platformID == "" {
+		return nil, false
+	}
+	key := "exact_rows::" + strings.ToLower(isrc) + "::" + strings.ToLower(platformID)
+	if s.exactRows != nil {
+		if v, ok := s.exactRows.Get(key); ok {
+			return v, len(v) > 0
+		}
+	}
+	if s.wasMiss(key) {
+		return nil, false
+	}
+	if s.IsResting() {
+		return nil, false
+	}
+	rows, err := s.queryExactRows(ctx, isrc, platformID)
+	if err != nil {
+		return nil, false
+	}
+	if len(rows) > 0 {
+		if s.exactRows != nil {
+			s.exactRows.Add(key, rows)
+		}
+	} else {
+		s.noteMiss(key)
+	}
+	return rows, len(rows) > 0
+}
+
 func (s *Store) GetExisting(ctx context.Context, keywords []string) ([]*Row, bool) {
 	var clean []string
 	for _, k := range keywords {
@@ -483,13 +621,19 @@ func (s *Store) GetByFTS5(ctx context.Context, title, artist string) ([]*Row, bo
 		return nil, false
 	}
 
-	rows, err := s.queryFTS5(ctx, tokens)
+	rows, err := s.queryFTS5Tiered(ctx, title, artist, tokens)
+	if len(rows) == 0 && (err != nil || s.ftsRepairing.Load()) {
+		if fbRows, fbErr := s.queryTitlePrefixFallback(ctx, title); fbErr == nil && len(fbRows) > 0 {
+			s.exist.Add(key, fbRows)
+			return fbRows, true
+		}
+	}
 	if err != nil {
 		return nil, false
 	}
 	if len(rows) > 0 {
 		s.exist.Add(key, rows)
-	} else {
+	} else if !s.ftsRepairing.Load() {
 		s.noteMiss(key)
 	}
 	return rows, len(rows) > 0
@@ -529,6 +673,57 @@ func buildFTSQuery(title, artist string) string {
 	return strings.Join(clauses, " OR ")
 }
 
+func buildFTSTiers(title, artist string) []string {
+	cleanTitle := sanitizeFTSToken(title)
+	cleanArtist := sanitizeFTSToken(artist)
+	if cleanTitle == "" && cleanArtist == "" {
+		return nil
+	}
+
+	var tiers []string
+	addTier := func(expr string) {
+		if expr == "" {
+			return
+		}
+		for _, existing := range tiers {
+			if existing == expr {
+				return
+			}
+		}
+		tiers = append(tiers, expr)
+	}
+
+	if cleanTitle != "" && cleanArtist != "" {
+		addTier(fmt.Sprintf(`(title: "%s" AND artist: "%s")`, cleanTitle, cleanArtist))
+
+		baseTitle := sanitizeFTSToken(similarity.AnalyzeTitle(title).BaseTitle)
+		if baseTitle != "" && !strings.EqualFold(baseTitle, cleanTitle) {
+			addTier(fmt.Sprintf(`(title: "%s" AND artist: "%s")`, baseTitle, cleanArtist))
+		}
+
+		artistWords := strings.Fields(cleanArtist)
+		if len(artistWords) > 0 && len(artistWords[0]) >= 2 {
+			addTier(fmt.Sprintf(`(title: "%s" AND artist: "%s"*)`, cleanTitle, artistWords[0]))
+			if baseTitle != "" && !strings.EqualFold(baseTitle, cleanTitle) {
+				addTier(fmt.Sprintf(`(title: "%s" AND artist: "%s"*)`, baseTitle, artistWords[0]))
+			}
+		}
+
+		if len(cleanTitle) >= 5 || strings.Contains(cleanTitle, " ") {
+			addTier(fmt.Sprintf(`title: "%s"`, cleanTitle))
+		}
+	} else if cleanTitle != "" {
+		addTier(fmt.Sprintf(`title: "%s"`, cleanTitle))
+		if strings.Contains(cleanTitle, " ") {
+			addTier(fmt.Sprintf(`title: "%s"*`, cleanTitle))
+		}
+	} else if cleanArtist != "" {
+		addTier(fmt.Sprintf(`artist: "%s"`, cleanArtist))
+	}
+
+	return tiers
+}
+
 func sanitizeFTSToken(word string) string {
 	var b strings.Builder
 	b.Grow(len(word))
@@ -541,6 +736,28 @@ func sanitizeFTSToken(word string) string {
 	return strings.TrimSpace(b.String())
 }
 
+func (s *Store) queryFTS5Tiered(ctx context.Context, title, artist, fallbackExpr string) ([]*Row, error) {
+	tiers := buildFTSTiers(title, artist)
+	if len(tiers) == 0 && fallbackExpr != "" {
+		tiers = []string{fallbackExpr}
+	}
+	var lastErr error
+	for _, expr := range tiers {
+		if ctx != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		rows, err := s.queryFTS5(ctx, expr)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(rows) > 0 {
+			return rows, nil
+		}
+	}
+	return nil, lastErr
+}
+
 func (s *Store) queryFTS5(ctx context.Context, matchExpr string) ([]*Row, error) {
 	const q = `SELECT l.id, l.filename, l.isrc, l.platform_id, l.source, l.title, l.artist, l.duration_ms, l.created_at
 FROM lyrics_fts
@@ -549,6 +766,9 @@ WHERE lyrics_fts MATCH ?
 LIMIT 30`
 	rows, err := s.db.QueryContext(ctx, q, matchExpr)
 	if err != nil {
+		if isFTSCorruptError(err) {
+			go s.repairFTS5(true)
+		}
 		s.recordQueryErr(ctx, err)
 		return nil, err
 	}
@@ -569,6 +789,18 @@ LIMIT 30`
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+func (s *Store) queryTitlePrefixFallback(ctx context.Context, title string) ([]*Row, error) {
+	base := strings.TrimSpace(similarity.AnalyzeTitle(title).BaseTitle)
+	if base == "" {
+		base = strings.TrimSpace(title)
+	}
+	if base == "" {
+		return nil, nil
+	}
+	const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE title >= ? COLLATE NOCASE AND title < ? COLLATE NOCASE LIMIT 30`
+	return s.scanLightRows(ctx, q, base, base+"￿")
 }
 
 func (s *Store) scanSingleRow(ctx context.Context, query string, args ...any) (*Row, error) {
@@ -594,16 +826,65 @@ func (s *Store) scanSingleRow(ctx context.Context, query string, args ...any) (*
 
 func (s *Store) queryExact(ctx context.Context, isrc, platformID string) (*Row, error) {
 	if isrc != "" {
-		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE isrc = ? LIMIT 1`
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE isrc = ? AND isrc != '' LIMIT 1`
 		if row, err := s.scanLightRow(ctx, q, isrc); err != nil || row != nil {
 			return row, err
 		}
+		if upper := strings.ToUpper(strings.TrimSpace(isrc)); upper != isrc && upper != "" {
+			if row, err := s.scanLightRow(ctx, q, upper); err != nil || row != nil {
+				return row, err
+			}
+		}
 	}
 	if platformID != "" {
-		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE platform_id = ? LIMIT 1`
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE platform_id = ? AND platform_id != '' LIMIT 1`
 		return s.scanLightRow(ctx, q, platformID)
 	}
 	return nil, nil
+}
+
+func (s *Store) queryExactRows(ctx context.Context, isrc, platformID string) ([]*Row, error) {
+	var out []*Row
+	seen := make(map[int64]struct{}, 8)
+	appendRows := func(rows []*Row) {
+		for _, r := range rows {
+			if r == nil {
+				continue
+			}
+			if _, ok := seen[r.ID]; ok {
+				continue
+			}
+			seen[r.ID] = struct{}{}
+			out = append(out, r)
+		}
+	}
+
+	if isrc != "" {
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE isrc = ? AND isrc != '' LIMIT 10`
+		rows, err := s.scanLightRows(ctx, q, isrc)
+		if err != nil {
+			return nil, err
+		}
+		appendRows(rows)
+		if len(out) == 0 {
+			if upper := strings.ToUpper(strings.TrimSpace(isrc)); upper != isrc && upper != "" {
+				rows, err := s.scanLightRows(ctx, q, upper)
+				if err != nil {
+					return nil, err
+				}
+				appendRows(rows)
+			}
+		}
+	}
+	if platformID != "" && len(out) == 0 {
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE platform_id = ? AND platform_id != '' LIMIT 10`
+		rows, err := s.scanLightRows(ctx, q, platformID)
+		if err != nil {
+			return nil, err
+		}
+		appendRows(rows)
+	}
+	return out, nil
 }
 
 func (s *Store) GetExactUser(ctx context.Context, isrc, platformID string) (*Row, bool) {
@@ -634,13 +915,18 @@ func (s *Store) GetExactUser(ctx context.Context, isrc, platformID string) (*Row
 
 func (s *Store) queryExactUser(ctx context.Context, isrc, platformID string) (*Row, error) {
 	if isrc != "" {
-		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE isrc = ? AND source = 'lyricsplus' LIMIT 1`
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE isrc = ? AND isrc != '' AND source = 'lyricsplus' LIMIT 1`
 		if row, err := s.scanLightRow(ctx, q, isrc); err != nil || row != nil {
 			return row, err
 		}
+		if upper := strings.ToUpper(strings.TrimSpace(isrc)); upper != isrc && upper != "" {
+			if row, err := s.scanLightRow(ctx, q, upper); err != nil || row != nil {
+				return row, err
+			}
+		}
 	}
 	if platformID != "" {
-		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE platform_id = ? AND source = 'lyricsplus' LIMIT 1`
+		const q = `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE platform_id = ? AND platform_id != '' AND source = 'lyricsplus' LIMIT 1`
 		return s.scanLightRow(ctx, q, platformID)
 	}
 	return nil, nil
@@ -666,40 +952,8 @@ func (s *Store) scanLightRow(ctx context.Context, query string, args ...any) (*R
 	return row, nil
 }
 
-func (s *Store) GetByTitleArtist(ctx context.Context, title, artist string) ([]*Row, bool) {
-	title = strings.TrimSpace(title)
-	artist = strings.TrimSpace(artist)
-	if title == "" || artist == "" {
-		return nil, false
-	}
-	key := "ta::" + strings.ToLower(title) + "::" + strings.ToLower(artist)
-	if v, ok := s.exactTitle.Get(key); ok {
-		return v, len(v) > 0
-	}
-	if s.wasMiss(key) {
-		return nil, false
-	}
-	if s.IsResting() {
-		return nil, false
-	}
-	rows, err := s.queryTitleArtist(ctx, title, artist)
-	if err != nil {
-		return nil, false
-	}
-	if len(rows) > 0 {
-		s.exactTitle.Add(key, rows)
-	} else {
-		s.noteMiss(key)
-	}
-	return rows, len(rows) > 0
-}
-
-func (s *Store) queryTitleArtist(ctx context.Context, title, artist string) ([]*Row, error) {
-	const q = `SELECT ` + storeLightRowColumns + `
-FROM lyrics
-WHERE title = ? COLLATE NOCASE AND artist = ? COLLATE NOCASE
-LIMIT 10`
-	rows, err := s.db.QueryContext(ctx, q, title, artist)
+func (s *Store) scanLightRows(ctx context.Context, query string, args ...any) ([]*Row, error) {
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		s.recordQueryErr(ctx, err)
 		return nil, err
@@ -721,6 +975,68 @@ LIMIT 10`
 		out = append(out, row)
 	}
 	return out, rows.Err()
+}
+
+func primaryArtistName(artist string) string {
+	for _, sep := range []string{",", " & ", " feat.", " feat ", " ft.", " ft ", " featuring ", " with ", " x ", " X "} {
+		if idx := strings.Index(strings.ToLower(artist), sep); idx > 0 {
+			return strings.TrimSpace(artist[:idx])
+		}
+	}
+	return strings.TrimSpace(artist)
+}
+
+func (s *Store) GetByTitleArtist(ctx context.Context, title, artist string) ([]*Row, bool) {
+	title = strings.TrimSpace(title)
+	artist = strings.TrimSpace(artist)
+	if title == "" || artist == "" {
+		return nil, false
+	}
+	key := "ta::" + strings.ToLower(title) + "::" + strings.ToLower(artist)
+	if v, ok := s.exactTitle.Get(key); ok {
+		return v, len(v) > 0
+	}
+	if s.wasMiss(key) {
+		return nil, false
+	}
+	if s.IsResting() {
+		return nil, false
+	}
+	rows, err := s.queryTitleArtist(ctx, title, artist)
+	if err != nil {
+		return nil, false
+	}
+	if len(rows) == 0 {
+		baseTitle := strings.TrimSpace(similarity.AnalyzeTitle(title).BaseTitle)
+		primArtist := primaryArtistName(artist)
+		if baseTitle != "" && (!strings.EqualFold(baseTitle, title) || !strings.EqualFold(primArtist, artist)) {
+			if baseRows, baseErr := s.queryTitleArtist(ctx, baseTitle, artist); baseErr == nil && len(baseRows) > 0 {
+				rows = baseRows
+			} else if primArtist != "" && !strings.EqualFold(primArtist, artist) {
+				if primRows, primErr := s.queryTitleArtist(ctx, title, primArtist); primErr == nil && len(primRows) > 0 {
+					rows = primRows
+				} else if !strings.EqualFold(baseTitle, title) {
+					if bpRows, bpErr := s.queryTitleArtist(ctx, baseTitle, primArtist); bpErr == nil && len(bpRows) > 0 {
+						rows = bpRows
+					}
+				}
+			}
+		}
+	}
+	if len(rows) > 0 {
+		s.exactTitle.Add(key, rows)
+	} else {
+		s.noteMiss(key)
+	}
+	return rows, len(rows) > 0
+}
+
+func (s *Store) queryTitleArtist(ctx context.Context, title, artist string) ([]*Row, error) {
+	const q = `SELECT ` + storeLightRowColumns + `
+FROM lyrics
+WHERE title = ? COLLATE NOCASE AND artist = ? COLLATE NOCASE
+LIMIT 15`
+	return s.scanLightRows(ctx, q, title, artist)
 }
 
 func (s *Store) GetContent(ctx context.Context, id int64) ([]byte, error) {
@@ -748,6 +1064,18 @@ func (s *Store) GetContent(ctx context.Context, id int64) ([]byte, error) {
 }
 
 func (s *Store) queryExisting(ctx context.Context, keywords []string) ([]*Row, error) {
+	var ftsTerms []string
+	for _, k := range keywords {
+		if tok := sanitizeFTSToken(k); tok != "" {
+			ftsTerms = append(ftsTerms, fmt.Sprintf(`"%s"*`, tok))
+		}
+	}
+	if len(ftsTerms) > 0 {
+		if ftsRows, err := s.queryFTS5(ctx, strings.Join(ftsTerms, " AND ")); err == nil && len(ftsRows) > 0 {
+			return ftsRows, nil
+		}
+	}
+
 	conds := make([]string, 0, len(keywords))
 	args := make([]interface{}, 0, len(keywords)*2)
 	for _, k := range keywords {
@@ -757,28 +1085,7 @@ func (s *Store) queryExisting(ctx context.Context, keywords []string) ([]*Row, e
 	}
 	q := `SELECT ` + storeLightRowColumns + ` FROM lyrics WHERE ` + strings.Join(conds, " AND ") +
 		` LIMIT 100`
-	rows, err := s.db.QueryContext(ctx, q, args...)
-	if err != nil {
-		s.recordQueryErr(ctx, err)
-		return nil, err
-	}
-	s.RecordDBSuccess()
-	defer func() { _ = rows.Close() }()
-
-	var out []*Row
-	for rows.Next() {
-		row := &Row{}
-		var createdAt int64
-		if err := rows.Scan(
-			&row.ID, &row.Filename, &row.ISRC, &row.PlatformID,
-			&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
-		); err != nil {
-			return nil, err
-		}
-		row.CreatedAt = time.UnixMilli(createdAt)
-		out = append(out, row)
-	}
-	return out, rows.Err()
+	return s.scanLightRows(ctx, q, args...)
 }
 
 func (s *Store) SaveUserLyrics(ctx context.Context, query domain.SearchQuery, content []byte) error {
@@ -997,6 +1304,7 @@ func (s *Store) invalidate(row *Row, id int64) {
 	loArtist := strings.ToLower(strings.TrimSpace(row.Artist))
 
 	exactKey := "exact::" + loISRC + "::" + loPlat
+	exactRowsKey := "exact_rows::" + loISRC + "::" + loPlat
 	exactUserKey := "exact_user::" + loISRC + "::" + loPlat
 	taKey := "ta::" + loTitle + "::" + loArtist
 
@@ -1006,6 +1314,11 @@ func (s *Store) invalidate(row *Row, id int64) {
 	s.exact.Remove("exact::::" + loPlat)
 	s.exact.Remove("exact_user::" + loISRC + "::")
 	s.exact.Remove("exact_user::::" + loPlat)
+	if s.exactRows != nil {
+		s.exactRows.Remove(exactRowsKey)
+		s.exactRows.Remove("exact_rows::" + loISRC + "::")
+		s.exactRows.Remove("exact_rows::::" + loPlat)
+	}
 	s.exactTitle.Remove(taKey)
 	if id > 0 {
 		s.content.Remove(id)
@@ -1019,9 +1332,12 @@ func (s *Store) invalidate(row *Row, id int64) {
 	}
 	if s.miss != nil {
 		s.miss.Remove(exactKey)
+		s.miss.Remove(exactRowsKey)
 		s.miss.Remove(exactUserKey)
 		s.miss.Remove("exact::" + loISRC + "::")
 		s.miss.Remove("exact::::" + loPlat)
+		s.miss.Remove("exact_rows::" + loISRC + "::")
+		s.miss.Remove("exact_rows::::" + loPlat)
 		s.miss.Remove("exact_user::" + loISRC + "::")
 		s.miss.Remove("exact_user::::" + loPlat)
 		s.miss.Remove(taKey)
@@ -1046,6 +1362,9 @@ func (s *Store) wasMiss(key string) bool {
 func (s *Store) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		if s.ftsDone != nil {
+			<-s.ftsDone
+		}
 		if s.writes != nil {
 			s.writes.CloseWithin(5 * time.Second)
 		}
@@ -1103,25 +1422,13 @@ func (s *Store) SearchCatalog(ctx context.Context, query string) ([]domain.SongC
 	}
 
 	if len(rows) == 0 {
-		likePattern := "%" + clean + "%"
+		prefixPattern := clean + "%"
 		const q = `SELECT id, filename, isrc, platform_id, source, title, artist, duration_ms, created_at
 FROM lyrics
-WHERE title LIKE ? OR artist LIKE ? OR filename LIKE ?
+WHERE title >= ? COLLATE NOCASE AND title LIKE ? COLLATE NOCASE
 LIMIT 20`
-		dbRows, err := s.db.QueryContext(ctx, q, likePattern, likePattern, likePattern)
-		if err == nil {
-			defer func() { _ = dbRows.Close() }()
-			for dbRows.Next() {
-				row := &Row{}
-				var createdAt int64
-				if err := dbRows.Scan(
-					&row.ID, &row.Filename, &row.ISRC, &row.PlatformID,
-					&row.Source, &row.Title, &row.Artist, &row.DurationMS, &createdAt,
-				); err == nil {
-					row.CreatedAt = time.UnixMilli(createdAt)
-					rows = append(rows, row)
-				}
-			}
+		if r, err := s.scanLightRows(ctx, q, clean, prefixPattern); err == nil && len(r) > 0 {
+			rows = r
 		}
 	}
 
@@ -1183,15 +1490,15 @@ func buildSearchFTS5Expr(q string) string {
 	if len(clean) == 0 {
 		return ""
 	}
-	var clauses []string
-	phrase := strings.Join(clean, " ")
-	clauses = append(clauses, fmt.Sprintf(`"%s"`, phrase))
-	clauses = append(clauses, fmt.Sprintf(`"%s"*`, phrase))
-	for _, t := range clean {
-		clauses = append(clauses, fmt.Sprintf(`title: "%s"*`, t))
-		clauses = append(clauses, fmt.Sprintf(`artist: "%s"*`, t))
+	if len(clean) == 1 {
+		return fmt.Sprintf(`title: "%s"* OR artist: "%s"*`, clean[0], clean[0])
 	}
-	return strings.Join(clauses, " OR ")
+	phrase := strings.Join(clean, " ")
+	var andTerms []string
+	for _, t := range clean {
+		andTerms = append(andTerms, fmt.Sprintf(`"%s"*`, t))
+	}
+	return fmt.Sprintf(`"%s" OR (%s)`, phrase, strings.Join(andTerms, " AND "))
 }
 
 func (s *Store) GetMetadata(ctx context.Context, title, artist, album string, durationSec float64) (map[string]interface{}, error) {
@@ -1232,7 +1539,6 @@ func (s *Store) GetMetadata(ctx context.Context, title, artist, album string, du
 	return meta, nil
 }
 
-// GetRowForSources searches the store for a lyrics row matching the query and matching any of the specified targetSources.
 func (s *Store) GetRowForSources(ctx context.Context, q domain.SearchQuery, targetSources ...string) (*Row, []byte, error) {
 	if s == nil {
 		return nil, nil, nil
@@ -1260,9 +1566,11 @@ func (s *Store) GetRowForSources(ctx context.Context, q domain.SearchQuery, targ
 
 	var candidateRows []*Row
 	if q.ISRC != "" || q.PlatformID != "" {
-		if r, ok := s.GetExact(ctx, q.ISRC, q.PlatformID); ok && r != nil {
-			if matchSource(r.Source) {
-				candidateRows = append(candidateRows, r)
+		if rows, ok := s.GetExactRows(ctx, q.ISRC, q.PlatformID); ok && len(rows) > 0 {
+			for _, r := range rows {
+				if matchSource(r.Source) {
+					candidateRows = append(candidateRows, r)
+				}
 			}
 		}
 	}

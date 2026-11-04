@@ -157,7 +157,7 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		Logger:      lg,
 	}
 
-	router := newRouter(cfg, lg, lyricsH, catalogH, powH, healthH, adminH)
+	router := middleware.FTSRepairGate(store)(newRouter(cfg, lg, lyricsH, catalogH, powH, healthH, adminH))
 
 	return &Server{
 		cfg:      cfg,

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"lyricsplus/backend/internal/api/handlers"
+	"lyricsplus/backend/internal/api/middleware"
 	"lyricsplus/backend/internal/config"
 	"lyricsplus/backend/internal/domain"
 	"lyricsplus/backend/internal/orchestrator"
@@ -338,6 +339,46 @@ func TestHealthAndReady(t *testing.T) {
 	rec = doGet(t, router, "/health")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("expected liveness 200 after db close, got %d", rec.Code)
+	}
+}
+
+func TestFTSRepairMaintenanceGate(t *testing.T) {
+	cfg := baseTestConfig()
+	dbPath := filepath.Join(t.TempDir(), "fts_repair_gate.db")
+	st, err := storage.NewStore(config.Storage{DBPath: dbPath, LRUSize: 64})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	st.SetFTSRepairing(true)
+
+	tracer := orchestrator.NewRacer([]orchestrator.Source{&fakeSource{resp: sampleWordLyrics()}}, cfg.Provider.Timeout)
+	dedup := orchestrator.NewDedup(tracer)
+	svc := &service.Service{Dedup: dedup, Store: st, Logger: nil}
+	lyricsH := &handlers.Lyrics{Service: svc, Logger: nil, KpoeInfo: "lyricsplus"}
+	catalogH := &handlers.Catalog{Store: st, Logger: nil}
+	lp := lyricsplus.NewLyricsPlus(nil)
+	lp.SetStore(st)
+	powH := &handlers.Pow{
+		Issuer:           lyricsplus.NewIssuer(cfg.LyricsPlus.JWTSecret, cfg.LyricsPlus.ChallengeTTL),
+		Verifier:         lyricsplus.NewVerifier(cfg.LyricsPlus.JWTSecret, cfg.LyricsPlus.PoWDifficulty),
+		LyricsPlus:       lp,
+		Store:            st,
+		MaxBodyBytes:     cfg.LyricsPlus.MaxBodyBytes,
+		AllowSubmissions: cfg.LyricsPlus.AllowSubmissions,
+		Logger:           nil,
+	}
+	healthH := &handlers.Health{Started: time.Now()}
+	base := newRouter(cfg, nil, lyricsH, catalogH, powH, healthH)
+	h := middleware.FTSRepairGate(st)(base)
+
+	rec := doGet(t, h, "/v2/lyrics/get?title=Hello&artist=Adele")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 while FTS5 repair is active, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "maintenance") || !strings.Contains(rec.Body.String(), "estimated") {
+		t.Fatalf("expected maintenance message with estimate in body, got %s", rec.Body.String())
 	}
 }
 

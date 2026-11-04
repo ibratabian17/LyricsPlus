@@ -72,6 +72,7 @@ type MergeStats struct {
 
 type DBStats struct {
 	TotalRows    int64
+	FTSIndexed   int64
 	Sources      map[string]int64
 	SyncTypes    map[string]int64
 	FileSize     int64
@@ -104,6 +105,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS lyrics_fts USING fts5(
 
 const lyricsDropSecondaryIndexesSQL = `
 DROP TRIGGER IF EXISTS lyrics_fts_insert;
+DROP TRIGGER IF EXISTS lyrics_fts_delete;
+DROP TRIGGER IF EXISTS lyrics_fts_update;
 DROP INDEX IF EXISTS idx_lyrics_filename;
 DROP INDEX IF EXISTS idx_lyrics_isrc;
 DROP INDEX IF EXISTS idx_lyrics_platform;
@@ -291,14 +294,13 @@ func detectJSONHeaderType(head []byte) int {
 	return RankNone
 }
 
-// EnsureSchema initializes the lyrics schema and indexes on a target database.
 func EnsureSchema(db *sql.DB) error {
 	pragmas := []string{
 		"PRAGMA page_size = 8192;",
 		"PRAGMA journal_mode = WAL;",
 		"PRAGMA synchronous = NORMAL;",
 		"PRAGMA busy_timeout = 30000;",
-		"PRAGMA temp_store = MEMORY;",
+		"PRAGMA temp_store = DEFAULT;",
 		"PRAGMA cache_size = -65536;",
 	}
 	for _, p := range pragmas {
@@ -313,6 +315,58 @@ func EnsureSchema(db *sql.DB) error {
 	if _, err := db.Exec(lyricsFTS5Setup); err != nil {
 		_ = err
 	}
+	return nil
+}
+
+func RepairDatabase(ctx context.Context, dbPath string, logf func(format string, args ...any)) error {
+	if logf == nil {
+		logf = func(format string, args ...any) {}
+	}
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+	db.SetMaxOpenConns(1)
+
+	pragmas := []string{
+		"PRAGMA journal_mode = WAL;",
+		"PRAGMA synchronous = NORMAL;",
+		"PRAGMA busy_timeout = 30000;",
+		"PRAGMA temp_store = DEFAULT;",
+		"PRAGMA cache_size = -262144;",
+		"PRAGMA mmap_size = 536870912;",
+	}
+	for _, p := range pragmas {
+		_, _ = db.ExecContext(ctx, p)
+	}
+
+	logf("[1/3] Ensuring all B-tree secondary indexes exist...")
+	if _, err := db.ExecContext(ctx, lyricsCreateTable); err != nil {
+		return fmt.Errorf("create indexes: %w", err)
+	}
+	if _, err := db.ExecContext(ctx, lyricsFTS5Setup); err != nil {
+		return fmt.Errorf("create fts5 setup: %w", err)
+	}
+
+	var totalRows, ftsRows int64
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM lyrics`).Scan(&totalRows)
+	_ = db.QueryRowContext(ctx, `SELECT COUNT(*) FROM lyrics_fts_docsize`).Scan(&ftsRows)
+	logf("[2/3] Checking FTS5 index sync (lyrics=%d, fts_indexed=%d)...", totalRows, ftsRows)
+	if totalRows > 0 && ftsRows != totalRows {
+		logf("      Rebuilding FTS5 index for %d rows...", totalRows)
+		if _, err := db.ExecContext(ctx, `INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild');`); err != nil {
+			return fmt.Errorf("rebuild fts5: %w", err)
+		}
+		logf("      FTS5 rebuild complete.")
+	}
+
+	logf("[3/3] Running sampled ANALYZE and WAL checkpoint...")
+	_, _ = db.ExecContext(ctx, "PRAGMA analysis_limit = 1000;")
+	_, _ = db.ExecContext(ctx, "ANALYZE;")
+	_, _ = db.ExecContext(ctx, "PRAGMA optimize;")
+	_, _ = db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE);")
+	logf("[+] Database repair & optimization finished successfully.")
 	return nil
 }
 
@@ -357,9 +411,9 @@ func MergeDatabases(ctx context.Context, cfg MergeConfig) (*MergeStats, error) {
 		"PRAGMA journal_mode = WAL;",
 		"PRAGMA synchronous = OFF;",
 		"PRAGMA busy_timeout = 30000;",
-		"PRAGMA temp_store = MEMORY;",
-		"PRAGMA cache_size = -1048576;",  // ~1 GB page cache
-		"PRAGMA mmap_size = 2147483648;", // 2 GB memory-mapped I/O
+		"PRAGMA temp_store = DEFAULT;",
+		"PRAGMA cache_size = -524288;",   // ~512 MB page cache
+		"PRAGMA mmap_size = 1073741824;", // 1 GB memory-mapped I/O
 		"PRAGMA wal_autocheckpoint = 0;", // Defer checkpoint until merge completes
 		"PRAGMA journal_size_limit = 268435456;",
 	}
@@ -373,10 +427,11 @@ func MergeDatabases(ctx context.Context, cfg MergeConfig) (*MergeStats, error) {
 		return nil, fmt.Errorf("init base table: %w", err)
 	}
 
-	var maxIDBeforeAll, targetRowsBeforeAll int64
+	var maxIDBeforeAll, targetRowsBeforeAll, ftsRowsBeforeAll int64
 	_ = targetDB.QueryRowContext(ctx, "SELECT COALESCE(MAX(id), 0), COUNT(*) FROM lyrics").Scan(&maxIDBeforeAll, &targetRowsBeforeAll)
+	_ = targetDB.QueryRowContext(ctx, "SELECT COUNT(*) FROM lyrics_fts_docsize").Scan(&ftsRowsBeforeAll)
 
-	// Estimate total source size to decide whether to drop secondary indexes and FTS insert triggers
+	// Estimate total source size to decide whether to drop secondary indexes and FTS triggers
 	var totalSourceBytes int64
 	for _, srcPath := range cfg.SourcePaths {
 		if fi, err := os.Stat(srcPath); err == nil {
@@ -386,7 +441,7 @@ func MergeDatabases(ctx context.Context, cfg MergeConfig) (*MergeStats, error) {
 
 	bulkIndexDefer := targetRowsBeforeAll == 0 || totalSourceBytes >= 4*1024*1024
 	if bulkIndexDefer {
-		logf("[*] Preparing target DB for bulk merge (deferring secondary indexes & FTS insert trigger)...")
+		logf("[*] Preparing target DB for bulk merge (deferring secondary indexes & FTS triggers)...")
 		_, _ = targetDB.ExecContext(ctx, lyricsDropSecondaryIndexesSQL)
 	} else {
 		_, _ = targetDB.ExecContext(ctx, lyricsCreateTable)
@@ -425,20 +480,30 @@ func MergeDatabases(ctx context.Context, cfg MergeConfig) (*MergeStats, error) {
 	// so the target database is never left in an unindexed state even on interrupt.
 	restoreCtx := context.Background()
 	if bulkIndexDefer {
-		logf("[*] Restoring secondary indexes on target database...")
-		_, _ = targetDB.ExecContext(restoreCtx, lyricsCreateTable)
+		logf("[*] Restoring secondary B-tree indexes on target database...")
+		if _, err := targetDB.ExecContext(restoreCtx, lyricsCreateTable); err != nil {
+			logf("[!] Warning: error creating secondary indexes: %v", err)
+		}
 
-		if cfg.RebuildFTS {
+		needFullFTSRebuild := cfg.RebuildFTS || stats.Upgraded > 0 || (targetRowsBeforeAll > 0 && ftsRowsBeforeAll < targetRowsBeforeAll)
+		if needFullFTSRebuild {
 			logf("[*] Rebuilding FTS5 full-text index...")
-			_, _ = targetDB.ExecContext(restoreCtx, `INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild');`)
+			if _, err := targetDB.ExecContext(restoreCtx, `INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild');`); err != nil {
+				logf("[!] Warning: error rebuilding FTS5 index: %v", err)
+			}
 		} else if stats.Inserted > 0 {
 			logf("[*] Syncing %d newly inserted records into FTS5 index...", stats.Inserted)
-			_, _ = targetDB.ExecContext(restoreCtx, `
+			if _, err := targetDB.ExecContext(restoreCtx, `
 				INSERT INTO lyrics_fts(rowid, title, artist)
 				SELECT id, title, artist FROM lyrics WHERE id > ?;
-			`, maxIDBeforeAll)
+			`, maxIDBeforeAll); err != nil {
+				logf("[!] Warning: incremental FTS5 sync failed (%v), running full FTS5 rebuild...", err)
+				_, _ = targetDB.ExecContext(restoreCtx, `INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild');`)
+			}
 		}
-		_, _ = targetDB.ExecContext(restoreCtx, lyricsFTS5Setup)
+		if _, err := targetDB.ExecContext(restoreCtx, lyricsFTS5Setup); err != nil {
+			logf("[!] Warning: error restoring FTS5 triggers: %v", err)
+		}
 	} else if cfg.RebuildFTS {
 		logf("[*] Rebuilding FTS5 full-text index...")
 		_, _ = targetDB.ExecContext(restoreCtx, `INSERT INTO lyrics_fts(lyrics_fts) VALUES('rebuild');`)
@@ -455,6 +520,7 @@ func MergeDatabases(ctx context.Context, cfg MergeConfig) (*MergeStats, error) {
 		_, _ = targetDB.ExecContext(restoreCtx, "PRAGMA wal_checkpoint(PASSIVE);")
 	}
 
+	_, _ = targetDB.ExecContext(restoreCtx, "PRAGMA analysis_limit = 1000;")
 	_, _ = targetDB.ExecContext(restoreCtx, "ANALYZE;")
 	_, _ = targetDB.ExecContext(restoreCtx, "PRAGMA optimize;")
 
@@ -567,7 +633,9 @@ func mergeSingleSource(ctx context.Context, srcPath string, targetDB *sql.DB, cf
 
 	insertStmt, err := tx.PrepareContext(ctx, `
 		INSERT OR IGNORE INTO main.lyrics (filename, content, isrc, platform_id, source, title, artist, duration_ms, created_at)
-		SELECT filename, content, COALESCE(isrc, ''), COALESCE(platform_id, ''), source, COALESCE(title, ''), COALESCE(artist, ''), COALESCE(duration_ms, 0), COALESCE(created_at, 0)
+		SELECT filename, content, COALESCE(isrc, ''), COALESCE(platform_id, ''), source, COALESCE(title, ''), COALESCE(artist, ''),
+		       COALESCE(duration_ms, 0),
+		       COALESCE(created_at, 0)
 		FROM src.lyrics
 		WHERE rowid > ? AND rowid <= ?
 	`)
@@ -771,7 +839,8 @@ func resolveConflictsQuality(
 			SELECT m.id, m.content, COALESCE(m.created_at, 0),
 			       s.content, COALESCE(s.isrc, ''), COALESCE(s.platform_id, ''),
 			       COALESCE(s.title, ''), COALESCE(s.artist, ''),
-			       COALESCE(s.duration_ms, 0), COALESCE(s.created_at, 0)
+			       COALESCE(s.duration_ms, 0),
+			       COALESCE(s.created_at, 0)
 			FROM main.lyrics m
 			CROSS JOIN src.lyrics s ON s.filename = m.filename AND s.source = m.source
 			WHERE m.id > ? AND m.id <= ?
@@ -784,7 +853,8 @@ func resolveConflictsQuality(
 			SELECT m.id, m.content, COALESCE(m.created_at, 0),
 			       s.content, COALESCE(s.isrc, ''), COALESCE(s.platform_id, ''),
 			       COALESCE(s.title, ''), COALESCE(s.artist, ''),
-			       COALESCE(s.duration_ms, 0), COALESCE(s.created_at, 0)
+			       COALESCE(s.duration_ms, 0),
+			       COALESCE(s.created_at, 0)
 			FROM src.lyrics s
 			CROSS JOIN main.lyrics m ON s.filename = m.filename AND s.source = m.source
 			WHERE s.rowid > ? AND s.rowid <= ?
@@ -991,7 +1061,7 @@ func hasLeadingFilenameIndex(ctx context.Context, db *sql.DB, schemaName, tableN
 
 // GetDatabaseStats inspects an SQLite database and aggregates statistics using parallel workers.
 func GetDatabaseStats(ctx context.Context, dbPath string) (*DBStats, error) {
-	db, err := sql.Open("sqlite", dbPath+"?mode=ro&_pragma=cache_size(-262144)&_pragma=mmap_size(1073741824)&_pragma=temp_store(MEMORY)")
+	db, err := sql.Open("sqlite", dbPath+"?mode=ro&_pragma=cache_size(-262144)&_pragma=mmap_size(1073741824)&_pragma=temp_store(DEFAULT)")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
@@ -1009,6 +1079,8 @@ func GetDatabaseStats(ctx context.Context, dbPath string) (*DBStats, error) {
 	if fi, err := os.Stat(dbPath + "-wal"); err == nil {
 		stats.WALSize = fi.Size()
 	}
+
+	_ = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM lyrics_fts_docsize").Scan(&stats.FTSIndexed)
 
 	// Total rows & Sources breakdown in a single query
 	srcRows, err := db.QueryContext(ctx, "SELECT COALESCE(source, ''), COUNT(*) FROM lyrics GROUP BY source")

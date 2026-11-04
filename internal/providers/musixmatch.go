@@ -266,6 +266,10 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 		if matchedTrack == nil {
 			tr, err := p.searchMatcher(ctx, url.Values{"q_track_isrc": {q.ISRC}}, accountIdx)
 			if err == nil && tr != nil && tr.TrackID != 0 {
+				if isMxmHoneypotTrack(tr.TrackName, tr.ArtistName, q.Title+" "+q.Artist) {
+					p.invalidateAccountToken(accountIdx)
+					return nil, fmt.Errorf("musixmatch: invalid user token (honeypot track)")
+				}
 				matchedTrack = tr
 				if p.state.searchCache != nil {
 					p.state.searchCache.Add(isrcKey, &mxmTrackCacheEntry{track: tr, created: time.Now()})
@@ -321,8 +325,9 @@ func (p *MusixmatchProvider) fetchLyricsWithAccount(ctx context.Context, q domai
 
 	for _, ln := range converted.Lyrics {
 		if isMxmHoneypotLyrics(ln.Text) {
-			p.debugf("honeypot lyrics for track %d, discarding", matchedTrack.TrackID)
-			return nil, nil
+			p.debugf("honeypot lyrics for track %d, invalidating token and rotating", matchedTrack.TrackID)
+			p.invalidateAccountToken(accountIdx)
+			return nil, fmt.Errorf("musixmatch: invalid user token (honeypot lyrics)")
 		}
 	}
 
@@ -485,6 +490,21 @@ func (p *MusixmatchProvider) invalidateWebToken(accountIdx int) {
 	delete(p.state.webTok, accountIdx)
 	p.state.cookieDisabled[accountIdx] = true
 	p.state.webMu.Unlock()
+}
+
+func (p *MusixmatchProvider) invalidateAccountToken(accountIdx int) {
+	if p.isAndroid(accountIdx) {
+		p.state.androidMu.Lock()
+		if st, ok := p.state.android[accountIdx]; ok {
+			st.currentToken = ""
+			st.isLoggedIn = false
+			st.expiresAt = time.Time{}
+			st.failUntil = time.Now().Add(30 * time.Second)
+		}
+		p.state.androidMu.Unlock()
+		return
+	}
+	p.invalidateWebToken(accountIdx)
 }
 
 func (p *MusixmatchProvider) makeWebRequest(ctx context.Context, endpoint string, params url.Values, accountIdx int) (json.RawMessage, error) {
@@ -719,7 +739,12 @@ func (p *MusixmatchProvider) searchTrack(ctx context.Context, query string, acco
 			}
 		}
 	}
+	rawCount := len(out)
 	out = filterMxmHoneypotTracks(out, query)
+	if err == nil && rawCount > 0 && len(out) == 0 {
+		p.invalidateAccountToken(accountIdx)
+		return nil, fmt.Errorf("musixmatch: invalid user token (honeypot search results)")
+	}
 	if err == nil && p.state.searchCache != nil {
 		p.state.searchCache.Add(cacheKey, &mxmTrackCacheEntry{tracks: out, created: time.Now()})
 	}
@@ -988,8 +1013,8 @@ func (p *MusixmatchProvider) fetchAndroidToken(ctx context.Context, accountIdx i
 	if data.Message.Header.StatusCode != 200 {
 		return "", fmt.Errorf("musixmatch: token request failed with status %d", data.Message.Header.StatusCode)
 	}
-	if data.Message.Body.UserToken == "" {
-		return "", fmt.Errorf("musixmatch: no user token found")
+	if data.Message.Body.UserToken == "" || !isValidMxmToken(data.Message.Body.UserToken) {
+		return "", fmt.Errorf("musixmatch: invalid user token")
 	}
 	return data.Message.Body.UserToken, nil
 }
@@ -1097,9 +1122,7 @@ func (p *MusixmatchProvider) androidRequest(ctx context.Context, endpoint string
 		return nil, err
 	}
 
-	signed := buildAndroidSignedParams(endpoint, params, tok)
-	raw, err := p.makeAndroidRequest(ctx, endpoint, signed, body)
-	if err == nil {
+	checkHeader := func(raw json.RawMessage) (json.RawMessage, int, string) {
 		var data struct {
 			Message struct {
 				Header struct {
@@ -1108,18 +1131,24 @@ func (p *MusixmatchProvider) androidRequest(ctx context.Context, endpoint string
 				} `json:"header"`
 			} `json:"message"`
 		}
+		if json.Unmarshal(raw, &data) == nil && data.Message.Header.StatusCode != 0 {
+			return raw, data.Message.Header.StatusCode, data.Message.Header.Hint
+		}
+		return raw, 200, ""
+	}
 
-		if json.Unmarshal(raw, &data) == nil {
-			code := data.Message.Header.StatusCode
-			if code == 200 {
-				return raw, nil
-			}
-			if code == 404 {
-				return nil, nil
-			}
-			if code != 401 && code != 402 {
-				return nil, fmt.Errorf("musixmatch android error (%d): %s", code, data.Message.Header.Hint)
-			}
+	signed := buildAndroidSignedParams(endpoint, params, tok)
+	raw, err := p.makeAndroidRequest(ctx, endpoint, signed, body)
+	if err == nil {
+		_, code, hint := checkHeader(raw)
+		if code == 200 {
+			return raw, nil
+		}
+		if code == 404 {
+			return nil, nil
+		}
+		if code != 401 && code != 402 {
+			return nil, fmt.Errorf("musixmatch android error (%d): %s", code, hint)
 		}
 	}
 
@@ -1136,7 +1165,19 @@ func (p *MusixmatchProvider) androidRequest(ctx context.Context, endpoint string
 		return nil, err
 	}
 	signed = buildAndroidSignedParams(endpoint, params, tok)
-	return p.makeAndroidRequest(ctx, endpoint, signed, body)
+	raw, err = p.makeAndroidRequest(ctx, endpoint, signed, body)
+	if err != nil {
+		return nil, err
+	}
+	_, code, hint := checkHeader(raw)
+	if code == 200 {
+		return raw, nil
+	}
+	if code == 404 {
+		return nil, nil
+	}
+	p.invalidateAccountToken(accountIdx)
+	return nil, fmt.Errorf("musixmatch android error (%d): %s", code, hint)
 }
 
 func Signature(endpoint string, now time.Time) string {

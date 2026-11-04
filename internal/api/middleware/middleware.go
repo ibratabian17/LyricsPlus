@@ -3,6 +3,7 @@ package middleware
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 
 	"lyricsplus/backend/internal/logger"
 	"lyricsplus/backend/internal/metrics"
+	"lyricsplus/backend/internal/storage"
 )
 
 type ctxKey int
@@ -166,6 +168,26 @@ func BodyLimit(maxBytes int64) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if maxBytes > 0 {
 				r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func FTSRepairGate(st *storage.Store) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if st != nil && st.IsFTSRepairing() {
+				estimate := st.FTSRepairEstimate()
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.Header().Set("Cache-Control", "no-store")
+				w.Header().Set("Retry-After", fmt.Sprintf("%d", int(estimate.Round(time.Second).Seconds())))
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(map[string]string{
+					"error":   "maintenance",
+					"message": "The service is currently under maintenance while the FTS5 index is being repaired. estimated time: " + estimate.Round(time.Second).String(),
+				})
+				return
 			}
 			next.ServeHTTP(w, r)
 		})
