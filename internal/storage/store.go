@@ -1439,12 +1439,6 @@ LIMIT 20`
 	seen := make(map[string]bool, len(rows))
 	var items []domain.SongCatalogItem
 	for _, r := range rows {
-		key := strings.ToLower(r.Title) + "::" + strings.ToLower(r.Artist)
-		if seen[key] {
-			continue
-		}
-		seen[key] = true
-
 		var isrcPtr *string
 		if r.ISRC != "" {
 			isrc := r.ISRC
@@ -1456,6 +1450,16 @@ LIMIT 20`
 			sourceName = "Database"
 		}
 		sourceKey := strings.ToLower(sourceName)
+		switch sourceKey {
+		case "database", "apple", "apple music", "spotify", "deezer", "qq", "qq music", "lyricsplus", "lyrics+", "qaple":
+		default:
+			continue
+		}
+		key := strings.ToLower(r.Title) + "::" + strings.ToLower(r.Artist)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 
 		idMap := map[string]string{}
 		if r.PlatformID != "" {
@@ -1555,9 +1559,6 @@ func (s *Store) GetRowForSources(ctx context.Context, q domain.SearchQuery, targ
 				return true
 			}
 			if strings.EqualFold(ts, "qq") && (strings.EqualFold(src, "qq music") || strings.EqualFold(src, "qq") || strings.EqualFold(src, "qqmusic")) {
-				return true
-			}
-			if strings.EqualFold(ts, "musixmatch") && (strings.EqualFold(src, "musixmatch") || strings.EqualFold(src, "musixmatch-word")) {
 				return true
 			}
 		}

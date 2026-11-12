@@ -4,7 +4,7 @@ info:
   version: 1.0.0
   description: >-
     Synced-lyrics aggregation API. It fetches timestamped (word- and line-level)
-    lyrics from several providers (Apple Music, Spotify, Musixmatch, Deezer, QQ
+    lyrics from several providers (Apple Music, Spotify, Deezer, QQ
     Music, and the LyricsPlus UGC store), normalizes them into a canonical V2
     payload, caches results, and serves the legacy V1 and Apple Music TTML
     variants. Interactive viewer: /docs. Prose reference: docs/endpoints.md.
@@ -182,8 +182,7 @@ paths:
       summary: Fetch the raw provider payload verbatim
       description: >-
         Returns the unparsed upstream response. Content-Type is
-        application/xml for Apple/QQ and application/json for
-        Musixmatch/Spotify sources.
+        application/xml for Apple/QQ and application/json for Spotify sources.
       parameters:
         - $ref: "#/components/parameters/Title"
         - $ref: "#/components/parameters/Artist"
@@ -228,7 +227,7 @@ paths:
       tags: [Catalog]
       summary: Search the aggregated song catalog
       description: >-
-        Queries Apple Music, Spotify and Musixmatch in parallel, normalizes and
+        Queries Apple Music, Spotify, Deezer and QQ Music in parallel, normalizes and
         merges the results, de-duplicating by ISRC then by title/artist/album.
       parameters:
         - name: q
@@ -495,7 +494,7 @@ components:
     Source:
       name: source
       in: query
-      description: Comma-separated provider preference, e.g. musixmatch,spotify,qq.
+      description: Comma-separated provider preference, e.g. apple,spotify,qq.
       schema: { type: string }
     ForceReload:
       name: forceReload

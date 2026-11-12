@@ -25,7 +25,6 @@ type Catalog struct {
 	Store      *storage.Store
 	AppleMusic *providers.AppleMusicProvider
 	Spotify    *providers.SpotifyProvider
-	Musixmatch *providers.MusixmatchProvider
 	Deezer     *providers.DeezerProvider
 	QQMusic    *providers.QQMusicProvider
 	Logger     *logger.Logger
@@ -76,9 +75,6 @@ func (h *Catalog) Search(w http.ResponseWriter, r *http.Request) {
 		if h.QQMusic != nil {
 			fns = append(fns, searchFn{"qq", func() ([]domain.SongCatalogItem, error) { return h.QQMusic.SearchCatalog(ctx, q) }})
 		}
-		if h.Musixmatch != nil {
-			fns = append(fns, searchFn{"musixmatch", func() ([]domain.SongCatalogItem, error) { return h.Musixmatch.SearchCatalog(ctx, q) }})
-		}
 	}
 
 	var wg sync.WaitGroup
@@ -107,7 +103,6 @@ func mergeCatalogResults(results []domain.SongCatalogItem, query string) []domai
 		"Spotify":     3,
 		"Deezer":      4,
 		"QQ Music":    5,
-		"Musixmatch":  6,
 	}
 	rank := func(item domain.SongCatalogItem) int {
 		if len(item.Availability) == 0 {
@@ -246,11 +241,6 @@ func (h *Catalog) Metadata(w http.ResponseWriter, r *http.Request) {
 	if h.QQMusic != nil {
 		getters = append(getters, metaGetter{"qq", func() (map[string]interface{}, error) {
 			return h.QQMusic.GetMetadata(ctx, title, artist, album, durationSec)
-		}})
-	}
-	if h.Musixmatch != nil {
-		getters = append(getters, metaGetter{"musixmatch", func() (map[string]interface{}, error) {
-			return h.Musixmatch.GetMetadata(ctx, title, artist, album, durationSec)
 		}})
 	}
 	if h.Store != nil {

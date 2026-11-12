@@ -59,7 +59,7 @@ func SourceOrder(query domain.SearchQuery, preferred []string) []string {
 		return preferred
 	}
 	if query.IDOnly() {
-		return []string{"apple", "lyricsplus", "qq", "musixmatch"}
+		return []string{"apple", "lyricsplus", "qq"}
 	}
-	return []string{"apple", "lyricsplus", "deezer", "qq", "musixmatch-word", "musixmatch"}
+	return []string{"apple", "lyricsplus", "deezer", "qq"}
 }

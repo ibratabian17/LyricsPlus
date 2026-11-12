@@ -258,8 +258,6 @@ func (s *Service) FetchLyrics(ctx context.Context, q domain.SearchQuery, preferr
 		resp.Metadata.Source = "QQ Music"
 	case strings.EqualFold(res.Source, "deezer"):
 		resp.Metadata.Source = "Deezer"
-	case strings.EqualFold(res.Source, "musixmatch") || strings.EqualFold(res.Source, "musixmatch-word"):
-		resp.Metadata.Source = "Musixmatch"
 	case strings.EqualFold(res.Source, "spotify"):
 		if resp.Metadata.Source == "" {
 			resp.Metadata.Source = "Spotify"
@@ -604,8 +602,6 @@ func (s *Service) fromStoreWithOpts(ctx context.Context, q domain.SearchQuery, r
 		resp.Metadata.Source = "QQ Music"
 	case strings.EqualFold(row.Source, "deezer"):
 		resp.Metadata.Source = "Deezer"
-	case strings.EqualFold(row.Source, "musixmatch") || strings.EqualFold(row.Source, "musixmatch-word"):
-		resp.Metadata.Source = "Musixmatch"
 	case strings.EqualFold(row.Source, "spotify"):
 		if resp.Metadata.Source == "" {
 			resp.Metadata.Source = "Spotify"
@@ -751,15 +747,6 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 			p.Metadata.Source = "Deezer"
 			return p
 		}
-	case strings.EqualFold(src, "musixmatch"), strings.EqualFold(src, "musixmatch-word"):
-		if res := parseNormalizedJSON(trimmedRaw); res != nil {
-			res.Metadata.Source = "Musixmatch"
-			return res
-		}
-		if p, err := parsers.ConvertMusixmatchToJSON(content, false); err == nil && p != nil && len(p.Lyrics) > 0 {
-			p.Metadata.Source = "Musixmatch"
-			return p
-		}
 	case strings.EqualFold(src, "spotify"):
 		if res := parseNormalizedJSON(trimmedRaw); res != nil {
 			if res.Metadata.Source == "" {
@@ -811,11 +798,6 @@ func parseStoredContent(row *storage.Row, content []byte) *domain.LyricsResponse
 	}
 	if strings.Contains(trimmedRaw, `"syncType"`) && strings.Contains(trimmedRaw, `"lines"`) {
 		if p, err := parsers.ConvertSpotifyToJSON(content); err == nil && p != nil && len(p.Lyrics) > 0 {
-			return p
-		}
-	}
-	if strings.Contains(trimmedRaw, `"message"`) && (strings.Contains(trimmedRaw, `"subtitle_body"`) || strings.Contains(trimmedRaw, `"richsync_body"`)) {
-		if p, err := parsers.ConvertMusixmatchToJSON(content, false); err == nil && p != nil && len(p.Lyrics) > 0 {
 			return p
 		}
 	}
@@ -982,10 +964,6 @@ func providerDisplayName(source string) string {
 		return "Apple"
 	case "qq", "qq music":
 		return "QQ Music"
-	case "musixmatch":
-		return "Musixmatch"
-	case "musixmatch-word":
-		return "Musixmatch (Word)"
 	case "deezer":
 		return "Deezer"
 	case "qaple":
@@ -1009,10 +987,6 @@ func ProviderNameForSource(source string) string {
 		return "apple"
 	case "qq music", "qq", "qqmusic":
 		return "qq"
-	case "musixmatch":
-		return "musixmatch"
-	case "musixmatch-word":
-		return "musixmatch-word"
 	case "deezer":
 		return "deezer"
 	case "qaple":
@@ -1023,23 +997,29 @@ func ProviderNameForSource(source string) string {
 		if strings.Contains(s, "qaple") || strings.Contains(s, "with qq") {
 			return "qaple"
 		}
-		return "lyricsplus"
+		if s == "" {
+			return "lyricsplus"
+		}
+		return ""
 	}
 }
 
 var providerNameForSource = ProviderNameForSource
 
 func sourcePriority(candidate string, allowed []string) int {
+	candNorm := providerNameForSource(candidate)
+	if candNorm == "" {
+		return -1
+	}
 	if len(allowed) == 0 {
 		return 0
 	}
-	candNorm := providerNameForSource(candidate)
 	for i, a := range allowed {
 		aNorm := providerNameForSource(a)
-		if aNorm == candNorm {
-			return i
+		if aNorm == "" {
+			continue
 		}
-		if aNorm == "musixmatch" && candNorm == "musixmatch-word" {
+		if aNorm == candNorm {
 			return i
 		}
 	}
@@ -1261,8 +1241,6 @@ func (s *Service) SaveResultAsync(q domain.SearchQuery, res *orchestrator.Result
 		case (isAppleSource(resp.Metadata.Source) || isAppleSource(source)) && strings.HasPrefix(trimmedRaw, "<"):
 			contentToSave = []byte(resp.RawData)
 		case (srcLower == "qq" || strings.EqualFold(resp.Metadata.Source, "qq")) && strings.HasPrefix(trimmedRaw, "<"):
-			contentToSave = []byte(resp.RawData)
-		case strings.HasPrefix(srcLower, "musixmatch") && strings.Contains(trimmedRaw, `"message"`):
 			contentToSave = []byte(resp.RawData)
 		case srcLower == "spotify" && strings.Contains(trimmedRaw, `"lines"`):
 			contentToSave = []byte(resp.RawData)

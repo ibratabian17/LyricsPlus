@@ -28,7 +28,7 @@ These apply to `/v1/lyrics/get`, `/v2/lyrics/get`, `/v1/ttml/get`, `/v1/raw/get`
 | `duration`   | number  | no | Track duration in seconds, may carry millisecond decimals (e.g. `232.123`). Coerced to milliseconds. |
 | `isrc`       | string  | conditional | ISRC code; enables direct cache lookup. |
 | `platformId` | string  | conditional | Upstream platform track ID; enables direct cache lookup. |
-| `source`     | string  | no | Comma-separated provider preference, e.g. `musixmatch,spotify,qq`. |
+| `source`     | string  | no | Comma-separated provider preference, e.g. `apple,spotify,qq`. |
 | `forceReload`| boolean | no | `true` bypasses every cache layer and races providers fresh. |
 
 Validation failure returns `400 {"error": "Missing required parameters: (title and artist) or isrc or platformId"}`.
@@ -106,14 +106,14 @@ Returns the best hit translated to Apple Music TTML:
 
 Returns the unparsed upstream payload verbatim. Content-Type follows the source:
 - `application/xml` for `apple`, `qq`
-- `application/json` for `musixmatch`, `spotify`
+- `application/json` for `spotify`
 
 Headers: `X-Lyrics-Source` and `X-Processing-Time`.
 `404` — `{"error":"Raw data is not available for this result","source":"..."}`.
 
 ## `/v1/songlist/search`
 
-Queries Apple Music, Spotify and Musixmatch in parallel, then normalizes and
+Queries Apple Music, Spotify, Deezer, and QQ Music in parallel, then normalizes and
 merges, de-duplicating by ISRC first, then title/artist/album.
 
 - `400` — `{"error":"Missing required parameter: q (query)"}` when `q` is empty.

@@ -72,18 +72,18 @@ func TestBreakerSuccessResetsConsecutiveCount(t *testing.T) {
 func TestBreakerStaleProbeTimesOutAndNeutral(t *testing.T) {
 	b, now := newTestBreaker()
 	for i := 0; i < 3; i++ {
-		b.Report("mxm", false)
+		b.Report("deezer", false)
 	}
 	*now = now.Add(11 * time.Second)
-	if !b.Allow("mxm") {
+	if !b.Allow("deezer") {
 		t.Fatal("probe expected")
 	}
-	b.Neutral("mxm") // cancelled probe frees the slot
-	if !b.Allow("mxm") {
+	b.Neutral("deezer")
+	if !b.Allow("deezer") {
 		t.Fatal("neutral must release the probe slot")
 	}
 	*now = now.Add(6 * time.Second) // probe never reported: timeout frees it
-	if !b.Allow("mxm") {
+	if !b.Allow("deezer") {
 		t.Fatal("stuck probe must expire")
 	}
 }
@@ -111,8 +111,8 @@ func TestIsHealthFailure(t *testing.T) {
 		timeoutErr{},
 		errors.New("apple music lyrics returned status 429"),
 		errors.New("status 503"),
-		errors.New("musixmatch web error (401): captcha"),
-		errors.New("musixmatch: login failed with status 401: bad"),
+		errors.New("provider error (401): unauthorized"),
+		errors.New("provider login failed with status 401"),
 		errors.New("spotify: web token in cooldown"),
 		errors.New("apple music: no account available"),
 		fmt.Errorf("wrap: %w", context.DeadlineExceeded),
@@ -126,7 +126,7 @@ func TestIsHealthFailure(t *testing.T) {
 		nil,
 		context.Canceled,
 		errors.New("status 404"),
-		errors.New("musixmatch web error (404): not found"),
+		errors.New("provider error (404): not found"),
 		errors.New("qq api response missing req"),
 		errors.New("no lyrics found"),
 	}

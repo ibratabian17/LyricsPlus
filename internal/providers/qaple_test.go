@@ -79,9 +79,7 @@ func TestQapleWithStore(t *testing.T) {
 
 	qqMock := &mockLineSource{resp: nil}
 	appleMock := &mockLineSource{resp: nil}
-	mxmMock := &mockLineSource{resp: nil}
-
-	svc := NewQapleService(qqMock, appleMock, mxmMock)
+	svc := NewQapleService(qqMock, appleMock)
 	svc.SetStore(st)
 
 	q := domain.SearchQuery{
@@ -154,7 +152,7 @@ func TestQaplePartialStoreHit(t *testing.T) {
 		},
 	}
 
-	svc := NewQapleService(qqMock, appleMock, nil)
+	svc := NewQapleService(qqMock, appleMock)
 	svc.SetStore(st)
 
 	q := domain.SearchQuery{

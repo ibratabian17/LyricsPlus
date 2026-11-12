@@ -28,15 +28,14 @@ const (
 	colorBold   = "\033[1m"
 )
 
-var providerKinds = []string{"spotify", "apple", "musixmatch", "deezer", "gdrive"}
+var providerKinds = []string{"spotify", "apple", "deezer", "gdrive"}
 
 var providerLabels = map[string]string{
-	"spotify":    "Spotify",
-	"apple":      "Apple Music",
-	"musixmatch": "Musixmatch",
-	"deezer":     "Deezer",
-	"gdrive":     "Google Drive",
-	"qq":         "QQ Music",
+	"spotify": "Spotify",
+	"apple":   "Apple Music",
+	"deezer":  "Deezer",
+	"gdrive":  "Google Drive",
+	"qq":      "QQ Music",
 }
 
 func main() {
@@ -124,8 +123,6 @@ Provider fields (add/edit):
   spotify:    --name --cookie --client-id --client-secret
   apple:      --name --auth-type(android|web) --token --dsid --user-agent
               --cookie --storefront
-  musixmatch: --name --auth-type(web|android) --cookie --user-agent --email
-              --password
   deezer:     --name --refresh-token --arl
   gdrive:     --client-id --client-secret --refresh-token --root
   qq:         --cookie
@@ -142,7 +139,6 @@ type account struct {
 	kind    string
 	spotify *config.SpotifyAccount
 	apple   *config.AppleAccount
-	mxm     *config.MusixmatchAccount
 	deezer  *config.DeezerAccount
 	gdrive  *config.GDriveAccount
 }
@@ -153,8 +149,6 @@ func (a *account) name() string {
 		return a.spotify.NAMEID
 	case "apple":
 		return a.apple.NAMEID
-	case "musixmatch":
-		return a.mxm.NAMEID
 	case "deezer":
 		return a.deezer.NAMEID
 	case "gdrive":
@@ -171,8 +165,6 @@ func setName(a *account, v string) {
 		a.spotify.NAMEID = v
 	case "apple":
 		a.apple.NAMEID = v
-	case "musixmatch":
-		a.mxm.NAMEID = v
 	case "deezer":
 		a.deezer.NAMEID = v
 	}
@@ -214,18 +206,6 @@ func templateFields(kind string) []templateField {
 			{key: "user-agent", label: "Android User-Agent", cond: isAndroid, set: func(a *account, v string) { a.apple.ANDROID_USER_AGENT = v }},
 			{key: "cookie", label: "Android Cookie", secret: true, cond: isAndroid, set: func(a *account, v string) { a.apple.ANDROID_COOKIE = v }},
 		}
-	case "musixmatch":
-		isAndroid := func(a *account) bool { return strings.EqualFold(a.mxm.AUTH_TYPE, "android") }
-		return []templateField{
-			{key: "auth-type", label: "Auth type (web/android)", set: func(a *account, v string) {
-				a.mxm.AUTH_TYPE = strings.ToLower(strings.TrimSpace(v))
-			}},
-			{key: "name", label: "Name/ID", set: func(a *account, v string) { a.mxm.NAMEID = v }},
-			{key: "cookie", label: "Musixmatch cookie", secret: true, cond: func(a *account) bool { return !isAndroid(a) }, set: func(a *account, v string) { a.mxm.COOKIE = accountmgr.CleanCookie(v) }},
-			{key: "user-agent", label: "User-Agent", cond: func(a *account) bool { return !isAndroid(a) }, set: func(a *account, v string) { a.mxm.USER_AGENT = v }},
-			{key: "email", label: "Account email", cond: isAndroid, set: func(a *account, v string) { a.mxm.EMAIL = v }},
-			{key: "password", label: "Password", secret: true, cond: isAndroid, set: func(a *account, v string) { a.mxm.PASSWORD = v }},
-		}
 	case "deezer":
 		return []templateField{
 			{key: "name", label: "Name/ID", set: func(a *account, v string) { a.deezer.NAMEID = v }},
@@ -252,8 +232,6 @@ func (a *account) hasCredential() bool {
 			return a.apple.MUSIC_AUTH_TOKEN != ""
 		}
 		return a.apple.ANDROID_AUTH_TOKEN != ""
-	case "musixmatch":
-		return a.mxm.COOKIE != "" || (a.mxm.EMAIL != "" && a.mxm.PASSWORD != "")
 	case "deezer":
 		return a.deezer.REFRESH_TOKEN != "" || a.deezer.ARL != ""
 	case "gdrive":
@@ -284,11 +262,6 @@ func (a *account) summary() string {
 			sf = "us"
 		}
 		return fmt.Sprintf("%s, sf: %s, token: %s", atype, sf, accountmgr.MaskCredential(tok))
-	case "musixmatch":
-		if strings.EqualFold(a.mxm.AUTH_TYPE, "android") {
-			return "android, email: " + emptyOr(a.mxm.EMAIL, "<none>")
-		}
-		return "web, cookie: " + accountmgr.MaskCredential(a.mxm.COOKIE)
 	case "deezer":
 		if a.deezer.REFRESH_TOKEN != "" {
 			return "refresh-token: " + accountmgr.MaskCredential(a.deezer.REFRESH_TOKEN)
@@ -307,8 +280,6 @@ func defaultName(kind string, store *accountmgr.Store) string {
 		n = len(store.SpotifyAccounts)
 	case "apple":
 		n = len(store.AppleAccounts)
-	case "musixmatch":
-		n = len(store.MusixmatchAccounts)
 	case "deezer":
 		n = len(store.DeezerAccounts)
 	}
@@ -327,12 +298,6 @@ func accountsOf(store *accountmgr.Store, kind string) []*account {
 		out := make([]*account, 0, len(store.AppleAccounts))
 		for i := range store.AppleAccounts {
 			out = append(out, &account{kind: "apple", apple: &store.AppleAccounts[i]})
-		}
-		return out
-	case "musixmatch":
-		out := make([]*account, 0, len(store.MusixmatchAccounts))
-		for i := range store.MusixmatchAccounts {
-			out = append(out, &account{kind: "musixmatch", mxm: &store.MusixmatchAccounts[i]})
 		}
 		return out
 	case "deezer":
@@ -376,9 +341,6 @@ func appendAccount(store *accountmgr.Store, kind string) *account {
 	case "apple":
 		store.AppleAccounts = append(store.AppleAccounts, config.AppleAccount{AUTH_TYPE: "android"})
 		return &account{kind: "apple", apple: &store.AppleAccounts[len(store.AppleAccounts)-1]}
-	case "musixmatch":
-		store.MusixmatchAccounts = append(store.MusixmatchAccounts, config.MusixmatchAccount{AUTH_TYPE: "web"})
-		return &account{kind: "musixmatch", mxm: &store.MusixmatchAccounts[len(store.MusixmatchAccounts)-1]}
 	case "deezer":
 		store.DeezerAccounts = append(store.DeezerAccounts, config.DeezerAccount{})
 		return &account{kind: "deezer", deezer: &store.DeezerAccounts[len(store.DeezerAccounts)-1]}
@@ -398,10 +360,6 @@ func removeLast(store *accountmgr.Store, kind string) {
 	case "apple":
 		if n := len(store.AppleAccounts); n > 0 {
 			store.AppleAccounts = store.AppleAccounts[:n-1]
-		}
-	case "musixmatch":
-		if n := len(store.MusixmatchAccounts); n > 0 {
-			store.MusixmatchAccounts = store.MusixmatchAccounts[:n-1]
 		}
 	case "deezer":
 		if n := len(store.DeezerAccounts); n > 0 {
@@ -424,8 +382,6 @@ func removeByName(store *accountmgr.Store, kind, name string) bool {
 			store.SpotifyAccounts = append(store.SpotifyAccounts[:i], store.SpotifyAccounts[i+1:]...)
 		case "apple":
 			store.AppleAccounts = append(store.AppleAccounts[:i], store.AppleAccounts[i+1:]...)
-		case "musixmatch":
-			store.MusixmatchAccounts = append(store.MusixmatchAccounts[:i], store.MusixmatchAccounts[i+1:]...)
 		case "deezer":
 			store.DeezerAccounts = append(store.DeezerAccounts[:i], store.DeezerAccounts[i+1:]...)
 		case "gdrive":
@@ -802,8 +758,6 @@ func (ap *app) test(provider, name string) {
 				res = tester.TestSpotify(ctx, *a.spotify)
 			case "apple":
 				res = tester.TestApple(ctx, *a.apple)
-			case "musixmatch":
-				res = tester.TestMusixmatch(ctx, *a.mxm)
 			case "deezer":
 				res = tester.TestDeezer(ctx, *a.deezer)
 			case "gdrive":
@@ -1179,21 +1133,6 @@ func currentValue(a *account, key string) string {
 			return a.apple.ANDROID_USER_AGENT
 		case "cookie":
 			return a.apple.ANDROID_COOKIE
-		}
-	case "musixmatch":
-		switch key {
-		case "name":
-			return a.mxm.NAMEID
-		case "auth-type":
-			return a.mxm.AUTH_TYPE
-		case "cookie":
-			return a.mxm.COOKIE
-		case "user-agent":
-			return a.mxm.USER_AGENT
-		case "email":
-			return a.mxm.EMAIL
-		case "password":
-			return a.mxm.PASSWORD
 		}
 	case "deezer":
 		switch key {

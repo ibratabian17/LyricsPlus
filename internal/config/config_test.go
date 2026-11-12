@@ -113,9 +113,6 @@ func TestLoadJSONConfig_Structured(t *testing.T) {
 			"spotify_accounts": [
 				{ "NAMEID": "sp-1", "CLIENT_ID": "sp-id-123", "COOKIE": "sp-cookie-abc" }
 			],
-			"musixmatch_accounts": [
-				{ "NAMEID": "mxm-1", "AUTH_TYPE": "web", "COOKIE": "mxm-cookie-xyz" }
-			],
 			"apple_music_accounts": [
 				{ "NAMEID": "apple-1", "AUTH_TYPE": "android", "ANDROID_AUTH_TOKEN": "apple-token-123" }
 			]
@@ -143,9 +140,6 @@ func TestLoadJSONConfig_Structured(t *testing.T) {
 	}
 	if len(cfg.Provider.SpotifyAccounts) != 1 || cfg.Provider.SpotifyAccounts[0].CLIENT_ID != "sp-id-123" {
 		t.Errorf("expected SpotifyAccount CLIENT_ID=sp-id-123, got %+v", cfg.Provider.SpotifyAccounts)
-	}
-	if len(cfg.Provider.MusixmatchAccounts) != 1 || cfg.Provider.MusixmatchAccounts[0].COOKIE != "mxm-cookie-xyz" {
-		t.Errorf("expected MusixmatchAccount COOKIE=mxm-cookie-xyz, got %+v", cfg.Provider.MusixmatchAccounts)
 	}
 	if len(cfg.Provider.AppleAccounts) != 1 || cfg.Provider.AppleAccounts[0].ANDROID_AUTH_TOKEN != "apple-token-123" {
 		t.Errorf("expected AppleAccount ANDROID_AUTH_TOKEN=apple-token-123, got %+v", cfg.Provider.AppleAccounts)
@@ -212,7 +206,6 @@ func TestLoad_DefaultsSafeAndClean(t *testing.T) {
 		"PORT", "MAX_CONCURRENCY",
 		"AUTH_KEY_CLIENT_ID", "AUTH_KEY_CLIENT_SECRET", "AUTH_KEY_REFRESH_TOKEN", "AUTH_KEY_ROOT", "GDRIVE_ACCOUNTS",
 		"SPOTIFY_COOKIE", "SPOTIFY_CLIENT_ID", "SPOTIFY_CLIENT_SECRET",
-		"MUSIXMATCH_COOKIE", "MUSIXMATCH_ANDROID_EMAIL", "MUSIXMATCH_ANDROID_PASSWORD",
 		"APPLE_MUSIC_ANDROID_AUTH_TOKEN", "APPLE_MUSIC_AUTH_TOKEN",
 	)
 
@@ -226,9 +219,6 @@ func TestLoad_DefaultsSafeAndClean(t *testing.T) {
 	}
 	if cfg.Provider.SpotifyClientID != "" {
 		t.Errorf("expected empty Spotify client id, got %q", cfg.Provider.SpotifyClientID)
-	}
-	if cfg.Provider.MusixmatchCookie != "" {
-		t.Errorf("expected empty Musixmatch cookie, got %q", cfg.Provider.MusixmatchCookie)
 	}
 	if cfg.Provider.AppleAndroidToken != "" {
 		t.Errorf("expected empty Apple Android token, got %q", cfg.Provider.AppleAndroidToken)

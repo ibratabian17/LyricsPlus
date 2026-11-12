@@ -22,7 +22,7 @@ Client ──► HTTP (chi router)
            Racer  (concurrent provider fetches, tunable timeout)
            Dedup  (singleflight + result dedup / most-canonical pick)
               ▼
-        providers  (musixmatch, spotify, apple, qq — HTTP or local LLCPlex)
+        providers  (spotify, apple, qq, deezer — HTTP or local LLCPlex)
               │
               ▼
         parsers   (V1→V2 canonical, JSON/TTML/LRC/plain text)

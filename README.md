@@ -4,7 +4,7 @@ This is the backend service for LyricsPlus, primarily functioning as a lyrics sc
 
 ## Features
 
-*   **Multi-Source Scraping**: Aggregates lyrics from various sources (e.g., Apple Music, Musixmatch, Spotify, QQ Music).
+*   **Multi-Source Scraping**: Aggregates lyrics from Apple Music, Spotify, QQ Music, Deezer, and Lyrics+.
 *   **Platform-Specific Timelines**: Provides synchronized lyrics tailored for specific platforms.
 *   **User Submissions**: Supports user contributions for synchronized lyrics.
 *   **Song Catalog Search**: Provides a search functionality for the song catalog.
@@ -67,7 +67,7 @@ All configuration is environment-driven with sensible defaults (see
 | `GDRIVE_ENABLED` | `true` | Google Drive caching/sync on start |
 | `DAILY_DUMP_ENABLED` | `false` | Periodic DB snapshot + GDrive upload |
 
-Provider credentials (Spotify, Musixmatch, Apple, QQ, Deezer) are read from
+Provider credentials (Spotify, Apple, QQ, Deezer) are read from
 their matching `*_COOKIE` / `_TOKEN` / `_ID` environment variables; leave unset
 to rely on the built-in defaults.
 

@@ -60,12 +60,6 @@ func TestAccountStore_LoadSaveRoundTrip(t *testing.T) {
 		ANDROID_AUTH_TOKEN: "sample-token",
 		STOREFRONT:         "us",
 	})
-	st.MusixmatchAccounts = append(st.MusixmatchAccounts, config.MusixmatchAccount{
-		NAMEID:    "mxm-1",
-		AUTH_TYPE: "android",
-		EMAIL:     "test@example.com",
-		PASSWORD:  "secret-pass",
-	})
 	st.GDriveAccounts = append(st.GDriveAccounts, config.GDriveAccount{
 		ClientID:     "gdrive-client",
 		ClientSecret: "gdrive-secret",
@@ -87,9 +81,6 @@ func TestAccountStore_LoadSaveRoundTrip(t *testing.T) {
 	}
 	if len(reloaded.AppleAccounts) != 1 {
 		t.Errorf("expected 1 apple account, got %d", len(reloaded.AppleAccounts))
-	}
-	if len(reloaded.MusixmatchAccounts) != 1 {
-		t.Errorf("expected 1 musixmatch account, got %d", len(reloaded.MusixmatchAccounts))
 	}
 	if len(reloaded.GDriveAccounts) != 1 {
 		t.Errorf("expected 1 gdrive account, got %d", len(reloaded.GDriveAccounts))
@@ -117,6 +108,59 @@ func TestAccountStore_LoadSaveRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAccountStore_RemovesLegacyProviderSettings(t *testing.T) {
+	dir := t.TempDir()
+	jsonPath := filepath.Join(dir, "auth.json")
+	initial := `{
+  "gdrive": {"folders": {"musixmatch": "legacy-folder"}},
+  "provider": {
+    "musixmatch_accounts": [{"COOKIE": "legacy-cookie"}],
+    "musixmatch_android_password": "legacy-password"
+  }
+}`
+	if err := os.WriteFile(jsonPath, []byte(initial), 0644); err != nil {
+		t.Fatalf("write auth.json: %v", err)
+	}
+	st, err := LoadStore(jsonPath)
+	if err != nil {
+		t.Fatalf("LoadStore: %v", err)
+	}
+	if err := st.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	jsonData, err := os.ReadFile(jsonPath)
+	if err != nil {
+		t.Fatalf("read auth.json: %v", err)
+	}
+	if strings.Contains(strings.ToLower(string(jsonData)), "musixmatch") ||
+		strings.Contains(string(jsonData), "legacy-cookie") ||
+		strings.Contains(string(jsonData), "legacy-password") {
+		t.Fatalf("legacy settings were retained in JSON:\n%s", jsonData)
+	}
+
+	envPath := filepath.Join(dir, ".env")
+	envData := "MUSIXMATCH_COOKIE=legacy-cookie\nGDRIVE_CACHED_MUSIXMATCH=legacy-folder\n"
+	if err := os.WriteFile(envPath, []byte(envData), 0644); err != nil {
+		t.Fatalf("write .env: %v", err)
+	}
+	envStore, err := LoadStore(envPath)
+	if err != nil {
+		t.Fatalf("LoadStore .env: %v", err)
+	}
+	if err := envStore.Save(); err != nil {
+		t.Fatalf("Save .env: %v", err)
+	}
+	savedEnv, err := os.ReadFile(envPath)
+	if err != nil {
+		t.Fatalf("read .env: %v", err)
+	}
+	if strings.Contains(strings.ToLower(string(savedEnv)), "musixmatch") ||
+		strings.Contains(string(savedEnv), "legacy-cookie") ||
+		strings.Contains(string(savedEnv), "legacy-folder") {
+		t.Fatalf("legacy settings were retained in .env:\n%s", savedEnv)
+	}
+}
+
 func TestAccountStore_LoadSaveEnv(t *testing.T) {
 	tmpDir := t.TempDir()
 	envPath := filepath.Join(tmpDir, ".env")
@@ -134,8 +178,6 @@ SPOTIFY_COOKIE="sp_dc=env-spotify-cookie"
 SPOTIFY_CLIENT_ID=env-spot-cid
 SPOTIFY_CLIENT_SECRET=env-spot-csec
 DEEZER_ARL=env-arl
-MUSIXMATCH_ANDROID_EMAIL="env@example.com"
-MUSIXMATCH_ANDROID_PASSWORD=env-pass
 QQ_COOKIE="qq=cookie value"
 `
 	if err := os.WriteFile(envPath, []byte(initial), 0644); err != nil {
@@ -155,9 +197,6 @@ QQ_COOKIE="qq=cookie value"
 	}
 	if len(st.DeezerAccounts) != 1 || st.DeezerAccounts[0].ARL != "env-arl" {
 		t.Errorf("deezer env load wrong: %+v", st.DeezerAccounts)
-	}
-	if len(st.MusixmatchAccounts) != 1 || st.MusixmatchAccounts[0].EMAIL != "env@example.com" {
-		t.Errorf("musixmatch env load wrong: %+v", st.MusixmatchAccounts)
 	}
 	if st.QQCookie != "qq=cookie value" {
 		t.Errorf("qq env load wrong: %q", st.QQCookie)
@@ -204,7 +243,6 @@ QQ_COOKIE="qq=cookie value"
 		"GDRIVE_ENABLED=true",
 		"# gdrive oauth",
 		"# providers",
-		"MUSIXMATCH_ANDROID_EMAIL=env@example.com",
 	} {
 		if !strings.Contains(content, wanted) {
 			t.Errorf(".env lost line %q after save:\n%s", wanted, content)

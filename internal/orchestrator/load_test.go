@@ -50,7 +50,7 @@ func (c *countingSource) FetchLyrics(ctx context.Context, _ domain.SearchQuery) 
 	}, nil
 }
 
-var allSourceNames = []string{"apple", "lyricsplus", "deezer", "qq", "musixmatch-word", "musixmatch"}
+var allSourceNames = []string{"apple", "lyricsplus", "deezer", "qq"}
 
 func buildRacer(t *testing.T, limiter *Limiter, delay time.Duration, respond bool) (*Racer, []*countingSource) {
 	t.Helper()

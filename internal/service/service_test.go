@@ -74,13 +74,13 @@ func TestProviderNameForSource(t *testing.T) {
 		"Apple":                       "apple",
 		"QQ Music":                    "qq",
 		"QQ":                          "qq",
-		"Musixmatch":                  "musixmatch",
 		"Deezer":                      "deezer",
 		"Qaple":                       "qaple",
 		"qaple":                       "qaple",
 		"Lyrics+ (via Apple with QQ)": "qaple",
 		"Lyrics+":                     "lyricsplus",
 		"":                            "lyricsplus",
+		"Unknown Provider":            "",
 	}
 	for in, want := range cases {
 		if got := providerNameForSource(in); got != want {
@@ -105,8 +105,8 @@ func TestMatchSource(t *testing.T) {
 	if matchSource("apple", []string{"qq"}) {
 		t.Error("expected false for apple when only qq is allowed")
 	}
-	if !matchSource("musixmatch-word", []string{"musixmatch"}) {
-		t.Error("expected true for musixmatch-word matching musixmatch")
+	if matchSource("Unknown Provider", nil) {
+		t.Error("expected unknown sources to be rejected")
 	}
 }
 
@@ -120,7 +120,6 @@ func TestExtFor(t *testing.T) {
 		"qq":                          "qrc",
 		"qqmusic":                     "qrc",
 		"Spotify":                     "json",
-		"Musixmatch":                  "json",
 		"Lyrics+":                     "json",
 		"Lyrics+ (via Apple with QQ)": "json",
 		"":                            "json",
@@ -241,6 +240,21 @@ func TestFromStoreSourceFiltering(t *testing.T) {
 		t.Fatal("expected cache hit for apple,qq")
 	} else if resp.Metadata.Source != "Apple" {
 		t.Errorf("expected winner Apple, got %q", resp.Metadata.Source)
+	}
+
+	legacyCache := &storage.Row{
+		Filename:    "legacy.json",
+		ContentJSON: []byte(`{"metadata":{"source":"Legacy Provider"},"type":"line","lyrics":[{"time":0,"text":"line"}]}`),
+		Source:      "legacy",
+		Title:       "Legacy Cache Song",
+		Artist:      "Legacy Cache Artist",
+	}
+	if err := st.SaveLyrics(context.Background(), legacyCache); err != nil {
+		t.Fatalf("save legacy cache: %v", err)
+	}
+	legacyQuery := domain.SearchQuery{Title: "Legacy Cache Song", Artist: "Legacy Cache Artist"}
+	if _, ok := s.fromStore(context.Background(), legacyQuery); ok {
+		t.Error("unsupported cached sources should not be served")
 	}
 }
 

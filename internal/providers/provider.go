@@ -36,7 +36,6 @@ type Set struct {
 	Sources    []Source
 	AppleMusic *AppleMusicProvider
 	Spotify    *SpotifyProvider
-	Musixmatch *MusixmatchProvider
 	Deezer     *DeezerProvider
 	QQMusic    *QQMusicProvider
 	LyricsPlus *LyricsPlusProvider
@@ -98,14 +97,11 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 
 	apple := NewAppleMusicWithConfig(client, pcfg)
 	qq := NewQQMusic(client, pcfg.QQCookie)
-	mxm := NewMusixmatchWithConfig(client, pcfg, "musixmatch", false)
-	mxmWord := NewMusixmatchWithConfig(client, pcfg, "musixmatch-word", true)
-	mxmWord.ShareStateFrom(mxm)
 	dz := NewDeezerWithConfig(client, pcfg)
 	sp := NewSpotifyWithConfig(client, pcfg)
 
 	if lg != nil {
-		for _, s := range []Source{apple, qq, mxm, mxmWord, dz, sp} {
+		for _, s := range []Source{apple, qq, dz, sp} {
 			if l, ok := s.(interface{ SetLogger(*logger.Logger) }); ok {
 				l.SetLogger(lg)
 			}
@@ -116,7 +112,6 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 	qapleSvc := NewQapleService(
 		guardedLineSource{name: "qq", src: qq, br: breaker},
 		guardedLineSource{name: "apple", src: apple, br: breaker},
-		guardedLineSource{name: "musixmatch", src: mxm, br: breaker},
 	)
 	if store != nil {
 		qapleSvc.SetStore(store)
@@ -139,15 +134,12 @@ func buildAll(client *proxy.Client, store *storage.Store, gdrive *storage.GDrive
 		dz,
 		qq,
 		sp,
-		mxmWord,
-		mxm,
 	}
 
 	return &Set{
 		Sources:    sources,
 		AppleMusic: apple,
 		Spotify:    sp,
-		Musixmatch: mxm,
 		Deezer:     dz,
 		QQMusic:    qq,
 		LyricsPlus: lp,

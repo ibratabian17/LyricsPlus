@@ -17,11 +17,10 @@ type Store struct {
 
 	envLines []envLine
 
-	SpotifyAccounts    []config.SpotifyAccount
-	AppleAccounts      []config.AppleAccount
-	MusixmatchAccounts []config.MusixmatchAccount
-	DeezerAccounts     []config.DeezerAccount
-	QQCookie           string
+	SpotifyAccounts []config.SpotifyAccount
+	AppleAccounts   []config.AppleAccount
+	DeezerAccounts  []config.DeezerAccount
+	QQCookie        string
 
 	GDriveAccounts []config.GDriveAccount
 }
@@ -190,34 +189,6 @@ func (s *Store) loadProviders() {
 		}
 	}
 
-	if raw, ok := provMap["musixmatch_accounts"]; ok {
-		_ = json.Unmarshal(raw, &s.MusixmatchAccounts)
-	}
-	if len(s.MusixmatchAccounts) == 0 {
-		var cookie, ua, email, pass string
-		_ = json.Unmarshal(provMap["musixmatch_cookie"], &cookie)
-		_ = json.Unmarshal(provMap["musixmatch_user_agent"], &ua)
-		_ = json.Unmarshal(provMap["musixmatch_android_email"], &email)
-		_ = json.Unmarshal(provMap["musixmatch_android_password"], &pass)
-
-		if cookie != "" || ua != "" {
-			s.MusixmatchAccounts = append(s.MusixmatchAccounts, config.MusixmatchAccount{
-				NAMEID:     "mxm-web",
-				AUTH_TYPE:  "web",
-				USER_AGENT: ua,
-				COOKIE:     cookie,
-			})
-		}
-		if email != "" && pass != "" {
-			s.MusixmatchAccounts = append(s.MusixmatchAccounts, config.MusixmatchAccount{
-				NAMEID:    "mxm-android",
-				AUTH_TYPE: "android",
-				EMAIL:     email,
-				PASSWORD:  pass,
-			})
-		}
-	}
-
 	if raw, ok := provMap["deezer_accounts"]; ok {
 		_ = json.Unmarshal(raw, &s.DeezerAccounts)
 	}
@@ -253,6 +224,11 @@ func (s *Store) Save() error {
 	}
 	if provMap == nil {
 		provMap = make(map[string]json.RawMessage)
+	}
+	for key := range provMap {
+		if strings.Contains(strings.ToLower(key), "musixmatch") {
+			delete(provMap, key)
+		}
 	}
 
 	provMap["spotify_accounts"] = mustMarshalJSON(s.SpotifyAccounts)
@@ -291,24 +267,6 @@ func (s *Store) Save() error {
 		delete(provMap, "apple_music_storefront")
 	}
 
-	provMap["musixmatch_accounts"] = mustMarshalJSON(s.MusixmatchAccounts)
-	switch len(s.MusixmatchAccounts) {
-	case 1:
-		acc := s.MusixmatchAccounts[0]
-		if strings.EqualFold(acc.AUTH_TYPE, "android") {
-			provMap["musixmatch_android_email"] = mustMarshalJSON(acc.EMAIL)
-			provMap["musixmatch_android_password"] = mustMarshalJSON(acc.PASSWORD)
-		} else {
-			provMap["musixmatch_cookie"] = mustMarshalJSON(acc.COOKIE)
-			provMap["musixmatch_user_agent"] = mustMarshalJSON(acc.USER_AGENT)
-		}
-	case 0:
-		delete(provMap, "musixmatch_android_email")
-		delete(provMap, "musixmatch_android_password")
-		delete(provMap, "musixmatch_cookie")
-		delete(provMap, "musixmatch_user_agent")
-	}
-
 	provMap["deezer_accounts"] = mustMarshalJSON(s.DeezerAccounts)
 	switch len(s.DeezerAccounts) {
 	case 1:
@@ -330,6 +288,17 @@ func (s *Store) Save() error {
 	if raw, ok := s.rawDoc["gdrive"]; ok {
 		if err := json.Unmarshal(raw, &gdMap); err != nil || gdMap == nil {
 			gdMap = make(map[string]json.RawMessage)
+		}
+	}
+	if raw, ok := gdMap["folders"]; ok {
+		var folders map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &folders); err == nil {
+			for key := range folders {
+				if strings.Contains(strings.ToLower(key), "musixmatch") {
+					delete(folders, key)
+				}
+			}
+			gdMap["folders"] = mustMarshalJSON(folders)
 		}
 	}
 	if len(s.GDriveAccounts) > 0 {
@@ -438,27 +407,6 @@ func (s *Store) loadProvidersEnv(vals map[string]string) {
 		}
 	}
 
-	if accs, ok := parseAccounts[config.MusixmatchAccount](vals["MUSIXMATCH_ACCOUNTS"]); ok {
-		s.MusixmatchAccounts = accs
-	} else {
-		if vals["MUSIXMATCH_COOKIE"] != "" || vals["MUSIXMATCH_USER_AGENT"] != "" {
-			s.MusixmatchAccounts = append(s.MusixmatchAccounts, config.MusixmatchAccount{
-				NAMEID:     "mxm-web",
-				AUTH_TYPE:  "web",
-				COOKIE:     vals["MUSIXMATCH_COOKIE"],
-				USER_AGENT: vals["MUSIXMATCH_USER_AGENT"],
-			})
-		}
-		if vals["MUSIXMATCH_ANDROID_EMAIL"] != "" && vals["MUSIXMATCH_ANDROID_PASSWORD"] != "" {
-			s.MusixmatchAccounts = append(s.MusixmatchAccounts, config.MusixmatchAccount{
-				NAMEID:    "mxm-android",
-				AUTH_TYPE: "android",
-				EMAIL:     vals["MUSIXMATCH_ANDROID_EMAIL"],
-				PASSWORD:  vals["MUSIXMATCH_ANDROID_PASSWORD"],
-			})
-		}
-	}
-
 	if accs, ok := parseAccounts[config.DeezerAccount](vals["DEEZER_ACCOUNTS"]); ok {
 		s.DeezerAccounts = accs
 	} else if vals["DEEZER_ARL"] != "" || vals["DEEZER_REFRESH_TOKEN"] != "" {
@@ -481,6 +429,15 @@ func envArray(v any) string {
 }
 
 func (s *Store) saveEnv() error {
+	lines := s.envLines[:0]
+	for _, line := range s.envLines {
+		if strings.Contains(strings.ToLower(line.raw), "musixmatch") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	s.envLines = lines
+
 	s.envSet("SPOTIFY_ACCOUNTS", envArray(s.SpotifyAccounts))
 	switch len(s.SpotifyAccounts) {
 	case 1:
@@ -514,24 +471,6 @@ func (s *Store) saveEnv() error {
 		s.envSet("APPLE_MUSIC_ANDROID_USER_AGENT", "")
 		s.envSet("APPLE_MUSIC_ANDROID_COOKIE", "")
 		s.envSet("APPLE_MUSIC_STOREFRONT", "")
-	}
-
-	s.envSet("MUSIXMATCH_ACCOUNTS", envArray(s.MusixmatchAccounts))
-	switch len(s.MusixmatchAccounts) {
-	case 1:
-		acc := s.MusixmatchAccounts[0]
-		if strings.EqualFold(acc.AUTH_TYPE, "android") {
-			s.envSet("MUSIXMATCH_ANDROID_EMAIL", acc.EMAIL)
-			s.envSet("MUSIXMATCH_ANDROID_PASSWORD", acc.PASSWORD)
-		} else {
-			s.envSet("MUSIXMATCH_COOKIE", acc.COOKIE)
-			s.envSet("MUSIXMATCH_USER_AGENT", acc.USER_AGENT)
-		}
-	case 0:
-		s.envSet("MUSIXMATCH_COOKIE", "")
-		s.envSet("MUSIXMATCH_USER_AGENT", "")
-		s.envSet("MUSIXMATCH_ANDROID_EMAIL", "")
-		s.envSet("MUSIXMATCH_ANDROID_PASSWORD", "")
 	}
 
 	s.envSet("DEEZER_ACCOUNTS", envArray(s.DeezerAccounts))
@@ -767,13 +706,12 @@ func ConvertEnvToJSON(envPath, jsonPath string) error {
 	}
 
 	type ProviderConfig struct {
-		TimeoutMS          int64                      `json:"timeout_ms,omitempty"`
-		SpotifySecretsURL  string                     `json:"spotify_secrets_url,omitempty"`
-		SpotifyAccounts    []config.SpotifyAccount    `json:"spotify_accounts,omitempty"`
-		AppleAccounts      []config.AppleAccount      `json:"apple_music_accounts,omitempty"`
-		MusixmatchAccounts []config.MusixmatchAccount `json:"musixmatch_accounts,omitempty"`
-		DeezerAccounts     []config.DeezerAccount     `json:"deezer_accounts,omitempty"`
-		QQCookie           string                     `json:"qq_cookie,omitempty"`
+		TimeoutMS         int64                   `json:"timeout_ms,omitempty"`
+		SpotifySecretsURL string                  `json:"spotify_secrets_url,omitempty"`
+		SpotifyAccounts   []config.SpotifyAccount `json:"spotify_accounts,omitempty"`
+		AppleAccounts     []config.AppleAccount   `json:"apple_music_accounts,omitempty"`
+		DeezerAccounts    []config.DeezerAccount  `json:"deezer_accounts,omitempty"`
+		QQCookie          string                  `json:"qq_cookie,omitempty"`
 	}
 
 	type LyricsPlusConfig struct {
@@ -824,9 +762,6 @@ func ConvertEnvToJSON(envPath, jsonPath string) error {
 	if len(cfg.GDrive.FolderSpotify) > 0 {
 		folders["spotify"] = strings.Join(cfg.GDrive.FolderSpotify, ",")
 	}
-	if len(cfg.GDrive.FolderMusixmatch) > 0 {
-		folders["musixmatch"] = strings.Join(cfg.GDrive.FolderMusixmatch, ",")
-	}
 	if len(cfg.GDrive.FolderQQ) > 0 {
 		folders["qq"] = strings.Join(cfg.GDrive.FolderQQ, ",")
 	}
@@ -869,13 +804,12 @@ func ConvertEnvToJSON(envPath, jsonPath string) error {
 			DailyDumpDir:      cfg.GDrive.DailyDumpDir,
 		},
 		Provider: ProviderConfig{
-			TimeoutMS:          cfg.Provider.Timeout.Milliseconds(),
-			SpotifySecretsURL:  cfg.Provider.SpotifySecretsURL,
-			SpotifyAccounts:    cfg.Provider.SpotifyAccounts,
-			AppleAccounts:      cfg.Provider.AppleAccounts,
-			MusixmatchAccounts: cfg.Provider.MusixmatchAccounts,
-			DeezerAccounts:     cfg.Provider.DeezerAccounts,
-			QQCookie:           cfg.Provider.QQCookie,
+			TimeoutMS:         cfg.Provider.Timeout.Milliseconds(),
+			SpotifySecretsURL: cfg.Provider.SpotifySecretsURL,
+			SpotifyAccounts:   cfg.Provider.SpotifyAccounts,
+			AppleAccounts:     cfg.Provider.AppleAccounts,
+			DeezerAccounts:    cfg.Provider.DeezerAccounts,
+			QQCookie:          cfg.Provider.QQCookie,
 		},
 		LyricsPlus: LyricsPlusConfig{
 			JWTSecret:        cfg.LyricsPlus.JWTSecret,

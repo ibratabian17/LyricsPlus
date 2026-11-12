@@ -1,7 +1,6 @@
 package parsers
 
 import (
-	"strconv"
 	"strings"
 	"testing"
 
@@ -511,94 +510,11 @@ func TestLRCParse(t *testing.T) {
 	}
 }
 
-func TestConvertMusixmatchRichSync(t *testing.T) {
-	rich := `[{"ts":1.1,"te":2.2,"x":"hello world","l":[{"c":"hello","o":0},{"c":" ","o":0.5},{"c":"world","o":0.9}]}]`
-	data := []byte(`{"track":{"track_id":"1"},"type":"richsync","lyrics":{"message":{"body":{"richsync":{"richsync_body":` + strconv.Quote(rich) + `,"lyrics_copyright":"Writer(s): Taylor Swift, Max Martin"}}}}}`)
-
-	resp, err := ConvertMusixmatchToJSON(data, true)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if resp.Type != "Word" || resp.KpoeTools != "1.2-MusixmatchToJSON" {
-		t.Errorf("type/kpoe = %q/%q", resp.Type, resp.KpoeTools)
-	}
-	if resp.Metadata.Source != "Musixmatch" || resp.Metadata.LeadingSilence != "0.000" {
-		t.Errorf("metadata = %+v", resp.Metadata)
-	}
-	if len(resp.Metadata.SongWriters) != 2 || resp.Metadata.SongWriters[0] != "Taylor Swift" {
-		t.Errorf("songwriters = %q", resp.Metadata.SongWriters)
-	}
-	if len(resp.Lyrics) != 1 {
-		t.Fatalf("lines = %d", len(resp.Lyrics))
-	}
-	l := resp.Lyrics[0]
-	if l.Time != 1100 {
-		t.Errorf("line time = %d", l.Time)
-	}
-
-	if l.Duration != (2000+200)-1100 {
-		t.Errorf("line duration = %d", l.Duration)
-	}
-
-	if len(l.Syllabus) != 2 {
-		t.Fatalf("syllables = %d", len(l.Syllabus))
-	}
-	if l.Syllabus[0].Text != "hello " || l.Syllabus[0].Time != 1100 {
-		t.Errorf("syllable[0] = %+v", l.Syllabus[0])
-	}
-	if l.Text != "hello world" {
-		t.Errorf("text = %q", l.Text)
-	}
-	if l.Syllabus[1].Time != 2000 || l.Syllabus[1].Duration != 200 {
-		t.Errorf("syllable[1] = %+v", l.Syllabus[1])
-	}
-}
-
-func TestConvertMusixmatchSubtitle(t *testing.T) {
-	data := []byte(`{"track":{"track_id":"1"},"type":"subtitle","lyrics":{"message":{"body":{"subtitle":{"subtitle_body":"[00:01.00]first\n[00:05.50]second","lyrics_copyright":"Writer(s): Bob"}}}}}`)
-
-	resp, err := ConvertMusixmatchToJSON(data, true)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if resp.Type != "Line" {
-		t.Errorf("type = %q", resp.Type)
-	}
-
-	if len(resp.Lyrics) != 2 {
-		t.Fatalf("lines = %d", len(resp.Lyrics))
-	}
-	if resp.Lyrics[0].Time != 1000 || resp.Lyrics[0].Duration != 4500 {
-		t.Errorf("line0 = %d/%d", resp.Lyrics[0].Time, resp.Lyrics[0].Duration)
-	}
-	if resp.Lyrics[1].Time != 5500 || resp.Lyrics[1].Duration != 3000 {
-		t.Errorf("line1 (last default 3000) = %d/%d", resp.Lyrics[1].Time, resp.Lyrics[1].Duration)
-	}
-
-	data2 := []byte(`{"lyrics":{"message":{"body":{"subtitle":{"subtitle_body":"[00:01.00]\n[00:02.00]ok","lyrics_copyright":""}}}}}`)
-	resp2, err := ConvertMusixmatchToJSON(data2, false)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if len(resp2.Lyrics) != 1 || resp2.Lyrics[0].Text != "ok" {
-		t.Errorf("filter empty: %+v", resp2.Lyrics)
-	}
-
-	if resp2.Lyrics[0].Duration != 3000 {
-		t.Errorf("duration = %d", resp2.Lyrics[0].Duration)
-	}
-
-	resp3, err := ConvertMusixmatchToJSON([]byte(`{"lyrics":{"message":{"body":{}}}}`), false)
-	if err != nil || resp3 != nil {
-		t.Errorf("empty body: %v / %+v", err, resp3)
-	}
-}
-
 func TestConvertSpotifyToJSON(t *testing.T) {
 	data := []byte(`{
   "lyrics": {
     "syncType": "LINE_SYNCED",
-    "providerDisplayName": "Musixmatch",
+    "providerDisplayName": "Spotify",
     "songWriters": ["A", "B"],
     "lines": [
       {"startTimeMs": 1000, "words": "hello world",
@@ -616,7 +532,7 @@ func TestConvertSpotifyToJSON(t *testing.T) {
 	if resp.Type != domain.SyncTypeWord || resp.KpoeTools != "2.0-LPlusBcknd" {
 		t.Errorf("type/kpoe = %q/%q", resp.Type, resp.KpoeTools)
 	}
-	if resp.Metadata.Source != "Musixmatch" {
+	if resp.Metadata.Source != "Spotify" {
 		t.Errorf("source = %q", resp.Metadata.Source)
 	}
 	if len(resp.Metadata.SongWriters) != 2 {

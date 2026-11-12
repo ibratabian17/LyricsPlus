@@ -21,7 +21,7 @@ func TestShouldCacheNegativeResult(t *testing.T) {
 			"apple": {Status: "BAD"}, "qq": {Status: "BAD"}, "deezer": {Status: "SKIP"},
 		}), true},
 		{"one provider failed", mk(map[string]orchestrator.SourceOutcome{
-			"apple": {Status: "BAD"}, "musixmatch": {Status: "BAD", Degraded: true},
+			"apple": {Status: "BAD"}, "qq": {Status: "BAD", Degraded: true},
 		}), false},
 		{"overloaded skip", mk(map[string]orchestrator.SourceOutcome{
 			"apple": {Status: "BAD"}, "qq": {Status: "SKIP", Degraded: true},

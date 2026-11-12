@@ -47,15 +47,6 @@ type AppleAccount struct {
 	MUSIC_AUTH_TOKEN   string `json:"MUSIC_AUTH_TOKEN"`
 }
 
-type MusixmatchAccount struct {
-	NAMEID     string `json:"NAMEID"`
-	AUTH_TYPE  string `json:"AUTH_TYPE"`
-	USER_AGENT string `json:"USER_AGENT"`
-	COOKIE     string `json:"COOKIE"`
-	EMAIL      string `json:"EMAIL"`
-	PASSWORD   string `json:"PASSWORD"`
-}
-
 type DeezerAccount struct {
 	NAMEID        string `json:"NAMEID"`
 	AUTH_TYPE     string `json:"AUTH_TYPE"`
@@ -82,10 +73,6 @@ func (a AppleAccount) IsConfigured() bool {
 	return a.MUSIC_AUTH_TOKEN != ""
 }
 
-func (a MusixmatchAccount) IsConfigured() bool {
-	return a.COOKIE != "" || a.USER_AGENT != "" || (a.EMAIL != "" && a.PASSWORD != "")
-}
-
 func (a DeezerAccount) IsConfigured() bool {
 	return a.REFRESH_TOKEN != "" || a.ARL != ""
 }
@@ -105,25 +92,20 @@ type Provider struct {
 	MaxConcurrentPerSource int64
 	FetchAdmissionWait     time.Duration
 
-	SpotifySpotifyDCCookie    string
-	SpotifyClientID           string
-	SpotifyClientSecret       string
-	MusixmatchCookie          string
-	MusixmatchUserAgent       string
-	MusixmatchAndroidEmail    string
-	MusixmatchAndroidPassword string
-	MusixmatchAccounts        []MusixmatchAccount
-	AppleAndroidToken         string
-	AppleAndroidDsid          string
-	AppleAndroidUserAgent     string
-	AppleAndroidCookie        string
-	AppleStorefront           string
-	AppleMediaUserToken       string
-	AppleAccounts             []AppleAccount
-	QQCookie                  string
-	DeezerARL                 string
-	DeezerRefreshToken        string
-	DeezerAccounts            []DeezerAccount
+	SpotifySpotifyDCCookie string
+	SpotifyClientID        string
+	SpotifyClientSecret    string
+	AppleAndroidToken      string
+	AppleAndroidDsid       string
+	AppleAndroidUserAgent  string
+	AppleAndroidCookie     string
+	AppleStorefront        string
+	AppleMediaUserToken    string
+	AppleAccounts          []AppleAccount
+	QQCookie               string
+	DeezerARL              string
+	DeezerRefreshToken     string
+	DeezerAccounts         []DeezerAccount
 }
 
 type LyricsPlus struct {
@@ -190,7 +172,6 @@ type GDrive struct {
 	FolderUserTML     []string
 	FolderTTML        []string
 	FolderSpotify     []string
-	FolderMusixmatch  []string
 	FolderQQ          []string
 	FolderDeezer      []string
 	FolderBackup      []string
@@ -271,10 +252,9 @@ func Default() Config {
 				{59, 92, 64, 70, 99, 78, 117, 75, 99, 103, 116, 67, 103, 51, 87, 63, 93, 59, 70, 45, 32},
 				{107, 81, 49, 57, 67, 93, 87, 81, 69, 67, 40, 93, 48, 50, 46, 91, 94, 113, 41, 108, 77, 107, 34},
 			},
-			SpotifyAccounts:    nil,
-			MusixmatchAccounts: nil,
-			AppleAccounts:      nil,
-			DeezerAccounts:     nil,
+			SpotifyAccounts: nil,
+			AppleAccounts:   nil,
+			DeezerAccounts:  nil,
 		},
 		LyricsPlus: LyricsPlus{
 			JWTSecret:        "lyricsplus-submit-opensource-yes-yes-yes",
@@ -317,7 +297,6 @@ func Default() Config {
 			FolderUserTML:     []string{"1RFoNsI5wAsRjQSVDOMaotDmMZNIQOWnW"},
 			FolderTTML:        nil,
 			FolderSpotify:     nil,
-			FolderMusixmatch:  nil,
 			FolderQQ:          nil,
 			FolderDeezer:      nil,
 			FolderBackup:      nil,
@@ -624,8 +603,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 					cfg.GDrive.FolderTTML = valSlice
 				case "spotify", "cached_spotify", "gdrive_cached_spotify":
 					cfg.GDrive.FolderSpotify = valSlice
-				case "musixmatch", "cached_musixmatch", "gdrive_cached_musixmatch":
-					cfg.GDrive.FolderMusixmatch = valSlice
 				case "qq", "cached_qq", "gdrive_cached_qq":
 					cfg.GDrive.FolderQQ = valSlice
 				case "deezer", "cached_deezer", "gdrive_cached_deezer":
@@ -679,11 +656,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 					if err := parseAccountListToSlice(string(pv), &accs); err == nil {
 						cfg.Provider.AppleAccounts = accs
 					}
-				case "musixmatch_accounts":
-					var accs []MusixmatchAccount
-					if err := parseAccountListToSlice(string(pv), &accs); err == nil {
-						cfg.Provider.MusixmatchAccounts = accs
-					}
 				case "deezer_accounts":
 					var accs []DeezerAccount
 					if err := parseAccountListToSlice(string(pv), &accs); err == nil {
@@ -715,15 +687,6 @@ func loadJSONConfig(cfg *Config, path string) error {
 					var s string
 					if err := json.Unmarshal(pv, &s); err == nil && s != "" && len(cfg.Provider.SpotifyAccounts) > 0 {
 						cfg.Provider.SpotifyAccounts[0].CLIENT_SECRET = s
-					}
-				case "musixmatch_cookie":
-					var s string
-					if err := json.Unmarshal(pv, &s); err == nil && s != "" && len(cfg.Provider.MusixmatchAccounts) == 0 {
-						cfg.Provider.MusixmatchAccounts = append(cfg.Provider.MusixmatchAccounts, MusixmatchAccount{
-							NAMEID:    "mxm-web",
-							AUTH_TYPE: "web",
-							COOKIE:    s,
-						})
 					}
 				case "apple_music_auth_token", "apple_music_android_auth_token":
 					var s string
@@ -1225,9 +1188,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 	if v, ok := m["GDRIVE_CACHED_SPOTIFY"]; ok && v != "" {
 		cfg.GDrive.FolderSpotify = parseCommaSlice(v)
 	}
-	if v, ok := m["GDRIVE_CACHED_MUSIXMATCH"]; ok && v != "" {
-		cfg.GDrive.FolderMusixmatch = parseCommaSlice(v)
-	}
 	if v, ok := m["GDRIVE_CACHED_QQ"]; ok && v != "" {
 		cfg.GDrive.FolderQQ = parseCommaSlice(v)
 	}
@@ -1326,34 +1286,6 @@ func applyMapToConfig(cfg *Config, m map[string]string) {
 		}
 	}
 
-	if raw, ok := m["MUSIXMATCH_ACCOUNTS"]; ok && raw != "" {
-		var accs []MusixmatchAccount
-		if err := parseAccountListToSlice(raw, &accs); err == nil && len(accs) > 0 {
-			cfg.Provider.MusixmatchAccounts = accs
-		}
-	} else if m["MUSIXMATCH_COOKIE"] != "" || m["MUSIXMATCH_ANDROID_EMAIL"] != "" {
-		var accs []MusixmatchAccount
-		if m["MUSIXMATCH_COOKIE"] != "" || m["MUSIXMATCH_USER_AGENT"] != "" {
-			accs = append(accs, MusixmatchAccount{
-				NAMEID:     "mxm-web",
-				AUTH_TYPE:  "web",
-				COOKIE:     m["MUSIXMATCH_COOKIE"],
-				USER_AGENT: m["MUSIXMATCH_USER_AGENT"],
-			})
-		}
-		if m["MUSIXMATCH_ANDROID_EMAIL"] != "" {
-			accs = append(accs, MusixmatchAccount{
-				NAMEID:    "mxm-android",
-				AUTH_TYPE: "android",
-				EMAIL:     m["MUSIXMATCH_ANDROID_EMAIL"],
-				PASSWORD:  m["MUSIXMATCH_ANDROID_PASSWORD"],
-			})
-		}
-		if len(accs) > 0 {
-			cfg.Provider.MusixmatchAccounts = accs
-		}
-	}
-
 	if raw, ok := m["DEEZER_ACCOUNTS"]; ok && raw != "" {
 		var accs []DeezerAccount
 		if err := parseAccountListToSlice(raw, &accs); err == nil && len(accs) > 0 {
@@ -1389,17 +1321,6 @@ func finalizeConfig(cfg *Config) {
 				cfg.Provider.AppleStorefront = a.STOREFRONT
 			} else if strings.EqualFold(a.AUTH_TYPE, "web") && cfg.Provider.AppleMediaUserToken == "" {
 				cfg.Provider.AppleMediaUserToken = a.MUSIC_AUTH_TOKEN
-			}
-		}
-	}
-	if len(cfg.Provider.MusixmatchAccounts) > 0 {
-		for _, a := range cfg.Provider.MusixmatchAccounts {
-			if strings.EqualFold(a.AUTH_TYPE, "android") && cfg.Provider.MusixmatchAndroidEmail == "" {
-				cfg.Provider.MusixmatchAndroidEmail = a.EMAIL
-				cfg.Provider.MusixmatchAndroidPassword = a.PASSWORD
-			} else if cfg.Provider.MusixmatchCookie == "" {
-				cfg.Provider.MusixmatchCookie = a.COOKIE
-				cfg.Provider.MusixmatchUserAgent = a.USER_AGENT
 			}
 		}
 	}

@@ -71,7 +71,6 @@ func main() {
 		fmt.Println("  GDRIVE_CACHED_TTML       (Apple Music folder ID)")
 		fmt.Println("  GDRIVE_CACHED_SPOTIFY    (Spotify folder ID)")
 		fmt.Println("  GDRIVE_USERTML_JSON      (Lyrics+ UGC folder ID)")
-		fmt.Println("  GDRIVE_CACHED_MUSIXMATCH (Musixmatch folder ID)")
 		fmt.Println("  GDRIVE_CACHED_QQ         (QQ Music folder ID)")
 		fmt.Println("  GDRIVE_CACHED_DEEZER     (Deezer folder ID)")
 		os.Exit(1)
@@ -129,7 +128,6 @@ func main() {
 		{"lyricsplus", cfg.GDrive.FolderUserTML},
 		{"apple", cfg.GDrive.FolderTTML},
 		{"spotify", cfg.GDrive.FolderSpotify},
-		{"musixmatch", cfg.GDrive.FolderMusixmatch},
 		{"qq", cfg.GDrive.FolderQQ},
 		{"deezer", cfg.GDrive.FolderDeezer},
 	}

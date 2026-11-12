@@ -288,7 +288,7 @@ func (r *Racer) Race(ctx context.Context, q domain.SearchQuery, preferredSources
 	if p1 != nil && p1.Priority == PriorityLine {
 		p3Sources := make([]string, 0, len(remaining))
 		for _, s := range remaining {
-			if s != "musixmatch" && s != "spotify" {
+			if s != "spotify" {
 				p3Sources = append(p3Sources, s)
 			}
 		}

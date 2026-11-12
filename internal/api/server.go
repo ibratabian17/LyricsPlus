@@ -73,9 +73,6 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 	if providerSet.Spotify != nil {
 		metrics.Default.RegisterPlatform("spotify", "Spotify", providerSet.Spotify.Configured, "Spotify Web API Availability")
 	}
-	if providerSet.Musixmatch != nil {
-		metrics.Default.RegisterPlatform("musixmatch", "Musixmatch", providerSet.Musixmatch.Configured, "Musixmatch API Availability")
-	}
 	if providerSet.Deezer != nil {
 		metrics.Default.RegisterPlatform("deezer", "Deezer", providerSet.Deezer.Configured, "Deezer API Availability")
 	}
@@ -119,7 +116,6 @@ func New(cfg config.Config, lg *logger.Logger) (*Server, error) {
 		Store:      store,
 		AppleMusic: providerSet.AppleMusic,
 		Spotify:    providerSet.Spotify,
-		Musixmatch: providerSet.Musixmatch,
 		Deezer:     providerSet.Deezer,
 		QQMusic:    providerSet.QQMusic,
 		Logger:     lg,

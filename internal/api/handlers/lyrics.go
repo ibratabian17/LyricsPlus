@@ -359,7 +359,7 @@ func resolveRawContentType(source, raw string) string {
 	src := strings.ToLower(source)
 	trimmed := strings.TrimSpace(raw)
 
-	if strings.Contains(src, "spotify") || strings.Contains(src, "musixmatch") {
+	if strings.Contains(src, "spotify") {
 		return "application/json"
 	}
 	if strings.Contains(src, "apple") || strings.Contains(src, "qq") || strings.Contains(src, "qaple") {

@@ -252,7 +252,6 @@ func TestExtForSource(t *testing.T) {
 		{"QQ Music", "qrc"},
 		{"lyricsplus", "json"},
 		{"spotify", "json"},
-		{"musixmatch", "json"},
 	}
 
 	for _, tc := range tests {

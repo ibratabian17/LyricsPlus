@@ -73,6 +73,36 @@ func TestStoreGetByTitleArtistAndContent(t *testing.T) {
 	}
 }
 
+func TestSearchCatalogSkipsUnsupportedSources(t *testing.T) {
+	st, err := NewStore(config.Storage{DBPath: filepath.Join(t.TempDir(), "catalog.db"), LRUSize: 64})
+	if err != nil {
+		t.Fatalf("NewStore failed: %v", err)
+	}
+	defer func() { _ = st.Close() }()
+
+	ctx := context.Background()
+	for _, source := range []string{"legacy", "apple"} {
+		row := &Row{
+			Filename:    source + ".json",
+			ContentJSON: []byte(`{"type":"line","lyrics":[{"time":0,"text":"line"}]}`),
+			Source:      source,
+			Title:       "Catalog Test Song",
+			Artist:      "Catalog Test Artist",
+		}
+		if err := st.SaveLyrics(ctx, row); err != nil {
+			t.Fatalf("SaveLyrics(%s): %v", source, err)
+		}
+	}
+
+	items, err := st.SearchCatalog(ctx, "Catalog Test Song")
+	if err != nil {
+		t.Fatalf("SearchCatalog: %v", err)
+	}
+	if len(items) != 1 || len(items[0].Availability) != 2 || items[0].Availability[1] != "apple" {
+		t.Fatalf("unexpected catalog results: %+v", items)
+	}
+}
+
 func TestStoreConnectionPoolSettings(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "pool_test.db")
 	st, err := NewStore(config.Storage{DBPath: dbPath, LRUSize: 64})

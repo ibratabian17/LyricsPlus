@@ -27,16 +27,16 @@ func (c *scriptedSource) FetchLyrics(ctx context.Context, q domain.SearchQuery) 
 // must be flagged Degraded (so the miss is not negative-cached), and the
 // healthy provider must keep serving.
 func TestRacerBreakerStopsCallingDeadProvider(t *testing.T) {
-	dead := &scriptedSource{name: "musixmatch", err: errors.New("musixmatch: login failed with status 401: bad")}
+	dead := &scriptedSource{name: "deezer", err: errors.New("provider login failed with status 401")}
 	good := &scriptedSource{name: "apple", resp: wordResp("apple")}
 	br := NewBreaker(BreakerConfig{Threshold: 3, BaseCooldown: time.Minute, MaxCooldown: time.Minute})
 	r := NewRacer([]Source{good, dead}, time.Second, WithBreaker(br), WithLimiter(NewLimiter(LimiterConfig{})))
 
 	q := domain.SearchQuery{Title: "t", Artist: "a"}
 	for i := 0; i < 10; i++ {
-		res := r.Race(context.Background(), q, []string{"musixmatch"})
+		res := r.Race(context.Background(), q, []string{"deezer"})
 		if i >= 3 {
-			if st := res.SourcesStatus["musixmatch"]; st.Status != "SKIP" || !st.Degraded {
+			if st := res.SourcesStatus["deezer"]; st.Status != "SKIP" || !st.Degraded {
 				t.Fatalf("iter %d: want degraded SKIP once open, got %+v", i, st)
 			}
 		}
@@ -44,7 +44,7 @@ func TestRacerBreakerStopsCallingDeadProvider(t *testing.T) {
 	if got := dead.calls.Load(); got != 3 {
 		t.Fatalf("dead provider should be called only until the breaker opens (3), got %d", got)
 	}
-	if !br.Status("musixmatch").Open {
+	if !br.Status("deezer").Open {
 		t.Fatal("breaker should be open")
 	}
 

@@ -756,7 +756,7 @@ func (h *Admin) ScrapeSources(w http.ResponseWriter, r *http.Request) {
 
 	targetSources := req.Sources
 	if len(targetSources) == 0 {
-		targetSources = []string{"apple", "musixmatch", "deezer", "spotify", "qq"}
+		targetSources = []string{"apple", "deezer", "spotify", "qq"}
 	}
 
 	type SourceResult struct {

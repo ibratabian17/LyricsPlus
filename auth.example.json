@@ -21,7 +21,6 @@
       "user_tml": "",
       "ttml": "",
       "spotify": "",
-      "musixmatch": "",
       "qq": "",
       "deezer": "",
       "backup": ""
@@ -34,20 +33,6 @@
         "CLIENT_ID": "",
         "CLIENT_SECRET": "",
         "COOKIE": ""
-      }
-    ],
-    "musixmatch_accounts": [
-      {
-        "NAMEID": "mxm-web-1",
-        "AUTH_TYPE": "web",
-        "USER_AGENT": "",
-        "COOKIE": ""
-      },
-      {
-        "NAMEID": "mxm-android-1",
-        "AUTH_TYPE": "android",
-        "EMAIL": "",
-        "PASSWORD": ""
       }
     ],
     "apple_music_accounts": [

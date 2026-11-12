@@ -43,15 +43,13 @@ type LineSource interface {
 type QapleService struct {
 	qqSource LineSource
 	apple    LineSource
-	mxm      LineSource
 	store    *storage.Store
 }
 
-func NewQapleService(qq, apple, mxm LineSource) *QapleService {
+func NewQapleService(qq, apple LineSource) *QapleService {
 	return &QapleService{
 		qqSource: qq,
 		apple:    apple,
-		mxm:      mxm,
 	}
 }
 
@@ -86,11 +84,6 @@ func parseStoredLine(row *storage.Row, content []byte) *domain.LyricsResponse {
 			return parsers.NormalizeV2(p)
 		}
 	}
-	if strings.EqualFold(row.Source, "musixmatch") || strings.EqualFold(row.Source, "musixmatch-word") {
-		if p, err := parsers.ConvertMusixmatchToJSON(content, false); err == nil && p != nil && len(p.Lyrics) > 0 {
-			return parsers.NormalizeV2(p)
-		}
-	}
 	var resp domain.LyricsResponse
 	if json.Unmarshal(content, &resp) == nil && len(resp.Lyrics) > 0 {
 		return parsers.NormalizeV2(&resp)
@@ -107,7 +100,7 @@ func isAlreadyWordSynced(resp *domain.LyricsResponse) bool {
 }
 
 func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*domain.LyricsResponse, error) {
-	if s.qqSource == nil || (s.apple == nil && s.mxm == nil) {
+	if s.qqSource == nil || s.apple == nil {
 		return nil, nil
 	}
 
@@ -138,17 +131,9 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 
 	go func() {
 		if !q.ForceReload && s.store != nil {
-			if row, content, err := s.store.GetRowForSources(qapleCtx, q, "apple", "musixmatch", "musixmatch-word"); err == nil && row != nil && len(content) > 0 {
+			if row, content, err := s.store.GetRowForSources(qapleCtx, q, "apple"); err == nil && row != nil && len(content) > 0 {
 				if resp := parseStoredLine(row, content); resp != nil && len(resp.Lyrics) > 0 {
 					if !isAlreadyWordSynced(resp) {
-						src := "Apple (DB)"
-						if strings.HasPrefix(strings.ToLower(row.Source), "musixmatch") {
-							src = "Musixmatch (DB)"
-						}
-						lineCh <- fetchResult{resp: resp, source: src, err: nil}
-						return
-					}
-					if s.mxm == nil {
 						lineCh <- fetchResult{resp: resp, source: "Apple (DB)", err: nil}
 						return
 					}
@@ -163,13 +148,6 @@ func (s *QapleService) FetchLyrics(ctx context.Context, q domain.SearchQuery) (*
 					return
 				}
 				lineCh <- fetchResult{resp: resp, source: "Apple", err: nil}
-				return
-			}
-		}
-		if s.mxm != nil {
-			resp, err := s.mxm.FetchLyrics(qapleCtx, q)
-			if err == nil && resp != nil && len(resp.Lyrics) > 0 {
-				lineCh <- fetchResult{resp: resp, source: "Musixmatch", err: nil}
 				return
 			}
 		}
