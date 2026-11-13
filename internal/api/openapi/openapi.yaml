@@ -7,7 +7,16 @@ info:
     lyrics from several providers (Apple Music, Spotify, Deezer, QQ
     Music, and the LyricsPlus UGC store), normalizes them into a canonical V2
     payload, caches results, and serves the legacy V1 and Apple Music TTML
-    variants. Interactive viewer: /docs. Prose reference: docs/endpoints.md.
+    variants.
+
+    Notice: All lyrics made available through this API are distributed
+    unofficially. LyricsPlus is not affiliated with or endorsed by artists,
+    publishers, labels, or streaming services. Lyrics remain the property of
+    their respective rights holders; this API does not grant permission to
+    reproduce or redistribute them. Users are responsible for ensuring their
+    use complies with applicable law.
+
+    Interactive viewer: /docs. Prose reference: docs/endpoints.md.
   license:
     name: Apache-2.0
 servers:

@@ -463,6 +463,10 @@ func TestDocsAndRoot(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "openapi:") {
 		t.Fatalf("expected OpenAPI spec, got %d: %s", rec.Code, rec.Body.String())
 	}
+	if !strings.Contains(rec.Body.String(), "All lyrics made available through this API are distributed") ||
+		!strings.Contains(rec.Body.String(), "unofficially.") {
+		t.Fatal("expected OpenAPI spec to include the unofficial lyrics notice")
+	}
 
 	rec = doGet(t, h, "/docs")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "swagger-ui") {

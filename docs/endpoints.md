@@ -4,6 +4,14 @@ This document is the prose reference for the LyricsPlus backend API. The
 machine-readable contract lives at [`internal/api/openapi/openapi.yaml`](../internal/api/openapi/openapi.yaml)
 and is served at `/openapi.yaml` (interactive viewer: `/docs`).
 
+## Notice
+
+All lyrics made available through this API are distributed unofficially.
+LyricsPlus is not affiliated with or endorsed by artists, publishers, labels,
+or streaming services. Lyrics remain the property of their respective rights
+holders; this API does not grant permission to reproduce or redistribute them.
+Users are responsible for ensuring their use complies with applicable law.
+
 ## Conventions
 
 - All responses are JSON unless noted otherwise.

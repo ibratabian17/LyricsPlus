@@ -19,6 +19,13 @@ The backend operates by exposing a set of API endpoints that allow clients to fe
 
 For a detailed list and explanation of all API endpoints, please refer to [docs/endpoints.md](docs/endpoints.md).
 
+## Notice
+
+All lyrics made available through this API are distributed unofficially.
+LyricsPlus is not affiliated with or endorsed by artists, publishers, labels,
+or streaming services. Lyrics remain the property of their respective rights
+holders; this API does not grant permission to reproduce or redistribute them.
+Users are responsible for ensuring their use complies with applicable law.
 
 ## Quick start
 
